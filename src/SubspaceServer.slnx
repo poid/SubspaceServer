@@ -1,4 +1,5 @@
 <Solution>
+  <Project Path="Bots/Bots.csproj" />
   <Project Path="Core/Core.csproj" />
   <Project Path="Example/Example.csproj" />
   <Project Path="Matchmaking/Matchmaking.csproj" />
@@ -7,6 +8,7 @@
   <Project Path="SourceGeneration.Tests/SourceGeneration.Tests.csproj" />
   <Project Path="SourceGeneration/SourceGeneration.csproj" />
   <Project DefaultStartup="true" Path="SubspaceServer/SubspaceServer.csproj">
+    <BuildDependency Project="Bots/Bots.csproj" />
     <BuildDependency Project="Example/Example.csproj" />
     <BuildDependency Project="Matchmaking/Matchmaking.csproj" />
     <BuildDependency Project="Replay/Replay.csproj" />
