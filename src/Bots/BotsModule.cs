@@ -4,6 +4,7 @@ using Microsoft.Extensions.ObjectPool;
 using QS.Networking.Protocols.Common; // ID
 using QS.Physics.Legacy;              // ReplayController, PhysicsCommand, CommandKind, EventKind, EventSink
 using QS.Physics.Legacy.Structs;      // ShipState
+using SS.Bots.Navigation;
 using SS.Core;
 using SS.Core.ComponentCallbacks;
 using SS.Core.ComponentInterfaces;
@@ -59,6 +60,15 @@ namespace SS.Bots
         /// emit above. TODO: confirm the engine's internal tick rate and adjust to match.</summary>
         private const uint StepsPerTick = 10;
 
+        /// <summary>How far to inflate walls when building the nav grid. TODO: derive from ship radius.</summary>
+        private const int ShipRadiusTiles = 1;
+
+        /// <summary>Door cycle length fed to the nav wait-cost model. TODO: source from arena settings (DoorDelay).</summary>
+        private const uint DefaultDoorDelayTicks = 300;
+
+        /// <summary>Brick lifetime used when marking brick tiles blocked. TODO: source real BrickTime + span from the brick entity.</summary>
+        private const uint DefaultBrickTicks = 1500;
+
         public BotsModule(
             IArenaManager arenaManager,
             IFake fake,
@@ -108,6 +118,10 @@ namespace SS.Bots
             {
                 ad.EventCollector = new PhysicsEventCollector();
                 ad.World.SetEventListener(ad.EventCollector);
+
+                // Build the static navigation substrate from the same map the sim uses. One-time,
+                // per arena; door/brick state is fed in each tick / on events below.
+                ad.Nav = GridNavigation.Build(ad.World.Canonical.Level, ShipRadiusTiles);
             }
 
             PlayerPositionPacketCallback.Register(arena, Callback_PlayerPosition);
@@ -179,10 +193,26 @@ namespace SS.Bots
             ReplayController world = ad.World;
             uint tick = world.CurrentTick;
 
+            // 0. Refresh the nav overlay with the engine's current door state (and drop stale bricks),
+            //    so this tick's path queries route through open doors and around live bricks.
+            if (ad.Nav is not null)
+            {
+                ad.Nav.UpdateDoors(world.Canonical.DoorOpenBitmask, world.Canonical.LastDoorSwitchTick, DefaultDoorDelayTicks);
+                ad.Nav.PruneExpiredBricks(tick);
+            }
+
             // 1. Each bot decides; translate intent into physics commands.
             foreach (Bot bot in ad.Bots)
             {
-                BotDecision decision = bot.Brain.Think(world, bot.ShipSlot);
+                BotContext context = new()
+                {
+                    World = world,
+                    Navigation = ad.Nav!, // non-null whenever World is (built together in AttachModule)
+                    ShipSlot = bot.ShipSlot,
+                    CurrentTick = tick,
+                };
+
+                BotDecision decision = bot.Brain.Think(in context);
                 world.EnqueueCommand(PhysicsAdapter.ThrustInputCommand(bot.ShipSlot, tick, in decision));
                 if (decision.Fire != WeaponCodes.Null)
                     world.EnqueueCommand(PhysicsAdapter.WeaponFireCommand(bot.ShipSlot, tick, decision.Fire, decision.FireLevel));
@@ -191,8 +221,8 @@ namespace SS.Bots
             // 2. Advance the authoritative simulation (fills the event collector).
             world.Tick(StepsPerTick);
 
-            // 3. Resolve combat from the physics event stream.
-            ProcessEvents(ad);
+            // 3. Resolve combat from the physics event stream, and reflect bricks into the nav overlay.
+            ProcessEvents(ad, tick);
 
             // 4. Broadcast each bot's resulting motion through the server's normal path.
             foreach (Bot bot in ad.Bots)
@@ -210,7 +240,7 @@ namespace SS.Bots
         // Physics is authoritative for weapons/damage: translate its combat events into server
         // actions. WeaponHit/BombExploded carry (victim, attacker); PlayerDied carries only the
         // victim, so we attribute the kill to the last ship that damaged them.
-        private void ProcessEvents(ArenaData ad)
+        private void ProcessEvents(ArenaData ad, uint currentTick)
         {
             PhysicsEventCollector? collector = ad.EventCollector;
             if (collector is null)
@@ -227,6 +257,13 @@ namespace SS.Bots
 
                     case EventKind.PlayerDied:
                         HandleDeath(ad, e.PrimaryId.Int);
+                        break;
+
+                    case EventKind.BrickPlaced:
+                        // IntA/IntB = brick tile. TODO: a brick is a wall span — read the full
+                        // start/end and real expiry from world.Canonical.Bricks instead of one tile.
+                        TileCoord brick = new((short)e.IntA, (short)e.IntB);
+                        ad.Nav?.AddBrick(brick, brick, currentTick + DefaultBrickTicks);
                         break;
                 }
             }
@@ -339,6 +376,9 @@ namespace SS.Bots
             /// <summary>Buffers combat events emitted during <see cref="ReplayController.Tick"/>.</summary>
             public PhysicsEventCollector? EventCollector;
 
+            /// <summary>The arena's navigation service, built alongside <see cref="World"/>.</summary>
+            public INavigation? Nav;
+
             public readonly List<Bot> Bots = new();
 
             /// <summary>External IDs (player.Id) whose ship has been added to the sim.</summary>
@@ -354,6 +394,7 @@ namespace SS.Bots
             {
                 World = null;
                 EventCollector = null;
+                Nav = null;
                 Bots.Clear();
                 AddedShipIds.Clear();
                 PlayerById.Clear();

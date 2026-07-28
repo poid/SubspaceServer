@@ -42,7 +42,32 @@ real players ──position packets──▶ Callback_PlayerPosition ──▶ E
 | [`PhysicsAdapter.cs`](PhysicsAdapter.cs) | The one seam: converts between `SS.Packets.Game` (pixels, `WeaponCodes`, `ShipType`) and QS (`1000`-coords, `WeaponTypes`, `ShipTypes`). |
 | [`IPhysicsWorldProvider.cs`](IPhysicsWorldProvider.cs) / [`PhysicsWorldProvider.cs`](PhysicsWorldProvider.cs) | Builds a configured `ReplayController` for an arena. **The main unimplemented seam.** |
 | [`PhysicsEventCollector.cs`](PhysicsEventCollector.cs) | Buffers physics events during `Tick` for post-tick handling. |
-| [`IBotBrain.cs`](IBotBrain.cs) / [`Brains/OrbitBrain.cs`](Brains/OrbitBrain.cs) | Pluggable AI; the example brain just flies in a loop. |
+| [`IBotBrain.cs`](IBotBrain.cs) / [`Brains/OrbitBrain.cs`](Brains/OrbitBrain.cs) | Pluggable AI (`Think(in BotContext)`); the example brain just flies in a loop. |
+| [`Navigation/INavigation.cs`](Navigation/INavigation.cs) | The navigation service **shape** — path/LOS/firing-position/region queries + the door/brick overlay feed. |
+| [`Navigation/GridNavigation.cs`](Navigation/GridNavigation.cs) | Implementation: inflated walkability grid, region/portal decomposition, grid A* with door-wait cost + brick overlay, LOS. |
+| [`Brains/NavSeekBrain.cs`](Brains/NavSeekBrain.cs) | Example of a brain consuming `INavigation`: path to a goal and steer the waypoints. |
+
+## Navigation
+
+`INavigation` is the one interface all four gameplay modes go through; they differ only in which
+goal they ask for. It is a two-part model:
+
+- **Static substrate** (built once per arena from `LevelArray`, since map geometry never changes):
+  a walkability grid with walls inflated by ship radius, flood-filled into **regions separated by
+  doors**, with doors as **portals** between regions.
+- **Dynamic overlay** (pushed each tick by the module from the physics world): **door open/closed
+  state** — a closed-but-cycling door is priced as a *waitable gate* (high-cost passable edge), not
+  a wall — and **player-dropped bricks** as temporary fully-blocking tiles.
+
+Queries: `TryFindPath` (global planner), `HasLineOfSight` / `TryFindFiringPosition` (combat and
+passing want a firing position, not the target's tile), and `GetRegion` / `AreConnected` (door-gated
+connectivity answered at region granularity).
+
+The current implementation uses grid A*; the interface is shaped so the internals can move to **Jump
+Point Search** (faster on these uniform-cost grids) and **D\* Lite** (incremental replanning as
+doors/bricks change) with no caller change. `GridNavigation` depends only on a `LevelArray`, so it is
+**independently testable right now** — you can build one from a hand-made level and exercise
+pathfinding without the settings bridge being done.
 
 ## Build & layout requirement
 
@@ -96,4 +121,12 @@ nothing simulates.
    Decide whether server-side (physics) combat may kill humans, and if so sync energy/death so it
    feels right, before enabling PvP damage against real players.
 5. **Energy / bounty** — emit these (via `ExtraPositionData`) so clients see bot health.
-6. **A real brain** — replace `OrbitBrain` with AI that reads `world.Canonical.Ships`.
+6. **Navigation upgrades** — the graph is wired but has known follow-ups: JPS + D\* Lite behind the
+   existing `INavigation` methods; precomputed region-adjacency so `AreConnected` doesn't rescan door
+   tiles; real brick span/expiry from `world.Canonical.Bricks`; and `DoorDelay`/`BrickTime`/ship
+   radius sourced from arena settings instead of the placeholder constants in `BotsModule`.
+7. **Real brains** — the four modes (defend stationary flags, retrieve/defend moveable flags, ball,
+   team/solo combat) built on `INavigation` + steering. They share `NavSeekBrain`'s path-following;
+   each adds goal selection (defended point, moving flag/ball, firing position behind an enemy).
+8. **Steering** — replace `NavSeekBrain`'s minimal face-and-thrust with arrive/braking behaviour and
+   physics look-ahead (clone + step the sim a few ticks to reject a thrust that would hit a wall).
