@@ -119,17 +119,10 @@ namespace SS.Bots
             if (!arena.TryGetExtraData(_adKey, out ArenaData? ad))
                 return false;
 
-            ad.World = _worldProvider.CreateWorld(arena, ServerTick.Now);
-            if (ad.World is not null)
-            {
-                ad.EventCollector = new PhysicsEventCollector();
-                ad.World.SetEventListener(ad.EventCollector);
-
-                // Build the static navigation substrate from the same map the sim uses. One-time,
-                // per arena; door/brick state is fed in each tick / on events below.
-                ad.Nav = GridNavigation.Build(ad.World.Canonical.Level, ShipRadiusTiles);
-            }
-
+            // The physics world is created lazily (see EnsureWorld), on the first ?spawnbot — NOT here.
+            // At attach time (arena creation) the ClientSettings module may not have loaded the arena's
+            // settings yet; configuring the sim then yields all-zero ship settings (no thrust/speed/
+            // energy), so the ship spawns frozen. By the time a player spawns a bot, settings are loaded.
             PlayerPositionPacketCallback.Register(arena, Callback_PlayerPosition);
             _mainloopTimer.SetTimer<Arena>(MainloopTimer_Tick, TickIntervalMs, TickIntervalMs, arena, arena);
             return true;
@@ -168,7 +161,7 @@ namespace SS.Bots
                 return;
 
             ReplayController world = ad.World;
-            uint tick = world.CurrentTick;
+            uint tick = world.CurrentTick + 1; // commands must target a future tick (engine drops tick <= current)
             int externalId = player.Id;
             int slot = world.GetOrAllocateShipSlot(new ID(externalId));
 
@@ -219,9 +212,12 @@ namespace SS.Bots
                 };
 
                 BotDecision decision = bot.Brain.Think(in context);
-                world.EnqueueCommand(PhysicsAdapter.ThrustInputCommand(bot.ShipSlot, tick, in decision));
+                // Commands must target a FUTURE tick. The engine drops any command whose tick is
+                // <= the canonical snapshot's current tick (i.e. == current on a single-lane live
+                // server), so tick+1 — applied by the world.Tick() call below.
+                world.EnqueueCommand(PhysicsAdapter.ThrustInputCommand(bot.ShipSlot, tick + 1, in decision));
                 if (decision.Fire != WeaponCodes.Null)
-                    world.EnqueueCommand(PhysicsAdapter.WeaponFireCommand(bot.ShipSlot, tick, decision.Fire, decision.FireLevel));
+                    world.EnqueueCommand(PhysicsAdapter.WeaponFireCommand(bot.ShipSlot, tick + 1, decision.Fire, decision.FireLevel));
             }
 
             // 2. Advance the authoritative simulation (fills the event collector).
@@ -303,15 +299,33 @@ namespace SS.Bots
 
         #region Commands
 
+        // Builds the arena's physics world (and nav) on first use. Deferred out of AttachModule so the
+        // arena's client settings are loaded by the time we read them; otherwise the sim gets all-zero
+        // ship settings and bots spawn frozen.
+        private void EnsureWorld(Arena arena, ArenaData ad)
+        {
+            if (ad.World is not null)
+                return;
+
+            ad.World = _worldProvider.CreateWorld(arena, ServerTick.Now);
+            if (ad.World is not null)
+            {
+                ad.EventCollector = new PhysicsEventCollector();
+                ad.World.SetEventListener(ad.EventCollector);
+                ad.Nav = GridNavigation.Build(ad.World.Canonical.Level, ShipRadiusTiles);
+            }
+        }
+
         private void Command_spawnbot(ReadOnlySpan<char> commandName, ReadOnlySpan<char> parameters, Player player, ITarget target)
         {
             Arena? arena = player.Arena;
             if (arena is null || !arena.TryGetExtraData(_adKey, out ArenaData? ad))
                 return;
 
+            EnsureWorld(arena, ad);
             if (ad.World is null)
             {
-                _chat.SendMessage(player, "Bots: no physics world for this arena (see IPhysicsWorldProvider). Cannot spawn.");
+                _chat.SendMessage(player, "Bots: could not build a physics world (client settings unavailable for this arena).");
                 return;
             }
 
@@ -323,19 +337,30 @@ namespace SS.Bots
             const ShipType ship = ShipType.Warbird;
             const short freq = 0;
 
-            Player? botPlayer = _fake.CreateFakePlayer(name, arena, ship, freq);
+            // Create the fake in spectator mode, then change it into a real ship via the Game module.
+            // CreateFakePlayer sets player.Ship as a raw field and sends the "entering" packet (so the
+            // bot appears in the player list), but it never announces a ship to clients — so without
+            // the ship change below, clients render no ship. SetShipAndFreq broadcasts the S2C
+            // ship-change packet that makes clients draw the ship, and it only fires on an actual
+            // change, which is why we must start in spec. (This mirrors how the Replay module and real
+            // players get into a ship: enter as spec, then ship-change.)
+            Player? botPlayer = _fake.CreateFakePlayer(name, arena, ShipType.Spec, freq);
             if (botPlayer is null)
             {
                 _chat.SendMessage(player, "Bots: failed to create fake player.");
                 return;
             }
 
+            _game.SetShipAndFreq(botPlayer, ship, freq);
+
             ReplayController world = ad.World;
             int slot = world.GetOrAllocateShipSlot(new ID(botPlayer.Id));
 
-            // TODO: choose a real spawn location from arena settings/map instead of map centre.
-            C2S_PositionPacket spawn = new() { X = 512 * 16, Y = 512 * 16 };
-            world.EnqueueCommand(PhysicsAdapter.ShipAddCommand(slot, world.CurrentTick, botPlayer.Id, ship, freq, in spawn));
+            // Spawn where the commanding player is, so it's immediately visible (fallback: map centre).
+            short spawnX = player.Position.X != 0 ? player.Position.X : (short)(512 * 16);
+            short spawnY = player.Position.Y != 0 ? player.Position.Y : (short)(512 * 16);
+            C2S_PositionPacket spawn = new() { X = spawnX, Y = spawnY };
+            world.EnqueueCommand(PhysicsAdapter.ShipAddCommand(slot, world.CurrentTick + 1, botPlayer.Id, ship, freq, in spawn));
 
             ad.AddedShipIds.Add(botPlayer.Id);
             ad.PlayerById[botPlayer.Id] = botPlayer;
@@ -353,7 +378,7 @@ namespace SS.Bots
             int count = ad.Bots.Count;
             foreach (Bot bot in ad.Bots)
             {
-                ad.World?.EnqueueCommand(PhysicsAdapter.ShipRemoveCommand(bot.ShipSlot, ad.World.CurrentTick));
+                ad.World?.EnqueueCommand(PhysicsAdapter.ShipRemoveCommand(bot.ShipSlot, ad.World.CurrentTick + 1));
                 ad.PlayerById.Remove(bot.Player.Id);
                 ad.AddedShipIds.Remove(bot.Player.Id);
                 _fake.EndFaked(bot.Player);

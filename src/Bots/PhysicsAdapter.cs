@@ -48,7 +48,7 @@ namespace SS.Bots
                 YSpeed = (short)(s.Velocity.Y / VelocityScale),
                 Bounty = 0,                              // TODO: track and emit bounty from the sim
                 Status = PlayerPositionStatus.Inert,
-                Energy = 0,                              // TODO: emit energy via ExtraPositionData so clients see it
+                Energy = (short)(s.Energy1000 / 1000),   // real sim energy (Energy1000 is energy * 1000)
             };
         }
 

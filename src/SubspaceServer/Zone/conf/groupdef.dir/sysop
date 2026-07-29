@@ -60,6 +60,10 @@ cmd_dropturret
 cmd_makefake
 privcmd_killfake
 
+; Bots
+cmd_spawnbot
+cmd_killbots
+
 cmd_py
 privcmd_py
 

@@ -97,10 +97,15 @@ the engine depending only on the protocol *structs*, not the full networking lib
 1. Build the solution (requires the `QS` repo as above).
 2. Load the module — add to `Zone/conf/Modules.config`:
    ```xml
-   <module type="SS.Bots.BotsModule, SS.Bots" path="bin/modules/Bots/SS.Bots.dll" />
+   <module type="SS.Bots.BotsModule" path="bin/modules/Bots/SS.Bots.dll" />
    ```
 3. Attach per arena — in the arena's conf, add `Bots` to `Modules:AttachModules`.
-4. In-game: `?spawnbot <name>` and `?killbots`.
+4. Grant the command capabilities — the commands are capability-gated like every server command, so
+   add `cmd_spawnbot` and `cmd_killbots` to the appropriate group file in `conf/groupdef.dir/`
+   (e.g. `sysop`, alongside `cmd_makefake`). Without this, the commands are silently denied even
+   though the module loaded. A public command `?foo` needs `cmd_foo`; a private/targeted one needs
+   `privcmd_foo`.
+5. In-game: `?spawnbot <name>` and `?killbots`.
 
 `?spawnbot` will report "no physics world for this arena" only if the client settings can't be read
 (e.g. the arena has none); otherwise a configured world is built on attach and bots simulate.
