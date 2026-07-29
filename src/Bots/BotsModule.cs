@@ -48,6 +48,8 @@ namespace SS.Bots
         private readonly ILogManager _logManager;
         private readonly ICommandManager _commandManager;
         private readonly IChat _chat;
+        private readonly IMapData _mapData;
+        private readonly IClientSettings _clientSettings;
 
         private IPhysicsWorldProvider _worldProvider = null!;
         private ArenaDataKey<ArenaData> _adKey;
@@ -76,7 +78,9 @@ namespace SS.Bots
             IMainloopTimer mainloopTimer,
             ILogManager logManager,
             ICommandManager commandManager,
-            IChat chat)
+            IChat chat,
+            IMapData mapData,
+            IClientSettings clientSettings)
         {
             _arenaManager = arenaManager ?? throw new ArgumentNullException(nameof(arenaManager));
             _fake = fake ?? throw new ArgumentNullException(nameof(fake));
@@ -85,13 +89,15 @@ namespace SS.Bots
             _logManager = logManager ?? throw new ArgumentNullException(nameof(logManager));
             _commandManager = commandManager ?? throw new ArgumentNullException(nameof(commandManager));
             _chat = chat ?? throw new ArgumentNullException(nameof(chat));
+            _mapData = mapData ?? throw new ArgumentNullException(nameof(mapData));
+            _clientSettings = clientSettings ?? throw new ArgumentNullException(nameof(clientSettings));
         }
 
         #region Module life-cycle
 
         bool IModule.Load(IComponentBroker broker)
         {
-            _worldProvider = new PhysicsWorldProvider(_logManager);
+            _worldProvider = new PhysicsWorldProvider(_mapData, _clientSettings, _logManager);
             _adKey = _arenaManager.AllocateArenaData<ArenaData>();
 
             _commandManager.AddCommand("spawnbot", Command_spawnbot);

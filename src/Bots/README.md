@@ -4,10 +4,10 @@ A plugin that spawns **fake players driven by the QS physics engine**, so people
 against server-side bots without any external bot programs. Because the bots live inside the
 server they add no network traffic and have full, authoritative knowledge of every player.
 
-Status: **scaffold**. The pipeline is wired end-to-end and the solution builds, but no bot
-actually simulates yet — the physics world can't be built until the settings/map/collision
-bridges in [`PhysicsWorldProvider`](PhysicsWorldProvider.cs) are implemented (see *Remaining
-work* below).
+Status: **runnable, pending runtime validation**. The pipeline is wired end-to-end, the solution
+builds, and [`PhysicsWorldProvider`](PhysicsWorldProvider.cs) now builds a real, configured physics
+world for an arena (map + client settings + collision settings). What remains is to actually run it —
+spawn a bot in a live arena and confirm it moves with correct physics — plus the real brains.
 
 ## How it works
 
@@ -102,17 +102,18 @@ the engine depending only on the protocol *structs*, not the full networking lib
 3. Attach per arena — in the arena's conf, add `Bots` to `Modules:AttachModules`.
 4. In-game: `?spawnbot <name>` and `?killbots`.
 
-Until `PhysicsWorldProvider` is implemented, `?spawnbot` reports that no physics world exists and
-nothing simulates.
+`?spawnbot` will report "no physics world for this arena" only if the client settings can't be read
+(e.g. the arena has none); otherwise a configured world is built on attach and bots simulate.
 
 ## Remaining work
 
-1. **`PhysicsWorldProvider.CreateWorld`** — build the three inputs `ReplayController.Configure`
-   needs, all of which the server already has:
-   - `LevelArray` from the arena map (`IMapData` tile data),
-   - `CollisionArenaSettings` from arena settings,
-   - `GameSettings` (ship/arena/prize) parsed from the arena's Continuum client settings — without
-     this, ships get zero thrust/recharge and won't move or fight.
+1. **Runtime validation of the world bridge** — `PhysicsWorldProvider` is implemented (map →
+   `LevelArray`, raw client settings → `GameSettings`, `CollisionArenaSettings` from the parsed arena
+   settings). It builds and the 1428-byte settings layout matches by construction, but it hasn't been
+   run yet: spawn a bot in a live arena and confirm it moves with correct physics (thrust/recharge),
+   which is also the first real test that the server's `S2C_ClientSettings` bytes parse correctly in
+   the QS `GameSettings`. Getting the raw bytes needed one small Core addition,
+   `IClientSettings.GetClientSettingsData`.
 2. **Velocity scale** — confirm the wire-`XSpeed`/`YSpeed` ↔ engine-velocity factor
    (`PhysicsAdapter.VelocityScale`, currently a placeholder) against the QS packet-ingestion code.
    The position (`1000`×pixels) scale is confirmed; velocity is not.

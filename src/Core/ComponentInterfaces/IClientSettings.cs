@@ -325,5 +325,19 @@ namespace SS.Core.ComponentInterfaces
         /// <param name="id">Identifies the setting to get.</param>
         /// <returns>The value of the setting.</returns>
         int GetSetting(Player player, ClientSettingIdentifier id);
+
+        /// <summary>
+        /// Copies the raw <see cref="S2C_ClientSettings"/> packet bytes for an arena into <paramref name="destination"/>.
+        /// </summary>
+        /// <remarks>
+        /// This is the full binary client-settings buffer — the same bytes sent to clients. It exists for
+        /// consumers that need to parse the Continuum settings format as a whole rather than field-by-field
+        /// (e.g. feeding a physics simulation), which <see cref="GetSetting(Arena, ClientSettingIdentifier)"/>
+        /// cannot do efficiently.
+        /// </remarks>
+        /// <param name="arena">The arena to get settings for.</param>
+        /// <param name="destination">The buffer to copy into. Must be at least <see cref="S2C_ClientSettings.Length"/> bytes.</param>
+        /// <returns>The number of bytes written (<see cref="S2C_ClientSettings.Length"/>), or 0 if the arena is unavailable or the buffer is too small.</returns>
+        int GetClientSettingsData(Arena arena, Span<byte> destination);
     }
 }
