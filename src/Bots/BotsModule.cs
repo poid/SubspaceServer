@@ -190,41 +190,51 @@ namespace SS.Bots
                 return true; // keep the timer alive; nothing to simulate yet
 
             ReplayController world = ad.World;
-            uint tick = world.CurrentTick;
 
             // 0. Refresh the nav overlay with the engine's current door state (and drop stale bricks),
-            //    so this tick's path queries route through open doors and around live bricks.
+            //    so path queries route through open doors and around live bricks.
             if (ad.Nav is not null)
             {
                 ad.Nav.UpdateDoors(world.Canonical.DoorOpenBitmask, world.Canonical.LastDoorSwitchTick, DefaultDoorDelayTicks);
-                ad.Nav.PruneExpiredBricks(tick);
+                ad.Nav.PruneExpiredBricks(world.CurrentTick);
             }
 
-            // 1. Each bot decides; translate intent into physics commands.
+            // 1. Each bot decides once this heartbeat (10 Hz); the decision drives the whole sim window.
             foreach (Bot bot in ad.Bots)
             {
                 BotContext context = new()
                 {
                     World = world,
-                    Navigation = ad.Nav!, // non-null whenever World is (built together in AttachModule)
+                    Navigation = ad.Nav!, // non-null whenever World is (both built in EnsureWorld)
                     ShipSlot = bot.ShipSlot,
-                    CurrentTick = tick,
+                    CurrentTick = world.CurrentTick,
                 };
-
-                BotDecision decision = bot.Brain.Think(in context);
-                // Commands must target a FUTURE tick. The engine drops any command whose tick is
-                // <= the canonical snapshot's current tick (i.e. == current on a single-lane live
-                // server), so tick+1 — applied by the world.Tick() call below.
-                world.EnqueueCommand(PhysicsAdapter.ThrustInputCommand(bot.ShipSlot, tick + 1, in decision));
-                if (decision.Fire != WeaponCodes.Null)
-                    world.EnqueueCommand(PhysicsAdapter.WeaponFireCommand(bot.ShipSlot, tick + 1, decision.Fire, decision.FireLevel));
+                bot.Decision = bot.Brain.Think(in context);
             }
 
-            // 2. Advance the authoritative simulation (fills the event collector).
-            world.Tick(StepsPerTick);
+            // 2. Advance the sim one tick at a time, steering each bot every tick. SteerShip re-reads
+            //    the ship's current rotation and turns toward the target via TurnLeft/TurnRight (rate-
+            //    limited, so no overshoot) while thrusting via ThrustOnly every tick — so bots turn at
+            //    the real rotation rate AND accelerate fully, flying like real ships. Weapon fire is
+            //    issued once. Stepping singly (vs Tick(StepsPerTick)) also lets the event collector see
+            //    every tick's combat events.
+            for (uint sub = 0; sub < StepsPerTick; sub++)
+            {
+                uint cmdTick = world.CurrentTick + 1;
+                foreach (Bot bot in ad.Bots)
+                {
+                    BotDecision d = bot.Decision;
+                    world.SteerShip(new ID(bot.Player.Id), cmdTick, d.Rotation, d.ThrustOn, d.AfterburnerOn);
 
-            // 3. Resolve combat from the physics event stream, and reflect bricks into the nav overlay.
-            ProcessEvents(ad, tick);
+                    // Fire once per decision (on the first sub-tick); the engine's fire delay governs cadence.
+                    if (sub == 0 && d.Fire != WeaponCodes.Null)
+                        world.EnqueueCommand(PhysicsAdapter.WeaponFireCommand(bot.ShipSlot, cmdTick, d.Fire, d.FireLevel));
+                }
+                world.Tick(1);
+            }
+
+            // 3. Resolve combat from the physics event stream (accumulated across the sub-ticks).
+            ProcessEvents(ad, world.CurrentTick);
 
             // 4. Broadcast each bot's resulting motion through the server's normal path.
             foreach (Bot bot in ad.Bots)
@@ -397,6 +407,7 @@ namespace SS.Bots
             public required Player Player;
             public required int ShipSlot;
             public required IBotBrain Brain;
+            public BotDecision Decision; // this heartbeat's intent, executed across the sim window
         }
 
         private sealed class ArenaData : IResettable

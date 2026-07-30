@@ -24,10 +24,11 @@ namespace SS.Bots
         /// </summary>
         private const int CoordScale = 1000;
 
-        // TODO(velocity): the factor converting a wire XSpeed/YSpeed unit to the engine's
-        // internal velocity units is NOT yet confirmed. Source the exact conversion from the
-        // QS layer that ingests a real C2S position packet into a ShipPositionUpdate command
-        // and replace this placeholder — bot/real-player motion will be wrong until it matches.
+        // Wire XSpeed/YSpeed are the SAME unit as the engine's Velocity: 1:1, no scaling. Both are
+        // Coordinates1000 per tick, i.e. the ship's "Speed" setting unit — the engine clamps a ship's
+        // Velocity magnitude directly against TopSpeedCurrent (= the Speed setting), and Continuum's
+        // max wire XSpeed is likewise the Speed setting. Confirmed against the physics engine's
+        // ShipPositionUpdate velocity-clamp tests.
         private const int VelocityScale = 1;
 
         // Enum values are identical across the two type systems (verified): ShipType.Warbird(0)
@@ -93,20 +94,6 @@ namespace SS.Bots
                 ShipSlot = slot,
                 WeaponType = ToPhysicsWeapon(code),
                 WeaponLevel = level,
-            };
-        }
-
-        /// <summary>A bot's per-tick thrust/rotation input.</summary>
-        public static PhysicsCommand ThrustInputCommand(int slot, uint tick, in BotDecision d)
-        {
-            return new PhysicsCommand
-            {
-                Tick = tick,
-                Kind = CommandKind.ShipThrustInput,
-                ShipSlot = slot,
-                Rotation = d.Rotation,
-                ThrustOn = d.ThrustOn,
-                AfterburnerOn = d.AfterburnerOn,
             };
         }
 
