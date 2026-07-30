@@ -339,7 +339,25 @@ namespace SS.Bots
                 return;
             }
 
-            string name = parameters.Trim().ToString();
+            // Usage: ?spawnbot [orbit|straight] [name]. Optional leading brain selector; the rest is the
+            // name. "straight" flies forward without turning (a wall-collision probe); default is "orbit".
+            ReadOnlySpan<char> parms = parameters.Trim();
+            IBotBrain brain = new Brains.OrbitBrain();
+            string brainLabel = "orbit";
+            int sp = parms.IndexOf(' ');
+            ReadOnlySpan<char> firstToken = sp < 0 ? parms : parms[..sp];
+            if (firstToken.Equals("straight", StringComparison.OrdinalIgnoreCase))
+            {
+                brain = new Brains.StraightBrain();
+                brainLabel = "straight";
+                parms = sp < 0 ? default : parms[(sp + 1)..].Trim();
+            }
+            else if (firstToken.Equals("orbit", StringComparison.OrdinalIgnoreCase))
+            {
+                parms = sp < 0 ? default : parms[(sp + 1)..].Trim();
+            }
+
+            string name = parms.ToString();
             if (name.Length == 0)
                 name = "Bot";
 
@@ -374,9 +392,9 @@ namespace SS.Bots
 
             ad.AddedShipIds.Add(botPlayer.Id);
             ad.PlayerById[botPlayer.Id] = botPlayer;
-            ad.Bots.Add(new Bot { Player = botPlayer, ShipSlot = slot, Brain = new Brains.OrbitBrain() });
+            ad.Bots.Add(new Bot { Player = botPlayer, ShipSlot = slot, Brain = brain });
 
-            _chat.SendMessage(player, $"Bots: spawned '{name}'.");
+            _chat.SendMessage(player, $"Bots: spawned '{name}' ({brainLabel}).");
         }
 
         private void Command_killbots(ReadOnlySpan<char> commandName, ReadOnlySpan<char> parameters, Player player, ITarget target)
