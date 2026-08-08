@@ -238,6 +238,17 @@ namespace SS.Core.Modules
                         ProcessTimers();
                         waitTime = TimeSpan.Zero;
                     }
+                    else
+                    {
+                        // WaitHandle.WaitAny takes a whole number of milliseconds and truncates.
+                        // A sub-millisecond wait would truncate to zero and return immediately, and since
+                        // the timer is not due yet, ProcessTimers would find nothing to do and we would
+                        // come straight back here. With enough timers there is nearly always one due
+                        // within the next millisecond, so that spins the mainloop at thousands of
+                        // iterations per second doing no work at all, even on a completely idle server.
+                        // Round up so the wait is never truncated away.
+                        waitTime = TimeSpan.FromMilliseconds(Math.Ceiling(waitTime.TotalMilliseconds));
+                    }
                 }
                 else
                 {
