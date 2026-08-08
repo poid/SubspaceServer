@@ -44,7 +44,8 @@
        (Private=true, the default). This couples the build to the QS repo living beside
        SubspaceServer at ..\..\..\QS. See README.md for the layout requirement. -->
   <ItemGroup>
-    <ProjectReference Include="..\..\..\QS\Physics\Physics Legacy Library\Physics Legacy Library.csproj" />
+    <ProjectReference Include="..\..\..\QS\Physics\Physics Legacy Library\Physics Legacy Library.csproj"
+                      SetTargetFramework="TargetFramework=net9.0" />
   </ItemGroup>
 
 </Project>
