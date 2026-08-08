@@ -59,6 +59,16 @@ namespace SS.Core.Modules
         /// </summary>
         private long _windowStartTimestamp = Stopwatch.GetTimestamp();
 
+        // Garbage collection is sampled from the runtime at the start and end of the window rather than
+        // reported by callers, so it is kept here instead of in ServerMetric.
+        // These tell whether the object pools are actually doing their job. The pools are sized from
+        // Constants.TargetPlayerCount (512), so at much higher player counts they stop retaining enough
+        // and the server starts allocating in steady state instead of reusing.
+        private long _windowStartAllocatedBytes;
+        private int _windowStartGen0;
+        private int _windowStartGen1;
+        private int _windowStartGen2;
+
         private bool _isEnabled;
 
         #region Module members
@@ -87,6 +97,9 @@ namespace SS.Core.Modules
                 int intervalMilliseconds = reportInterval * 1000;
                 _mainloopTimer.SetTimer(MainloopTimer_Report, intervalMilliseconds, intervalMilliseconds, null);
             }
+
+            // Establishes the garbage collection baselines for the first window.
+            Reset();
 
             _iServerMetricsToken = broker.RegisterInterface<IServerMetrics>(this);
 
@@ -177,6 +190,11 @@ namespace SS.Core.Modules
                 Interlocked.Exchange(ref _values[i], 0);
             }
 
+            _windowStartAllocatedBytes = GC.GetTotalAllocatedBytes();
+            _windowStartGen0 = GC.CollectionCount(0);
+            _windowStartGen1 = GC.CollectionCount(1);
+            _windowStartGen2 = GC.CollectionCount(2);
+
             Interlocked.Exchange(ref _windowStartTimestamp, Stopwatch.GetTimestamp());
         }
 
@@ -250,6 +268,11 @@ namespace SS.Core.Modules
                 Emit(sb, player);
 
                 sb.Append($"  player lock: {Read(ServerMetric.PlayerDataReadLocks) / seconds:F0} read/s, {Read(ServerMetric.PlayerDataWriteLocks) / seconds:F0} write/s, write held {TotalMilliseconds(Read(ServerMetric.PlayerDataWriteLockHeldTicks)):F1}ms");
+                Emit(sb, player);
+
+                // Sustained allocation here means the object pools have stopped keeping up, since the
+                // server is written to avoid allocating in steady state.
+                sb.Append($"  gc: {(GC.GetTotalAllocatedBytes() - _windowStartAllocatedBytes) / seconds / 1024d:F0} KB/s allocated, gen0 {GC.CollectionCount(0) - _windowStartGen0}, gen1 {GC.CollectionCount(1) - _windowStartGen1}, gen2 {GC.CollectionCount(2) - _windowStartGen2}");
                 Emit(sb, player);
             }
             finally
