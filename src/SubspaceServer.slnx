@@ -2,6 +2,7 @@
   <Project Path="Bots/Bots.csproj" />
   <Project Path="Core/Core.csproj" />
   <Project Path="Example/Example.csproj" />
+  <Project Path="LoadClient/LoadClient.csproj" />
   <Project Path="Matchmaking/Matchmaking.csproj" />
   <Project Path="Packets/Packets.csproj" />
   <Project Path="Replay/Replay.csproj" />
