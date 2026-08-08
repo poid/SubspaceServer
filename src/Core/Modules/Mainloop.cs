@@ -58,6 +58,21 @@ namespace SS.Core.Modules
         private readonly object _mainloopTimerLock = new();
         private MainloopTimer? _timerProcessing = null;
 
+        /// <summary>
+        /// When the soonest timer in <see cref="_mainloopTimerList"/> is due, or <see langword="null"/>
+        /// when there are no timers.
+        /// </summary>
+        /// <remarks>
+        /// The mainloop needs this on every wakeup to know how long to wait for, and wakeups scale with
+        /// traffic rather than with the number of timers. Searching the list each time would make every
+        /// wakeup cost O(timers), which at a few hundred arenas is over a thousand timers per wakeup.
+        /// <para>
+        /// Guarded by <see cref="_mainloopTimerLock"/>. Must be kept current by everything that adds or
+        /// removes a timer, or changes a <see cref="MainloopTimer.WhenDue"/>.
+        /// </para>
+        /// </remarks>
+        private DateTime? _nextTimerDue;
+
         // for IServerTimer
         private readonly LinkedList<ThreadPoolTimer> _serverTimerList = new();
         private readonly Lock _serverTimerLock = new();
@@ -147,6 +162,8 @@ namespace SS.Core.Modules
                 {
                     _mainloopTimerList.Clear();
                 }
+
+                _nextTimerDue = null;
             }
 
             lock (_serverTimerLock)
@@ -213,25 +230,18 @@ namespace SS.Core.Modules
 
                 MainloopCallback.Fire(_broker);
 
-                // Wait until the next timer needs to be processed
-                // perhaps keep track of the one, so we can immediately process it?
-                // perhaps keep the list ordered such that the next one due is in front?
-
-                LinkedListNode<MainloopTimer>? dueNext = null;
+                // Wait until the next timer needs to be processed.
+                DateTime? nextTimerDue;
 
                 lock (_mainloopTimerLock)
                 {
-                    for (LinkedListNode<MainloopTimer>? node = _mainloopTimerList.First; node != null; node = node.Next)
-                    {
-                        if (dueNext == null || node.Value.WhenDue < dueNext.Value.WhenDue)
-                            dueNext = node;
-                    }
+                    nextTimerDue = _nextTimerDue;
                 }
 
                 TimeSpan waitTime;
-                if (dueNext != null)
+                if (nextTimerDue is not null)
                 {
-                    waitTime = dueNext.Value.WhenDue - DateTime.UtcNow;
+                    waitTime = nextTimerDue.Value - DateTime.UtcNow;
                     if (waitTime <= TimeSpan.Zero)
                     {
                         // already due
@@ -306,6 +316,23 @@ namespace SS.Core.Modules
             return _quitCode;
         }
 
+        /// <summary>
+        /// Recomputes <see cref="_nextTimerDue"/> from the timer list.
+        /// </summary>
+        /// <remarks><see cref="_mainloopTimerLock"/> must be held.</remarks>
+        private void RefreshNextTimerDue()
+        {
+            DateTime? nextTimerDue = null;
+
+            for (LinkedListNode<MainloopTimer>? node = _mainloopTimerList.First; node is not null; node = node.Next)
+            {
+                if (nextTimerDue is null || node.Value.WhenDue < nextTimerDue)
+                    nextTimerDue = node.Value.WhenDue;
+            }
+
+            _nextTimerDue = nextTimerDue;
+        }
+
         private void ProcessTimers()
         {
             DateTime now = DateTime.UtcNow;
@@ -361,6 +388,9 @@ namespace SS.Core.Modules
 
                 node = node.Next;
             }
+
+            // Timers were fired, removed, and re-armed above, so the soonest due time has changed.
+            RefreshNextTimerDue();
 
             Monitor.Exit(_mainloopTimerLock);
         }
@@ -517,7 +547,11 @@ namespace SS.Core.Modules
 
             lock (_mainloopTimerLock)
             {
-                _mainloopTimerList.AddLast(new MainloopTimer(initialDelay, interval, key, callbackInvoker));
+                MainloopTimer timer = new(initialDelay, interval, key, callbackInvoker);
+                _mainloopTimerList.AddLast(timer);
+
+                if (_nextTimerDue is null || timer.WhenDue < _nextTimerDue)
+                    _nextTimerDue = timer.WhenDue;
             }
 
             _mainloopTimerAutoResetEvent.Set();
@@ -610,6 +644,10 @@ namespace SS.Core.Modules
                         timersRemoved.AddLast(timer);
                     }
                 }
+
+                // Recomputed at the end rather than after the removal loop, because waiting on an
+                // in-progress timer above releases the lock and lets the mainloop change the list again.
+                RefreshNextTimerDue();
             }
 
             if (timerDisposedAction != null && timersRemoved != null)
