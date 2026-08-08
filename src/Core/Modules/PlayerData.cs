@@ -3,6 +3,7 @@ using SS.Core.ComponentCallbacks;
 using SS.Core.ComponentInterfaces;
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Threading;
 
 namespace SS.Core.Modules
@@ -18,12 +19,21 @@ namespace SS.Core.Modules
         private readonly IMainloop _mainloop;
         private InterfaceRegistrationToken<IPlayerData>? _iPlayerDataToken;
 
+        // Optional dependencies
+        private IServerMetrics? _serverMetrics;
+
         /// <summary>
         /// How long after a PlayerID can be reused after it is freed.
         /// </summary>
         private readonly static TimeSpan PlayerReuseDelay = TimeSpan.FromSeconds(10);
 
         private readonly ReaderWriterLockSlim _rwLock = new(LockRecursionPolicy.SupportsRecursion);
+
+        /// <summary>
+        /// When the current thread took the outermost write lock, for measuring how long it is held.
+        /// </summary>
+        [ThreadStatic]
+        private static long t_writeLockTimestamp;
 
         /// <summary>
         /// The next available PlayerId for when a <see cref="Player"/> object needs to be allocated.
@@ -74,6 +84,8 @@ namespace SS.Core.Modules
 
         bool IModule.Load(IComponentBroker broker)
         {
+            _serverMetrics = broker.GetInterface<IServerMetrics>();
+
             _iPlayerDataToken = broker.RegisterInterface<IPlayerData>(this);
             return true;
         }
@@ -82,6 +94,11 @@ namespace SS.Core.Modules
         {
             if (broker.UnregisterInterface(ref _iPlayerDataToken) != 0)
                 return false;
+
+            if (_serverMetrics is not null)
+            {
+                broker.ReleaseInterface(ref _serverMetrics);
+            }
 
             return true;
         }
@@ -95,6 +112,8 @@ namespace SS.Core.Modules
         public void Lock()
         {
             _rwLock.EnterReadLock();
+
+            _serverMetrics?.Increment(ServerMetric.PlayerDataReadLocks);
         }
 
         public void Unlock()
@@ -105,10 +124,26 @@ namespace SS.Core.Modules
         public void WriteLock()
         {
             _rwLock.EnterWriteLock();
+
+            IServerMetrics? serverMetrics = _serverMetrics;
+            if (serverMetrics is not null && serverMetrics.IsEnabled)
+            {
+                serverMetrics.Increment(ServerMetric.PlayerDataWriteLocks);
+
+                // The lock is recursive, so only time the outermost acquisition.
+                if (_rwLock.RecursiveWriteCount == 1)
+                    t_writeLockTimestamp = Stopwatch.GetTimestamp();
+            }
         }
 
         public void WriteUnlock()
         {
+            IServerMetrics? serverMetrics = _serverMetrics;
+            if (serverMetrics is not null && serverMetrics.IsEnabled && _rwLock.RecursiveWriteCount == 1)
+            {
+                serverMetrics.Add(ServerMetric.PlayerDataWriteLockHeldTicks, Stopwatch.GetTimestamp() - t_writeLockTimestamp);
+            }
+
             _rwLock.ExitWriteLock();
         }
 

@@ -59,6 +59,7 @@ namespace SS.Core.Modules
         private IChatNetwork? _chatNetwork;
         private ICommandManager? _commandManager;
         private IPersist? _persist;
+        private IServerMetrics? _serverMetrics;
 
         private InterfaceRegistrationToken<IGame>? _iGameToken;
 
@@ -82,6 +83,7 @@ namespace SS.Core.Modules
             _chatNetwork = broker.GetInterface<IChatNetwork>();
             _commandManager = broker.GetInterface<ICommandManager>();
             _persist = broker.GetInterface<IPersist>();
+            _serverMetrics = broker.GetInterface<IServerMetrics>();
 
             _adKey = _arenaManager.AllocateArenaData<ArenaData>();
             _pdKey = _playerData.AllocatePlayerData<PlayerData>();
@@ -199,6 +201,11 @@ namespace SS.Core.Modules
             if (_commandManager is not null)
             {
                 broker.ReleaseInterface(ref _commandManager);
+            }
+
+            if (_serverMetrics is not null)
+            {
+                broker.ReleaseInterface(ref _serverMetrics);
             }
 
             if (_persist is not null)
@@ -1439,13 +1446,18 @@ namespace SS.Core.Modules
                 bool wpnDirty = true;
                 bool posDirty = true;
 
+                // Tallied here and reported once after the loop. Reporting per candidate would put an
+                // interlocked operation in the hottest loop in the server. See IServerMetrics.
+                long candidatesScanned = 0;
+                long recipientsInView = 0;
+
                 _playerData.Lock();
 
                 try
                 {
                     // have to do this check inside pd->Lock();
                     // ignore packets from the first 500ms of death, and accept packets up to 500ms
-                    // before their expected respawn. 
+                    // before their expected respawn.
                     if (player.Flags.IsDead && gtc - player.LastDeath >= 50 && player.NextRespawn - gtc <= 50)
                     {
                         player.Flags.IsDead = false;
@@ -1454,6 +1466,8 @@ namespace SS.Core.Modules
 
                     foreach (Player otherPlayer in _playerData.Players)
                     {
+                        candidatesScanned++;
+
                         if (!otherPlayer.TryGetExtraData(_pdKey, out PlayerData? otherPlayerData))
                             continue;
 
@@ -1480,6 +1494,8 @@ namespace SS.Core.Modules
                                     && randnum > ((double)dist / (double)arenaData.PositionPixels * Constants.RandMax + 1d)) // send some radar packets
                                 || otherPlayer.Flags.SeeAllPositionPackets) // bots
                             {
+                                recipientsInView++;
+
                                 int extraLength;
 
                                 const int plainLength = 0;
@@ -1678,6 +1694,13 @@ namespace SS.Core.Modules
                 finally
                 {
                     _playerData.Unlock();
+                }
+
+                if (_serverMetrics is not null && _serverMetrics.IsEnabled)
+                {
+                    _serverMetrics.Increment(ServerMetric.PositionPacketsHandled);
+                    _serverMetrics.Add(ServerMetric.PositionCandidatesScanned, candidatesScanned);
+                    _serverMetrics.Add(ServerMetric.PositionRecipientsInView, recipientsInView);
                 }
 
                 PlayerPositionPacketCallback.Fire(arena, player, ref pos, ref extra, hasExtra);

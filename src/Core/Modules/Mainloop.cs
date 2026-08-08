@@ -5,6 +5,7 @@ using SS.Utilities;
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Threading;
 
 namespace SS.Core.Modules
@@ -13,13 +14,18 @@ namespace SS.Core.Modules
     /// The equivalent of ASSS' mainloop.[ch]
     /// </summary>
     [CoreModuleInfo]
-    public sealed class Mainloop : IModule, IMainloop, IMainloopTimer, IServerTimer, IDisposable
+    public sealed class Mainloop : IModule, IModuleLoaderAware, IMainloop, IMainloopTimer, IServerTimer, IDisposable
     {
         private readonly IComponentBroker _broker;
         private IObjectPoolManager? _objectPoolManager;
         private InterfaceRegistrationToken<IMainloop>? _iMainloopToken;
         private InterfaceRegistrationToken<IMainloopTimer>? _iMainloopTimerToken;
         private InterfaceRegistrationToken<IServerTimer>? _iServerTimerToken;
+
+        // Optional dependencies.
+        // Retrieved in PostLoad since this module loads before the ones that provide them.
+        private IConfigManager? _configManager;
+        private IServerMetrics? _serverMetrics;
 
         // for main loop
         private readonly CancellationTokenSource _cancellationTokenSource = new();
@@ -28,9 +34,23 @@ namespace SS.Core.Modules
         private ExitCode _quitCode = ExitCode.None;
 
         // for main loop workitems
-        private readonly BlockingCollection<IRunInMainWorkItem> _runInMainQueue = []; // not bounded
+        private readonly BlockingCollection<IRunInMainWorkItem> _runInMainQueue = [];
         private readonly AutoResetEvent _runInMainAutoResetEvent = new(false);
         private SynchronizationContext? _originalSynchronizationContext;
+
+        /// <summary>
+        /// The most work items allowed to be waiting at once, or 0 for no limit.
+        /// </summary>
+        /// <remarks>
+        /// The queue is not bounded by <see cref="BlockingCollection{T}"/> itself, because the limit is
+        /// read from config in <see cref="IModuleLoaderAware.PostLoad"/>, which is long after this module
+        /// is constructed and after work items can already have been queued.
+        /// <para>
+        /// This is a shed-load backstop, not a precise limit. The depth check and the add are not atomic,
+        /// so the queue can briefly exceed the limit, which is fine for its purpose.
+        /// </para>
+        /// </remarks>
+        private int _maxQueueDepth;
 
         // for IMainloopTimer
         private readonly LinkedList<MainloopTimer> _mainloopTimerList = new();
@@ -72,6 +92,38 @@ namespace SS.Core.Modules
             _iMainloopToken = broker.RegisterInterface<IMainloop>(this);
 
             return true;
+        }
+
+        [ConfigHelp<int>("Mainloop", "MaxQueueDepth", ConfigScope.Global, Default = 0, Min = 0,
+            Description = """
+                The most work items allowed to wait in the mainloop queue at once, or 0 for no limit.
+                When the limit is reached, further work is rejected rather than queued, which sheds load
+                instead of letting latency and memory grow without bound. Rejections are counted and logged.
+                """)]
+        void IModuleLoaderAware.PostLoad(IComponentBroker broker)
+        {
+            _configManager = broker.GetInterface<IConfigManager>();
+            _serverMetrics = broker.GetInterface<IServerMetrics>();
+
+            if (_configManager is not null)
+            {
+                _maxQueueDepth = _configManager.GetInt(_configManager.Global, "Mainloop", "MaxQueueDepth", ConfigHelp.Constants.Global.Mainloop.MaxQueueDepth.Default);
+                if (_maxQueueDepth < 0)
+                    _maxQueueDepth = 0;
+            }
+        }
+
+        void IModuleLoaderAware.PreUnload(IComponentBroker broker)
+        {
+            if (_configManager is not null)
+            {
+                broker.ReleaseInterface(ref _configManager);
+            }
+
+            if (_serverMetrics is not null)
+            {
+                broker.ReleaseInterface(ref _serverMetrics);
+            }
         }
 
         bool IModule.Unload(IComponentBroker broker)
@@ -154,6 +206,11 @@ namespace SS.Core.Modules
 
             while (!_cancellationToken.IsCancellationRequested)
             {
+                // Time spent working, not the blocking wait below. Accumulated across the two work
+                // phases (before and after the wait) and reported once per iteration.
+                long workTicks = 0;
+                long workStart = Stopwatch.GetTimestamp();
+
                 MainloopCallback.Fire(_broker);
 
                 // Wait until the next timer needs to be processed
@@ -187,11 +244,16 @@ namespace SS.Core.Modules
                     waitTime = TimeSpan.FromMilliseconds(-1); // wait indefinitely
                 }
 
+                workTicks += Stopwatch.GetTimestamp() - workStart;
+
                 // wait until:
-                // the next timer needs to be run 
-                // OR 
+                // the next timer needs to be run
+                // OR
                 // we're signaled (to quit, that another timer was added, or that another work item was added)
                 int waitHandleIndex = WaitHandle.WaitAny(waitHandles, waitTime);
+
+                workStart = Stopwatch.GetTimestamp();
+
                 switch (waitHandleIndex)
                 {
                     case WaitHandle.WaitTimeout:
@@ -218,6 +280,15 @@ namespace SS.Core.Modules
                     case 2:
                         // at least one timer was added
                         break;
+                }
+
+                IServerMetrics? serverMetrics = _serverMetrics;
+                if (serverMetrics is not null && serverMetrics.IsEnabled)
+                {
+                    workTicks += Stopwatch.GetTimestamp() - workStart;
+
+                    serverMetrics.Increment(ServerMetric.MainloopIterations);
+                    serverMetrics.Add(ServerMetric.MainloopElapsedTicks, workTicks);
                 }
             }
 
@@ -292,6 +363,12 @@ namespace SS.Core.Modules
             int maxToProcess = _runInMainQueue.Count;
             int count = 0;
 
+            IServerMetrics? serverMetrics = _serverMetrics;
+            if (serverMetrics is not null && serverMetrics.IsEnabled)
+            {
+                serverMetrics.SetGauge(ServerMetric.MainloopQueueDepth, maxToProcess);
+            }
+
             while (++count <= maxToProcess
                 && _runInMainQueue.TryTake(out IRunInMainWorkItem? workItem))
             {
@@ -312,6 +389,19 @@ namespace SS.Core.Modules
                     }
                 }
             }
+
+            if (serverMetrics is not null && serverMetrics.IsEnabled)
+            {
+                serverMetrics.Add(ServerMetric.MainloopWorkItemsProcessed, count - 1);
+
+                // A limit hit is draining the whole allowed batch AND still finding work left over,
+                // which means producers outpaced the single consumer. Draining the batch and leaving the
+                // queue empty is just a normal complete drain, not saturation.
+                if (maxToProcess > 0 && count - 1 >= maxToProcess && _runInMainQueue.Count > 0)
+                {
+                    serverMetrics.Increment(ServerMetric.MainloopDrainLimitHits);
+                }
+            }
         }
 
         void IMainloop.Quit(ExitCode code)
@@ -326,6 +416,15 @@ namespace SS.Core.Modules
 
             if (_runInMainQueue.IsAddingCompleted)
                 return false;
+
+            // Shed load rather than letting the queue grow without bound.
+            // Callers already handle a false return by discarding the work and any buffer it holds.
+            int maxQueueDepth = _maxQueueDepth;
+            if (maxQueueDepth > 0 && _runInMainQueue.Count >= maxQueueDepth)
+            {
+                _serverMetrics?.Increment(ServerMetric.MainloopWorkItemsDropped);
+                return false;
+            }
 
             RunInMainWorkItem<TState> workItem = (_objectPoolManager?.GetPool<RunInMainWorkItem<TState>>() ?? Pool<RunInMainWorkItem<TState>>.Default).Get();
             workItem.Set(callback, state);
