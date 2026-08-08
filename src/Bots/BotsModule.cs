@@ -115,6 +115,7 @@ namespace SS.Bots
 
             _commandManager.AddCommand("spawnbot", Command_spawnbot);
             _commandManager.AddCommand("killbots", Command_killbots);
+            _commandManager.AddCommand("loadtest", Command_loadtest);
             return true;
         }
 
@@ -122,6 +123,7 @@ namespace SS.Bots
         {
             _commandManager.RemoveCommand("spawnbot", Command_spawnbot);
             _commandManager.RemoveCommand("killbots", Command_killbots);
+            _commandManager.RemoveCommand("loadtest", Command_loadtest);
 
             _arenaManager.FreeArenaData(ref _adKey);
             return true;
@@ -975,7 +977,20 @@ namespace SS.Bots
             if (arena is null || !arena.TryGetExtraData(_adKey, out ArenaData? ad))
                 return;
 
+            int count = RemoveAllBots(ad);
+
+            _chat.SendMessage(player, $"Bots: removed {count} bot(s).");
+        }
+
+        /// <summary>
+        /// Removes every bot in an arena.
+        /// </summary>
+        /// <param name="ad">The arena's data.</param>
+        /// <returns>How many bots were removed.</returns>
+        private int RemoveAllBots(ArenaData ad)
+        {
             int count = ad.Bots.Count;
+
             foreach (Bot bot in ad.Bots)
             {
                 ad.World?.EnqueueCommand(PhysicsAdapter.ShipRemoveCommand(bot.ShipSlot, ad.World.CurrentTick + 1));
@@ -983,9 +998,225 @@ namespace SS.Bots
                 ad.AddedShipIds.Remove(bot.Player.Id);
                 _fake.EndFaked(bot.Player);
             }
+
             ad.Bots.Clear();
 
-            _chat.SendMessage(player, $"Bots: removed {count} bot(s).");
+            return count;
+        }
+
+        [CommandHelp(
+            Targets = CommandTarget.None,
+            Args = "<bots per arena> [arena count] | stop",
+            Description = """
+                Spawns bots to generate load for performance measurement, and reports what it did.
+                Bots are spread over a wide area of each map rather than spawned on top of the caller,
+                because the cost being measured depends on how many of them are in view of each other.
+                Give an arena count to spread the load over that many arenas; only arenas that are
+                running and have this module attached are used. Use ?loadtest stop to remove them all.
+                """)]
+        private void Command_loadtest(ReadOnlySpan<char> commandName, ReadOnlySpan<char> parameters, Player player, ITarget target)
+        {
+            ReadOnlySpan<char> parms = parameters.Trim();
+
+            if (parms.Equals("stop", StringComparison.OrdinalIgnoreCase))
+            {
+                Command_loadtest_Stop(player);
+                return;
+            }
+
+            if (!int.TryParse(PeekToken(parms), out int botsPerArena) || botsPerArena <= 0)
+            {
+                _chat.SendMessage(player, "Bots: usage is ?loadtest <bots per arena> [arena count], or ?loadtest stop.");
+                return;
+            }
+
+            parms = PopToken(parms);
+
+            int arenaCount = 1;
+            if (int.TryParse(PeekToken(parms), out int parsedArenaCount) && parsedArenaCount > 0)
+                arenaCount = parsedArenaCount;
+
+            // Collect the arenas to load, starting with the caller's so that a plain "?loadtest 100"
+            // does the obvious thing.
+            List<Arena> targetArenas = new(arenaCount);
+
+            if (player.Arena is not null && player.Arena.TryGetExtraData(_adKey, out _))
+                targetArenas.Add(player.Arena);
+
+            if (targetArenas.Count < arenaCount)
+            {
+                _arenaManager.Lock();
+
+                try
+                {
+                    foreach (Arena candidate in _arenaManager.Arenas)
+                    {
+                        if (targetArenas.Count >= arenaCount)
+                            break;
+
+                        if (candidate.Status == ArenaState.Running
+                            && !targetArenas.Contains(candidate)
+                            && candidate.TryGetExtraData(_adKey, out _))
+                        {
+                            targetArenas.Add(candidate);
+                        }
+                    }
+                }
+                finally
+                {
+                    _arenaManager.Unlock();
+                }
+            }
+
+            if (targetArenas.Count == 0)
+            {
+                _chat.SendMessage(player, "Bots: no arena available. Attach this module to an arena first (Modules:AttachModules).");
+                return;
+            }
+
+            int spawned = 0;
+            foreach (Arena arena in targetArenas)
+            {
+                spawned += SpawnLoadTestBots(arena, botsPerArena);
+            }
+
+            _chat.SendMessage(player, $"Bots: spawned {spawned} bot(s) across {targetArenas.Count} arena(s).");
+
+            if (targetArenas.Count < arenaCount)
+                _chat.SendMessage(player, $"Bots: wanted {arenaCount} arenas but only {targetArenas.Count} had this module attached.");
+
+            _logManager.LogM(LogLevel.Info, nameof(BotsModule), $"Load test spawned {spawned} bot(s) across {targetArenas.Count} arena(s).");
+        }
+
+        private void Command_loadtest_Stop(Player player)
+        {
+            int removed = 0;
+            int arenasCleared = 0;
+
+            _arenaManager.Lock();
+
+            try
+            {
+                foreach (Arena arena in _arenaManager.Arenas)
+                {
+                    if (!arena.TryGetExtraData(_adKey, out ArenaData? ad) || ad.Bots.Count == 0)
+                        continue;
+
+                    removed += RemoveAllBots(ad);
+                    arenasCleared++;
+                }
+            }
+            finally
+            {
+                _arenaManager.Unlock();
+            }
+
+            _chat.SendMessage(player, $"Bots: load test stopped, removed {removed} bot(s) from {arenasCleared} arena(s).");
+            _logManager.LogM(LogLevel.Info, nameof(BotsModule), $"Load test stopped, removed {removed} bot(s) from {arenasCleared} arena(s).");
+        }
+
+        /// <summary>
+        /// Spawns load test bots scattered across an arena's map.
+        /// </summary>
+        /// <remarks>
+        /// Every bot gets an <see cref="Brains.OrbitBrain"/>. It thrusts while turning, which produces a
+        /// tight loop riding on a persistent line of travel, and it bounces off whatever it meets, so the
+        /// population keeps moving and spreading out for as long as the test runs. A brain that flies
+        /// straight would pile every bot against a wall within seconds, which both stops resembling play
+        /// and makes the numbers depend on the map's wall layout instead of the load.
+        /// </remarks>
+        /// <param name="arena">The arena to spawn in.</param>
+        /// <param name="count">How many bots to spawn.</param>
+        /// <returns>How many bots were actually spawned.</returns>
+        private int SpawnLoadTestBots(Arena arena, int count)
+        {
+            if (!arena.TryGetExtraData(_adKey, out ArenaData? ad))
+                return 0;
+
+            EnsureWorld(arena, ad);
+
+            ReplayController? world = ad.World;
+            if (world is null)
+            {
+                _logManager.LogA(LogLevel.Warn, nameof(BotsModule), arena, "Load test could not create a physics world for this arena.");
+                return 0;
+            }
+
+            // Deliberately seeded from the arena name rather than the clock, so that repeating a load
+            // test puts the bots in the same places. Comparing a measurement against an earlier run is
+            // only meaningful if the spread of bots, and therefore how many are in view, is the same.
+            uint random = (uint)arena.Name.GetHashCode() | 1u;
+
+            int spawned = 0;
+            for (int i = 0; i < count; i++)
+            {
+                const ShipType ship = ShipType.Warbird;
+
+                Player? botPlayer = _fake.CreateFakePlayer($"Load{i:D4}", arena, ShipType.Spec, 0);
+                if (botPlayer is null)
+                    break;
+
+                _game.SetShipAndFreq(botPlayer, ship, 0);
+
+                int slot = world.GetOrAllocateShipSlot(new ID(botPlayer.Id));
+
+                GetScatteredSpawn(arena, ref random, out short spawnX, out short spawnY);
+                C2S_PositionPacket spawn = new() { X = spawnX, Y = spawnY };
+                world.EnqueueCommand(PhysicsAdapter.ShipAddCommand(slot, world.CurrentTick + 1, botPlayer.Id, ship, 0, in spawn));
+
+                ad.AddedShipIds.Add(botPlayer.Id);
+                ad.PlayerById[botPlayer.Id] = botPlayer;
+                ad.Bots.Add(new Bot { Player = botPlayer, ShipSlot = slot, Brain = new Brains.OrbitBrain() });
+
+                spawned++;
+            }
+
+            return spawned;
+        }
+
+        /// <summary>
+        /// Picks a spawn position on open ground, spread over the whole map.
+        /// </summary>
+        /// <remarks>
+        /// Maps have enclosed areas, so a narrow spread would strand part of the population in them.
+        /// Covering the full map means only a small share start enclosed and the rest disperse normally.
+        /// </remarks>
+        private void GetScatteredSpawn(Arena arena, ref uint random, out short x, out short y)
+        {
+            const int TileCount = 1024;      // maps are 1024 x 1024 tiles
+            const int PixelsPerTile = 16;
+            const int Margin = 8;            // keep clear of the map's solid border
+            const int MaxAttempts = 64;
+
+            for (int attempt = 0; attempt < MaxAttempts; attempt++)
+            {
+                short tileX = (short)(Margin + (NextRandom(ref random) % (TileCount - (Margin * 2))));
+                short tileY = (short)(Margin + (NextRandom(ref random) % (TileCount - (Margin * 2))));
+
+                // 0 means there is no tile there, i.e. open space.
+                if ((byte)_mapData.GetTile(arena, new TileCoordinates(tileX, tileY)) == 0)
+                {
+                    x = (short)((tileX * PixelsPerTile) + (PixelsPerTile / 2));
+                    y = (short)((tileY * PixelsPerTile) + (PixelsPerTile / 2));
+                    return;
+                }
+            }
+
+            // Every attempt hit something solid, which a real map should not manage. Fall back to the
+            // centre rather than skipping the bot, so the requested load still gets generated.
+            x = (short)(TileCount / 2 * PixelsPerTile);
+            y = (short)(TileCount / 2 * PixelsPerTile);
+        }
+
+        /// <summary>
+        /// Xorshift, so that a load test is reproducible without depending on the shared PRNG.
+        /// </summary>
+        private static uint NextRandom(ref uint state)
+        {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            return state;
         }
 
         #endregion
