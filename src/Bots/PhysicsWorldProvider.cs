@@ -5,7 +5,7 @@ using SS.Core.Map;
 using SS.Packets.Game;
 using QS.Networking.Protocols.Game;        // GameSettings
 using QS.Networking.Protocols.Game.Enums;  // TileTypes
-using QS.Physics.Legacy;                    // LevelArray, CollisionArenaSettings, ReplayController, WorldStateConfig
+using QS.Physics.Legacy;                    // LevelArray, ReplayController, WorldStateConfig
 
 namespace SS.Bots
 {
@@ -70,19 +70,13 @@ namespace SS.Bots
             //    are written. One-time per arena attach; ~1M reads but only a few thousand writes.
             LevelArray level = BuildLevel(arena);
 
-            // 3. Collision settings — both scalars are already parsed into the arena settings.
-            CollisionArenaSettings collision = new()
-            {
-                BounceFactor = gameSettings.arenas.BounceFactor,
-                WormholeSwitchTime = (int)gameSettings.arenas.WormholeSwitchTime,
-                GameSettings = gameSettings,
-            };
-
-            // 4. Build and configure the controller. A single canonical lane (delays = {0}) is correct for a
+            // 3. Build and configure the controller. A single canonical lane (delays = {0}) is correct for a
             //    live authoritative server; the multi-lane rollback support is for client-side prediction.
+            //    The collision scalars (bounce factor, wormhole switch time) are read from gameSettings.arenas
+            //    inside Configure now, so no separate settings object is passed.
             WorldStateConfig config = WorldStateConfig.Default;
             ReplayController controller = new(currentTick, [0u], in config);
-            controller.Configure(level, collision, gameSettings);
+            controller.Configure(level, gameSettings);
 
             _logManager.LogA(LogLevel.Info, nameof(BotsModule), arena, "Physics world configured for bots.");
             return controller;

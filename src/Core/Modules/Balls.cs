@@ -209,6 +209,49 @@ namespace SS.Core.Modules
             }
         }
 
+        bool IBalls.TryReportGoal(Arena arena, byte ballId, Player scorer, TileCoordinates goalTile)
+        {
+            if (arena is null || scorer is null)
+                return false;
+
+            HandleGoal(arena, scorer, ballId, goalTile);
+            return true;
+        }
+
+        bool IBalls.TryPickupBall(Arena arena, byte ballId, Player player)
+        {
+            if (arena is null || player is null)
+                return false;
+
+            if (player.Status != PlayerState.Playing || player.Ship >= ShipType.Spec)
+                return false;
+
+            if (!arena.TryGetExtraData(_adKey, out ArenaData? ad))
+                return false;
+
+            lock (ad.Lock)
+            {
+                return DoPickupBall(arena, ad, ballId, player, checkTime: false, requestTime: 0);
+            }
+        }
+
+        bool IBalls.TryShootBall(Arena arena, byte ballId, Player player, short x, short y, short xSpeed, short ySpeed, ServerTick time)
+        {
+            if (arena is null || player is null)
+                return false;
+
+            if (player.Status != PlayerState.Playing || player.Ship >= ShipType.Spec)
+                return false;
+
+            if (!arena.TryGetExtraData(_adKey, out ArenaData? ad))
+                return false;
+
+            lock (ad.Lock)
+            {
+                return DoShootBall(arena, ad, ballId, player, x, y, xSpeed, ySpeed, time);
+            }
+        }
+
         void IBalls.GetGoalInfo(Arena arena, short freq, TileCoordinates coordinates, out bool isScorable, out short? ownerFreq)
         {
             ArgumentNullException.ThrowIfNull(arena);
@@ -512,80 +555,88 @@ namespace SS.Core.Modules
 
             lock (ad.Lock)
             {
-                byte ballId = c2s.BallId;
+                // checkTime enforces the client "stale coords" guard: the request must reference the ball's
+                // current fire timestamp so a client can't grab it from an out-of-date position.
+                DoPickupBall(arena, ad, c2s.BallId, player, checkTime: true, requestTime: c2s.Time);
+            }
+        }
 
-                if (ballId >= ad.BallCount)
+        // Shared pickup logic for the C2S packet and IBalls.TryPickupBall (server-side bots). Caller holds
+        // ad.Lock. Arbitration: the ball must be OnMap and the player must not already carry a ball; the first
+        // valid caller flips it to Carried (a later one sees Carried and loses). Returns true if granted.
+        private bool DoPickupBall(Arena arena, ArenaData ad, byte ballId, Player player, bool checkTime, uint requestTime)
+        {
+            if (ballId >= ad.BallCount)
+            {
+                _logManager.LogP(LogLevel.Warn, nameof(Balls), player, $"State sync problem: tried to pick up nonexistent ball {ballId}");
+                return false;
+            }
+
+            ref BallData bd = ref ad.Balls[ballId];
+            ref ExtraBallStateInfo extraInfo = ref ad.ExtraBallStateInfo[ballId];
+
+            // Make sure someone else didn't get it first.
+            if (bd.State != BallState.OnMap)
+            {
+                _logManager.LogP(LogLevel.Warn, nameof(Balls), player, "State sync problem: tried to pick up a ball that can't be picked up at the moment.");
+                return false;
+            }
+
+            if (checkTime && requestTime != bd.Time && (player != extraInfo.LastKiller || requestTime != extraInfo.KillerValidPickupTime))
+            {
+                _logManager.LogP(LogLevel.Warn, nameof(Balls), player, "State sync problem: tried to pick up a ball from stale coords.");
+                return false;
+            }
+
+            // Make sure the player doesn't carry more than one ball.
+            for (int i = 0; i < ad.BallCount; i++)
+            {
+                if (ad.Balls[i].Carrier == player
+                    && ad.Balls[i].State == BallState.Carried
+                    && i != ballId)
                 {
-                    _logManager.LogP(LogLevel.Warn, nameof(Balls), player, $"State sync problem: tried to pick up nonexistent ball {ballId}");
-                    return;
-                }
-
-                ref BallData bd = ref ad.Balls[ballId];
-                ref ExtraBallStateInfo extraInfo = ref ad.ExtraBallStateInfo[ballId];
-
-                // Make sure someone else didn't get it first.
-                if (bd.State != BallState.OnMap)
-                {
-                    _logManager.LogP(LogLevel.Warn, nameof(Balls), player, "State sync problem: tried to pick up a ball that can't be picked up at the moment.");
-                    return;
-                }
-
-                if (c2s.Time != bd.Time && (player != extraInfo.LastKiller || c2s.Time != extraInfo.KillerValidPickupTime))
-                {
-                    _logManager.LogP(LogLevel.Warn, nameof(Balls), player, "State sync problem: tried to pick up a ball from stale coords.");
-                    return;
-                }
-
-                // Make sure the player doesn't carry more than one ball.
-                for (int i = 0; i < ad.BallCount; i++)
-                {
-                    if (ad.Balls[i].Carrier == player
-                        && ad.Balls[i].State == BallState.Carried
-                        && i != ballId)
-                    {
-                        return;
-                    }
-                }
-
-                BallData defaultBallData = bd;
-
-                bd.State = BallState.Carried;
-                bd.X = player.Position.X;
-                bd.Y = player.Position.Y;
-                bd.XSpeed = 0;
-                bd.YSpeed = 0;
-                bd.Carrier = player;
-                bd.Freq = player.Freq;
-                bd.Time = 0;
-                bd.LastUpdate = ServerTick.Now;
-
-                bool allow = true;
-
-                // Consult advisors to allow other modules to affect the pickup.
-                var advisors = arena.GetAdvisors<IBallsAdvisor>();
-                foreach (var advisor in advisors)
-                {
-                    if (!(allow = advisor.AllowPickupBall(arena, player, ballId, ref bd)))
-                        break;
-                }
-
-                if (!allow)
-                {
-                    bd = defaultBallData;
-                    SendBallPacket(arena, ballId);
-                }
-                else
-                {
-                    ad.Previous[ballId] = defaultBallData;
-                    extraInfo.LastKiller = null;
-                    SendBallPacket(arena, ballId);
-
-                    // now call callbacks
-                    BallPickupCallback.Fire(arena, arena, player, ballId);
-
-                    _logManager.LogP(LogLevel.Info, nameof(Balls), player, $"Picked up ball {ballId}.");
+                    return false;
                 }
             }
+
+            BallData defaultBallData = bd;
+
+            bd.State = BallState.Carried;
+            bd.X = player.Position.X;
+            bd.Y = player.Position.Y;
+            bd.XSpeed = 0;
+            bd.YSpeed = 0;
+            bd.Carrier = player;
+            bd.Freq = player.Freq;
+            bd.Time = 0;
+            bd.LastUpdate = ServerTick.Now;
+
+            bool allow = true;
+
+            // Consult advisors to allow other modules to affect the pickup.
+            var advisors = arena.GetAdvisors<IBallsAdvisor>();
+            foreach (var advisor in advisors)
+            {
+                if (!(allow = advisor.AllowPickupBall(arena, player, ballId, ref bd)))
+                    break;
+            }
+
+            if (!allow)
+            {
+                bd = defaultBallData;
+                SendBallPacket(arena, ballId);
+                return false;
+            }
+
+            ad.Previous[ballId] = defaultBallData;
+            extraInfo.LastKiller = null;
+            SendBallPacket(arena, ballId);
+
+            // now call callbacks
+            BallPickupCallback.Fire(arena, arena, player, ballId);
+
+            _logManager.LogP(LogLevel.Info, nameof(Balls), player, $"Picked up ball {ballId}.");
+            return true;
         }
 
         private void Packet_ShootBall(Player player, ReadOnlySpan<byte> data, NetReceiveFlags flags)
@@ -617,70 +668,79 @@ namespace SS.Core.Modules
 
             lock (ad.Lock)
             {
-                if (ballId >= ad.BallCount)
-                {
-                    _logManager.LogP(LogLevel.Warn, nameof(Balls), player, $"State sync problem: tried to shoot nonexistent ball {ballId}");
-                    return;
-                }
-
-                ref BallData bd = ref ad.Balls[ballId];
-                ref ExtraBallStateInfo extraInfo = ref ad.ExtraBallStateInfo[ballId];
-
-                if (bd.State != BallState.Carried || bd.Carrier != player)
-                {
-                    _logManager.LogP(LogLevel.Warn, nameof(Balls), player, "State sync problem: tried to shoot ball he wasn't carrying.");
-                    return;
-                }
-
-                BallData defaultBallData = bd;
-
-                bd.State = BallState.OnMap;
-                bd.X = c2s.X;
-                bd.Y = c2s.Y;
-                bd.XSpeed = c2s.XSpeed;
-                bd.YSpeed = c2s.YSpeed;
-                bd.Freq = player.Freq;
-                bd.Time = c2s.Time;
-                bd.LastUpdate = ServerTick.Now;
-
-                bool allow = true;
-
-                // Consult advisors to allow other modules to affect the ball shot.
-                var advisors = arena.GetAdvisors<IBallsAdvisor>();
-                foreach (var advisor in advisors)
-                {
-                    if (!(allow = advisor.AllowShootBall(arena, player, ballId, false, ref bd)))
-                        break;
-                }
-
-                if (!allow)
-                {
-                    bd = defaultBallData;
-                    SendBallPacket(arena, ballId);
-                }
-                else
-                {
-                    ad.Previous[ballId] = defaultBallData;
-                    extraInfo.LastKiller = null;
-                    SendBallPacket(arena, ballId);
-
-                    // now call callbacks
-                    BallShootCallback.Fire(arena, arena, player, ballId);
-
-                    _logManager.LogP(LogLevel.Info, nameof(Balls), player, $"Shot ball {ballId}.");
-
-                    TileCoordinates coordinates = new((short)(bd.X / 16), (short)(bd.Y / 16));
-                    if (bd.Carrier != null
-                        && _mapData.GetTile(arena, coordinates).IsGoal)
-                    {
-                        // Shot a ball on top of a goal tile.
-                        // Check whether it's a goal and if it is don't wait for the goal packet.
-                        // Waiting for the goal packet is undesirable because it is a race between who has the better connection.
-                        _logManager.LogP(LogLevel.Drivel, nameof(Balls), player, $"Shot ball {ballId} on top of goal tile.");
-                        HandleGoal(arena, bd.Carrier, ballId, coordinates);
-                    }
-                }
+                DoShootBall(arena, ad, ballId, player, c2s.X, c2s.Y, c2s.XSpeed, c2s.YSpeed, c2s.Time);
             }
+        }
+
+        // Shared shoot logic for the C2S packet and IBalls.TryShootBall (server-side bots). Caller holds
+        // ad.Lock. The player must currently carry the ball. Also detects a shot landing on a goal tile.
+        // Returns true if the shot was accepted (the ball is now on the map).
+        private bool DoShootBall(Arena arena, ArenaData ad, byte ballId, Player player, short x, short y, short xSpeed, short ySpeed, ServerTick time)
+        {
+            if (ballId >= ad.BallCount)
+            {
+                _logManager.LogP(LogLevel.Warn, nameof(Balls), player, $"State sync problem: tried to shoot nonexistent ball {ballId}");
+                return false;
+            }
+
+            ref BallData bd = ref ad.Balls[ballId];
+            ref ExtraBallStateInfo extraInfo = ref ad.ExtraBallStateInfo[ballId];
+
+            if (bd.State != BallState.Carried || bd.Carrier != player)
+            {
+                _logManager.LogP(LogLevel.Warn, nameof(Balls), player, "State sync problem: tried to shoot ball he wasn't carrying.");
+                return false;
+            }
+
+            BallData defaultBallData = bd;
+
+            bd.State = BallState.OnMap;
+            bd.X = x;
+            bd.Y = y;
+            bd.XSpeed = xSpeed;
+            bd.YSpeed = ySpeed;
+            bd.Freq = player.Freq;
+            bd.Time = time;
+            bd.LastUpdate = ServerTick.Now;
+
+            bool allow = true;
+
+            // Consult advisors to allow other modules to affect the ball shot.
+            var advisors = arena.GetAdvisors<IBallsAdvisor>();
+            foreach (var advisor in advisors)
+            {
+                if (!(allow = advisor.AllowShootBall(arena, player, ballId, false, ref bd)))
+                    break;
+            }
+
+            if (!allow)
+            {
+                bd = defaultBallData;
+                SendBallPacket(arena, ballId);
+                return false;
+            }
+
+            ad.Previous[ballId] = defaultBallData;
+            extraInfo.LastKiller = null;
+            SendBallPacket(arena, ballId);
+
+            // now call callbacks
+            BallShootCallback.Fire(arena, arena, player, ballId);
+
+            _logManager.LogP(LogLevel.Info, nameof(Balls), player, $"Shot ball {ballId}.");
+
+            TileCoordinates coordinates = new((short)(bd.X / 16), (short)(bd.Y / 16));
+            if (bd.Carrier != null
+                && _mapData.GetTile(arena, coordinates).IsGoal)
+            {
+                // Shot a ball on top of a goal tile.
+                // Check whether it's a goal and if it is don't wait for the goal packet.
+                // Waiting for the goal packet is undesirable because it is a race between who has the better connection.
+                _logManager.LogP(LogLevel.Drivel, nameof(Balls), player, $"Shot ball {ballId} on top of goal tile.");
+                HandleGoal(arena, bd.Carrier, ballId, coordinates);
+            }
+
+            return true;
         }
 
         private void Packet_Goal(Player player, ReadOnlySpan<byte> data, NetReceiveFlags flags)

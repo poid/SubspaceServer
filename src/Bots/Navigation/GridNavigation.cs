@@ -25,12 +25,14 @@ namespace SS.Bots.Navigation
         private const int N = Size * Size;                  // 1,048,576 tiles
 
         // ---- Static substrate (immutable after Build) ----
-        private readonly bool[] _wall = new bool[N];        // wall/hazard, inflated by ship radius
+        private readonly bool[] _wall = new bool[N];        // RAW wall/hazard (hard block + region boundary)
+        private readonly bool[] _nearWall = new bool[N];    // within a ship-radius of a raw wall — SOFT A* cost only
         private readonly bool[] _door = new bool[N];        // door tile (conditionally passable)
         private readonly byte[] _doorBit = new byte[N];     // which door type (0-7), valid where _door
         private readonly int[] _region = new int[N];        // region id, or -1 if blocked/door
         private int _regionCount;
         private int _portalCount;
+        private int _shipRadiusTiles;                        // hull half-width, for hull-aware line clearance
 
         // ---- Dynamic overlay ----
         private byte _doorOpenMask;                         // bit N set => door type 162+N is open
@@ -50,6 +52,10 @@ namespace SS.Bots.Navigation
         private const float WaitCostPerTick = 0.05f;
         private const float CardinalCost = 1.0f;
         private const float DiagonalCost = 1.41421356f;
+        // Soft penalty for planning through a tile within a ship-radius of a wall. High enough to prefer
+        // open lanes, low enough to still take a tight gap when it's the only route (vs. hard-blocking,
+        // which disconnected the map). Tunable.
+        private const float NearWallCost = 3.0f;
 
         public bool IsReady { get; private set; }
         public NavStats Stats => new(_regionCount, _portalCount, CountBlocked());
@@ -62,8 +68,9 @@ namespace SS.Bots.Navigation
         public static GridNavigation Build(LevelArray level, int shipRadiusTiles)
         {
             GridNavigation nav = new();
+            nav._shipRadiusTiles = Math.Max(0, shipRadiusTiles);
             nav.Classify(level);
-            nav.Inflate(Math.Max(0, shipRadiusTiles));
+            nav.Inflate(nav._shipRadiusTiles);
             nav.BuildRegions();
             nav.IsReady = true;
             return nav;
@@ -108,20 +115,22 @@ namespace SS.Bots.Navigation
             }
         }
 
-        // Configuration-space expansion: block a tile if a raw wall is within Chebyshev radius, so a
-        // path planned for the ship's centre keeps its whole body clear. Static only — doors and
-        // bricks are handled at query time (inflating a moving obstacle is a documented refinement).
+        // Configuration-space margin: mark every tile within Chebyshev radius of a raw wall in a SEPARATE
+        // _nearWall layer used only as an A* preference cost — NOT as a hard block. Hard-blocking this
+        // margin (the old behaviour) closes 1-2 tile gaps that ships actually fly through, which split
+        // pbsmall's open playfield into 4 disconnected nav regions and stranded ball carriers with NoPath.
+        // Raw walls alone drive hard-blocking and region connectivity; the margin just makes the planner
+        // prefer routes with hull clearance while still allowing a tight gap when it's the only way through.
         private void Inflate(int radius)
         {
             if (radius == 0)
                 return;
 
-            bool[] raw = (bool[])_wall.Clone();
             for (int y = 0; y < Size; y++)
             {
                 for (int x = 0; x < Size; x++)
                 {
-                    if (!raw[Index(x, y)])
+                    if (!_wall[Index(x, y)]) // dilate RAW walls into the soft margin
                         continue;
 
                     for (int dy = -radius; dy <= radius; dy++)
@@ -132,7 +141,7 @@ namespace SS.Bots.Navigation
                         {
                             int nx = x + dx;
                             if ((uint)nx < Size)
-                                _wall[Index(nx, ny)] = true;
+                                _nearWall[Index(nx, ny)] = true;
                         }
                     }
                 }
@@ -345,6 +354,36 @@ namespace SS.Bots.Navigation
             }
         }
 
+        // Hull-aware clearance for a SHIP with width: the centre ray plus two rays offset perpendicular by the
+        // ship radius. A straight segment that only grazes a wall corner is clear for a point ray but a snag
+        // for the hull, so the offset ray catches it. This is what keeps path smoothing from collapsing a
+        // corner-routing path into a straight line the ship's body can't fly (the "stuck against a diagonal
+        // wall" bug). Falls back to the thin ray when the radius is 0.
+        public bool HasClearLineForShip(TileCoord from, TileCoord to, uint currentTick)
+        {
+            int r = _shipRadiusTiles;
+            if (r <= 0)
+                return HasLineOfSight(from, to, currentTick);
+
+            int dx = to.X - from.X, dy = to.Y - from.Y;
+            double len = Math.Sqrt((double)dx * dx + (double)dy * dy);
+            if (len < 0.5)
+                return InBounds(from.X, from.Y) && !BlocksSight(Index(from.X, from.Y), currentTick);
+
+            int ox = (int)Math.Round(-dy / len * r); // perpendicular offset, ship-radius long
+            int oy = (int)Math.Round(dx / len * r);
+            for (int side = -1; side <= 1; side++)
+            {
+                int fx = from.X + ox * side, fy = from.Y + oy * side;
+                int tx = to.X + ox * side, ty = to.Y + oy * side;
+                if (!InBounds(fx, fy) || !InBounds(tx, ty))
+                    return false; // the hull edge would leave the map / clip the border
+                if (!HasLineOfSight(new TileCoord((short)fx, (short)fy), new TileCoord((short)tx, (short)ty), currentTick))
+                    return false;
+            }
+            return true;
+        }
+
         // ---- Path query (grid A*) ----
 
         public bool TryFindPath(TileCoord start, TileCoord goal, uint currentTick, List<TileCoord> pathOut)
@@ -355,8 +394,20 @@ namespace SS.Bots.Navigation
 
             int startIdx = Index(start.X, start.Y);
             int goalIdx = Index(goal.X, goal.Y);
-            if (BlocksMovement(startIdx, currentTick) || BlocksMovement(goalIdx, currentTick))
-                return false;
+
+            // A ship can physically sit in the inflated margin right next to a wall — a tile the nav marks
+            // "blocked". Snap a blocked start/goal to the nearest walkable tile so we can still path OUT of
+            // the margin (or up to a target sitting in one) instead of bailing to a straight line into the wall.
+            if (BlocksMovement(startIdx, currentTick))
+            {
+                startIdx = NearestWalkable(start.X, start.Y, currentTick);
+                if (startIdx < 0) return false;
+            }
+            if (BlocksMovement(goalIdx, currentTick))
+            {
+                goalIdx = NearestWalkable(goal.X, goal.Y, currentTick);
+                if (goalIdx < 0) return false;
+            }
 
             _gen++;
             _open.Clear();
@@ -397,6 +448,8 @@ namespace SS.Bots.Navigation
                     float step = diagonal ? DiagonalCost : CardinalCost;
                     if (_door[ni] && !DoorOpen(_doorBit[ni]))
                         step += ClosedDoorWaitCost(currentTick); // price the wait rather than forbidding it
+                    if (_nearWall[ni])
+                        step += NearWallCost; // prefer hull clearance, but don't forbid tight gaps
 
                     float tentative = baseG + step;
                     if (_stamp[ni] != _gen || tentative < _g[ni])
@@ -443,7 +496,9 @@ namespace SS.Bots.Navigation
             pathOut.Add(raw[0]);
             for (int i = 2; i < raw.Count; i++)
             {
-                if (!HasLineOfSight(raw[anchor], raw[i], currentTick))
+                // Hull-aware: only skip raw[i-1] if the ship's whole body can fly anchor->i. Using a thin ray
+                // here let the smoothed line graze wall corners the hull then snags on (the stuck-at-centre bug).
+                if (!HasClearLineForShip(raw[anchor], raw[i], currentTick))
                 {
                     pathOut.Add(raw[i - 1]);
                     anchor = i - 1;
@@ -487,6 +542,30 @@ namespace SS.Bots.Navigation
         }
 
         // ---- Helpers ----
+
+        // Nearest non-blocking tile to (x,y), spiralling out to a small radius. -1 if none found nearby.
+        private int NearestWalkable(int x, int y, uint now)
+        {
+            const int MaxR = 6;
+            for (int r = 1; r <= MaxR; r++)
+            {
+                for (int dy = -r; dy <= r; dy++)
+                {
+                    int ny = y + dy;
+                    if ((uint)ny >= Size) continue;
+                    for (int dx = -r; dx <= r; dx++)
+                    {
+                        if (Math.Max(Math.Abs(dx), Math.Abs(dy)) != r) continue; // ring only
+                        int nx = x + dx;
+                        if ((uint)nx >= Size) continue;
+                        int i = Index(nx, ny);
+                        if (!BlocksMovement(i, now))
+                            return i;
+                    }
+                }
+            }
+            return -1;
+        }
 
         private int CountBlocked()
         {

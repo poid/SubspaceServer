@@ -1,3 +1,4 @@
+using QS.Networking.Protocols.Common;
 using QS.Physics.Legacy;
 using SS.Bots.Navigation;
 using SS.Packets.Game;
@@ -17,7 +18,27 @@ namespace SS.Bots
         bool AfterburnerOn,
         byte Rotation,
         WeaponCodes Fire,
-        byte FireLevel);
+        byte FireLevel)
+    {
+        /// <summary>Whether to thrust in REVERSE this tick — brake by thrusting OPPOSITE the facing (used to
+        /// bleed speed before a turn/wall without spinning around). If both this and <see cref="ThrustOn"/>
+        /// are set, the engine gives reverse precedence.</summary>
+        public bool ThrustReverse { get; init; }
+
+        /// <summary>Ball interaction to perform this tick (Mode 3). Movement fields above still apply.</summary>
+        public BallIntent BallAction { get; init; }
+
+        /// <summary>Target for a <see cref="BallIntent.Fire"/> (Coordinates1000): the goal, a teammate lead, or open space.</summary>
+        public Point BallTarget { get; init; }
+    }
+
+    /// <summary>What a bot wants to do with the soccer ball this tick. Executed by the module via <c>IBalls</c>.</summary>
+    public enum BallIntent : byte
+    {
+        None,
+        Grab,  // pick up a loose ball we're adjacent to
+        Fire,  // kick/pass/shoot the carried ball toward BallTarget
+    }
 
     /// <summary>
     /// Everything a brain needs to decide for one bot on one tick. Passed by <c>in</c> to avoid copies.
@@ -30,11 +51,20 @@ namespace SS.Bots
         /// <summary>The arena's navigation service (global path planner, line-of-sight, regions).</summary>
         public required INavigation Navigation { get; init; }
 
+        /// <summary>This bot's private path-follower (cached A* waypoints) for goal-directed movement.</summary>
+        public NavAgent Agent { get; init; }
+
         /// <summary>This bot's stable ship slot within <see cref="World"/>.</summary>
         public required int ShipSlot { get; init; }
 
+        /// <summary>This bot's network ID — pass to the ID-based query/aim methods on <see cref="World"/>.</summary>
+        public required ID SelfId { get; init; }
+
         /// <summary>The simulation tick this decision is for.</summary>
         public required uint CurrentTick { get; init; }
+
+        /// <summary>The soccer-ball situation for this bot (Mode 3). Default = not in play; ball brains read it.</summary>
+        public Ai.BallView Ball { get; init; }
     }
 
     /// <summary>

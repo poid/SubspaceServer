@@ -74,6 +74,14 @@ namespace SS.Bots.Navigation
         bool HasLineOfSight(TileCoord from, TileCoord to, uint currentTick);
 
         /// <summary>
+        /// Like <see cref="HasLineOfSight"/> but for a SHIP with width: clear only if the ship's whole hull
+        /// (a ship-radius margin either side of the line) can travel it without snagging a wall corner. Use
+        /// this for path smoothing and "head straight there" decisions; weapon aiming should use the thin
+        /// <see cref="HasLineOfSight"/> (a bullet has no width).
+        /// </summary>
+        bool HasClearLineForShip(TileCoord from, TileCoord to, uint currentTick);
+
+        /// <summary>
         /// Finds the nearest walkable tile to <paramref name="target"/>, within
         /// <paramref name="maxRangeTiles"/>, that has a clear line of fire to it — i.e. a firing
         /// position, which is usually what a combat or passing bot actually wants rather than the
