@@ -501,6 +501,22 @@ namespace SS.Core.Modules
             }
         }
 
+        int IClientSettings.GetClientSettingsData(Arena arena, Span<byte> destination)
+        {
+            if (arena is null || !arena.TryGetExtraData(_adkey, out ArenaData? arenaData))
+                return 0;
+
+            lock (_lock)
+            {
+                ReadOnlySpan<byte> source = MemoryMarshal.AsBytes(MemoryMarshal.CreateReadOnlySpan(ref arenaData.Settings, 1));
+                if (destination.Length < source.Length)
+                    return 0;
+
+                source.CopyTo(destination);
+                return source.Length;
+            }
+        }
+
         #endregion
 
         #region Callbacks

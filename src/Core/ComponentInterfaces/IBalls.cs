@@ -187,6 +187,41 @@ namespace SS.Core.ComponentInterfaces
         void EndGame(Arena arena);
 
         /// <summary>
+        /// Records a goal for a ball, running the full server-side goal handling — goal advisors
+        /// (<see cref="IBallsAdvisor.AllowGoal"/>), the <see cref="ComponentCallbacks.BallGoalCallback"/>
+        /// (scoring), and the normal ball respawn/phase. Intended for a host driving a ball whose goal
+        /// detection happens outside the client protocol (e.g. server-side bots). The ball should be in
+        /// <see cref="BallState.OnMap"/> for the respawn to occur.
+        /// </summary>
+        /// <param name="arena">The arena the goal occurred in.</param>
+        /// <param name="ballId">The ball that scored.</param>
+        /// <param name="scorer">The player credited with the goal.</param>
+        /// <param name="goalTile">The goal tile the ball entered.</param>
+        /// <returns>True if the goal was handled; false on invalid input.</returns>
+        bool TryReportGoal(Arena arena, byte ballId, Player scorer, TileCoordinates goalTile);
+
+        /// <summary>
+        /// Requests a ball pickup on behalf of a player, running the same server-side validation and
+        /// arbitration as the C2S pickup packet (<see cref="ComponentCallbacks.BallPickupCallback"/> fires on
+        /// success). Intended for a host driving a player outside the client protocol (e.g. server-side bots):
+        /// the ball must be <see cref="BallState.OnMap"/>, the player must not already carry a ball, goal
+        /// advisors may veto, and the FIRST valid request wins a contested pickup (it flips the ball to
+        /// <see cref="BallState.Carried"/>, so a later request loses). The client-only "stale coords" time
+        /// check is skipped since the caller is the server.
+        /// </summary>
+        /// <returns>True if the pickup was granted (the player now carries the ball); otherwise false.</returns>
+        bool TryPickupBall(Arena arena, byte ballId, Player player);
+
+        /// <summary>
+        /// Requests a ball shot on behalf of a player, running the same server-side handling as the C2S shoot
+        /// packet — advisors, <see cref="ComponentCallbacks.BallShootCallback"/>, and goal-on-goal-tile
+        /// detection. The player must currently carry the ball. Intended for a server-side bot that computed
+        /// its own shot (position, velocity, and fire time).
+        /// </summary>
+        /// <returns>True if the shot was accepted (the ball is now on the map); otherwise false.</returns>
+        bool TryShootBall(Arena arena, byte ballId, Player player, short x, short y, short xSpeed, short ySpeed, ServerTick time);
+
+        /// <summary>
         /// Gets goal info for a coordinate in an arena, for a given team.
         /// The <paramref name="arena"/>'s <see cref="SoccerMode"/> setting is a major determining factor.
         /// </summary>
