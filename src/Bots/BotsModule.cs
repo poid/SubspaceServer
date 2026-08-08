@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using Microsoft.Extensions.ObjectPool;
 using QS.Networking.Protocols.Common; // ID
@@ -1152,7 +1152,7 @@ namespace SS.Bots
             {
                 const ShipType ship = ShipType.Warbird;
 
-                Player? botPlayer = _fake.CreateFakePlayer($"Load{i:D4}", arena, ShipType.Spec, 0);
+                Player? botPlayer = _fake.CreateFakePlayer($"LoadBot{i:D4}", arena, ShipType.Spec, 0);
                 if (botPlayer is null)
                     break;
 
