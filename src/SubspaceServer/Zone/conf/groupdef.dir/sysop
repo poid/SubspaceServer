@@ -1,4 +1,4 @@
-; conf/groups/sysop
+﻿; conf/groups/sysop
 
 seesysoplogall
 
@@ -63,6 +63,8 @@ privcmd_killfake
 ; Bots
 cmd_spawnbot
 cmd_killbots
+cmd_loadtest
+privcmd_loadtest
 
 cmd_py
 privcmd_py
