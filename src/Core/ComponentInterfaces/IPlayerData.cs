@@ -50,6 +50,23 @@ namespace SS.Core.ComponentInterfaces
         bool IsUpgradeableReadLockHeld { get; }
 
         /// <summary>
+        /// Moves a player into an arena, out of one, or between two.
+        /// </summary>
+        /// <remarks>
+        /// The only way to change <see cref="Player.Arena"/>. It also maintains
+        /// <see cref="Arena.Players"/>, and the two must move together or an arena ends up holding a
+        /// player it no longer has, or missing one it does. Since the arena's collection is what the
+        /// position fan out and every other arena scoped operation reads, a discrepancy shows up as
+        /// players who cannot see each other.
+        /// <para>
+        /// The caller must hold the write lock.
+        /// </para>
+        /// </remarks>
+        /// <param name="player">The player to move.</param>
+        /// <param name="arena">The arena to move into, or <see langword="null"/> to leave.</param>
+        void SetPlayerArena(Player player, Arena? arena);
+
+        /// <summary>
         /// Use to enumerate over all of the players.
         /// </summary>
         /// <remarks>

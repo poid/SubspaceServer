@@ -60,6 +60,12 @@ namespace SS.Core.Modules
         private readonly IPlayerData _playerData;
         private readonly IServerTimer _serverTimer;
 
+        /// <summary>
+        /// The player data service, so that <see cref="Arena"/> can assert the player lock is held when
+        /// its player collection is touched.
+        /// </summary>
+        internal IPlayerData PlayerData => _playerData;
+
         // optional dependencies
         private IChatNetwork? _chatNetwork;
         private INetwork? _network;
@@ -1286,18 +1292,11 @@ namespace SS.Core.Modules
 
         private void ArenaStateChange_DoWriteData(Arena arena, ArenaState state)
         {
-            bool hasPlayers = false;
+            bool hasPlayers;
             _playerData.Lock();
             try
             {
-                foreach (Player player in _playerData.Players)
-                {
-                    if (player.Arena == arena)
-                    {
-                        hasPlayers = true;
-                        break;
-                    }
-                }
+                hasPlayers = arena.HasPlayers;
             }
             finally
             {

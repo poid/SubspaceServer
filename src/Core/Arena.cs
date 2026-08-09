@@ -3,9 +3,11 @@ using SS.Core.ComponentInterfaces;
 using SS.Core.Modules;
 using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
+using System.Runtime.InteropServices;
 using System.Threading;
 
 namespace SS.Core
@@ -247,6 +249,82 @@ namespace SS.Core
         /// The frequency for spectators in this arena.
         /// </summary>
         public short SpecFreq { get; internal set; } = DefaultSpecFreq;
+
+        #region Players
+
+        /// <summary>
+        /// The players currently in this arena.
+        /// </summary>
+        /// <remarks>
+        /// Guarded by the global player lock, the same one that guards <see cref="IPlayerData.Players"/>.
+        /// It needs no lock of its own: the only places a player's arena changes already hold that lock
+        /// for writing, so every existing caller that enumerates players under it is already correct
+        /// here, and no new lock ordering is introduced.
+        /// </remarks>
+        private readonly List<Player> _players = new(64);
+
+        /// <summary>
+        /// The players currently in this arena.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// The caller must hold the global player lock, exactly as when enumerating
+        /// <see cref="IPlayerData.Players"/>.
+        /// </para>
+        /// <para>
+        /// Prefer this over filtering <see cref="IPlayerData.Players"/> by arena. The server scans
+        /// players far more often than it changes them — once per position packet per player — and
+        /// filtering the whole zone makes that cost the zone's population rather than the arena's.
+        /// </para>
+        /// </remarks>
+        public ReadOnlySpan<Player> Players
+        {
+            get
+            {
+                ThreadingAssert.PlayerLockHeld(Manager.PlayerData);
+
+                return CollectionsMarshal.AsSpan(_players);
+            }
+        }
+
+        /// <summary>
+        /// Adds a player to this arena.
+        /// </summary>
+        /// <remarks>Only <see cref="Modules.PlayerData"/> may call this, under the player write lock.</remarks>
+        internal void AddPlayer(Player player)
+        {
+            ThreadingAssert.PlayerWriteLockHeld(Manager.PlayerData);
+            Debug.Assert(!_players.Contains(player));
+
+            _players.Add(player);
+        }
+
+        /// <summary>
+        /// Removes a player from this arena.
+        /// </summary>
+        /// <remarks>Only <see cref="Modules.PlayerData"/> may call this, under the player write lock.</remarks>
+        internal void RemovePlayer(Player player)
+        {
+            ThreadingAssert.PlayerWriteLockHeld(Manager.PlayerData);
+
+            _players.Remove(player);
+        }
+
+        /// <summary>
+        /// Whether any player is in this arena.
+        /// </summary>
+        /// <remarks>The caller must hold the global player lock.</remarks>
+        internal bool HasPlayers
+        {
+            get
+            {
+                ThreadingAssert.PlayerLockHeld(Manager.PlayerData);
+
+                return _players.Count > 0;
+            }
+        }
+
+        #endregion
 
         #region Player Counts
 

@@ -278,7 +278,7 @@ namespace SS.Core.Modules
                         case PlayerState.Connected:
                         case PlayerState.LoggedIn:
                             // at this point, the player can't have an arena
-                            player.Arena = null;
+                            _playerData.SetPlayerArena(player, null);
 
                             // check if the player's arena is ready.
                             // LOCK: we don't grab the arena status lock because it
@@ -356,7 +356,7 @@ namespace SS.Core.Modules
                                 }
                                 else
                                 {
-                                    player.Arena = newArena;
+                                    _playerData.SetPlayerArena(player, newArena);
                                     player.Status = PlayerState.DoFreqAndArenaSync;
                                 }
                             }

@@ -893,14 +893,31 @@ namespace SS.Core.Modules
 
                 try
                 {
-                    foreach (Player p in _playerData.Players)
+                    // A null arena means the whole zone, so that case still has to walk every player.
+                    // Otherwise only the arena's own, since scanning the zone to pick out one arena
+                    // makes each broadcast cost the zone's population.
+                    if (arena is null)
                     {
-                        if (p.Status == PlayerState.Playing
-                            && (p.Arena == arena || arena is null)
-                            && p != except
-                            && IsOurs(p))
+                        foreach (Player p in _playerData.Players)
                         {
-                            set.Add(p);
+                            if (p.Status == PlayerState.Playing
+                                && p != except
+                                && IsOurs(p))
+                            {
+                                set.Add(p);
+                            }
+                        }
+                    }
+                    else
+                    {
+                        foreach (Player p in arena.Players)
+                        {
+                            if (p.Status == PlayerState.Playing
+                                && p != except
+                                && IsOurs(p))
+                            {
+                                set.Add(p);
+                            }
                         }
                     }
                 }
