@@ -1292,18 +1292,11 @@ namespace SS.Core.Modules
 
         private void ArenaStateChange_DoWriteData(Arena arena, ArenaState state)
         {
-            bool hasPlayers = false;
+            bool hasPlayers;
             _playerData.Lock();
             try
             {
-                foreach (Player player in _playerData.Players)
-                {
-                    if (player.Arena == arena)
-                    {
-                        hasPlayers = true;
-                        break;
-                    }
-                }
+                hasPlayers = arena.HasPlayers;
             }
             finally
             {
