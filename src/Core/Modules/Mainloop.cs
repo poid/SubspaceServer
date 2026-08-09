@@ -569,6 +569,16 @@ namespace SS.Core.Modules
 
         bool IMainloop.IsMainloop => Thread.CurrentThread == _mainThread;
 
+        /// <summary>
+        /// Whether <see cref="IMainloop.RunLoop"/> has been entered, so that there is a mainloop thread
+        /// to compare against.
+        /// </summary>
+        /// <remarks>
+        /// Used by <see cref="ThreadingAssert"/> to tell "called off the mainloop", which is a problem,
+        /// from "called before the mainloop exists", which is how module loading legitimately runs.
+        /// </remarks>
+        internal bool HasStarted => _mainThread is not null;
+
         #endregion
 
         #region IMainloopTimer Members
