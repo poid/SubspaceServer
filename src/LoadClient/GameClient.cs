@@ -90,18 +90,27 @@ namespace SS.LoadClient
                 using CancellationTokenSource timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
                 timeout.CancelAfter(TimeSpan.FromSeconds(10));
 
-                while (!timeout.IsCancellationRequested)
+                try
                 {
-                    int received = await _socket.ReceiveAsync(_receiveBuffer, SocketFlags.None, timeout.Token);
-                    if (received >= 6 && _receiveBuffer[0] == 0x00 && _receiveBuffer[1] == 0x02)
+                    while (true)
                     {
-                        IsConnected = true;
-                        return true;
+                        int received = await _socket.ReceiveAsync(_receiveBuffer, SocketFlags.None, timeout.Token);
+                        if (received >= 6 && _receiveBuffer[0] == 0x00 && _receiveBuffer[1] == 0x02)
+                        {
+                            IsConnected = true;
+                            return true;
+                        }
                     }
                 }
-
-                FailureReason = "no connection init response";
-                return false;
+                catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+                {
+                    // Our own timeout, rather than the run ending. Worth saying so specifically: by far
+                    // the most likely cause is another encryption module sitting ahead of EncryptionNull,
+                    // which answers the handshake and then expects encryption this client cannot do.
+                    // Reported as a plain cancellation, that is close to impossible to guess.
+                    FailureReason = "no connection init response; is EncryptionNull loaded before EncryptionVIE?";
+                    return false;
+                }
             }
             catch (OperationCanceledException)
             {

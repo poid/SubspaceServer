@@ -13,6 +13,8 @@ prefix_@
 
 cmd_shutdown
 cmd_recyclezone
+cmd_metrics
+privcmd_metrics
 cmd_netstats
 cmd_serverstats
 cmd_lastlog

@@ -57,12 +57,16 @@ namespace SS.LoadClient
             Console.WriteLine($"Spread {options.SpreadPixels}px, view {options.ViewWidth}x{options.ViewHeight}. The server needs the EncryptionNull module loaded.");
 
             GameClient[] clients = new GameClient[options.ClientCount];
-            List<Task> tasks = new(options.ClientCount * 2);
+
+            // Indexed per client rather than appended to a shared list, because every client is set up
+            // concurrently and List is not safe to add to from several threads at once.
+            Task?[] receiveTasks = new Task?[options.ClientCount];
+            Task?[] positionTasks = new Task?[options.ClientCount];
 
             int connected = 0;
             long startTimestamp = Stopwatch.GetTimestamp();
 
-            Task[] setupTasks = new Task[options.ClientCount];
+            Task?[] setupTasks = new Task?[options.ClientCount];
 
             for (int i = 0; i < options.ClientCount; i++)
             {
@@ -87,19 +91,24 @@ namespace SS.LoadClient
 
             try
             {
-                await Task.WhenAll(setupTasks);
+                // Interrupting the staggered start leaves the rest of the array unset, and WhenAll
+                // throws on a null element, so only the entries that were filled are awaited.
+                await Task.WhenAll(setupTasks.Where(t => t is not null)!);
             }
             catch (OperationCanceledException)
             {
                 // Expected if the run was cut short while clients were still arriving.
             }
 
+            // Same reason: only the clients that were actually constructed.
+            GameClient[] startedClients = clients.Where(c => c is not null).ToArray()!;
+
             Console.WriteLine($"Connected {connected}/{options.ClientCount} in {Stopwatch.GetElapsedTime(startTimestamp).TotalSeconds:F1}s");
 
             if (connected == 0)
             {
-                Console.WriteLine("No client connected. First failure: " + (Array.Find(clients, c => c.FailureReason is not null)?.FailureReason ?? "unknown"));
-                Console.WriteLine("Check that the EncryptionNull module is enabled in Modules.config.");
+                Console.WriteLine("No client connected. First failure: " + (Array.Find(startedClients, c => c.FailureReason is not null)?.FailureReason ?? "unknown"));
+                Console.WriteLine("Check that EncryptionNull is loaded, and loaded before EncryptionVIE.");
                 return 1;
             }
 
@@ -111,7 +120,7 @@ namespace SS.LoadClient
 
             try
             {
-                await Task.WhenAll(tasks);
+                await Task.WhenAll(receiveTasks.Concat(positionTasks).Where(t => t is not null)!);
             }
             catch (OperationCanceledException)
             {
@@ -125,7 +134,7 @@ namespace SS.LoadClient
             long kills = 0;
             int stillUp = 0;
 
-            foreach (GameClient client in clients)
+            foreach (GameClient client in startedClients)
             {
                 positionUpdates += Interlocked.Read(ref client.PositionUpdatesReceived);
                 bytes += Interlocked.Read(ref client.BytesReceived);
@@ -141,9 +150,9 @@ namespace SS.LoadClient
             if (options.DeathsPerMinute > 0)
                 Console.WriteLine($"Kill notifications seen: {kills / seconds:F0}/s, which confirms deaths were processed rather than rejected.");
 
-            await Task.WhenAll(clients.Select(c => c.DisconnectAsync(CancellationToken.None)));
+            await Task.WhenAll(startedClients.Select(c => c.DisconnectAsync(CancellationToken.None)));
 
-            foreach (GameClient client in clients)
+            foreach (GameClient client in startedClients)
                 client.Dispose();
 
             return 0;
@@ -155,7 +164,7 @@ namespace SS.LoadClient
 
                 Interlocked.Increment(ref connected);
 
-                tasks.Add(client.ReceiveLoopAsync(cancellationToken));
+                receiveTasks[index] = client.ReceiveLoopAsync(cancellationToken);
 
                 await client.LoginAsync(cancellationToken);
 
@@ -168,7 +177,7 @@ namespace SS.LoadClient
 
                 await Task.Delay(1500, cancellationToken);
 
-                tasks.Add(PositionLoopAsync(client, index, cancellationToken));
+                positionTasks[index] = PositionLoopAsync(client, index, cancellationToken);
             }
 
             async Task PositionLoopAsync(GameClient client, int index, CancellationToken token)
