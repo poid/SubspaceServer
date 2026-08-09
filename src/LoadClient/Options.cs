@@ -43,6 +43,25 @@
 
         public short ViewHeight { get; private set; } = 1080;
 
+        /// <summary>
+        /// Percentage of position packets that carry weapon fire.
+        /// </summary>
+        /// <remarks>
+        /// Firing is not a small addition to the load. A position packet with a weapon on it cannot be
+        /// sent in either of the compact batched forms, so every recipient gets the largest position
+        /// packet instead, and it runs the weapon range logic rather than the plain view range.
+        /// </remarks>
+        public int WeaponPercent { get; private set; }
+
+        /// <summary>
+        /// Deaths per client per minute, or zero for none.
+        /// </summary>
+        /// <remarks>
+        /// Deaths reach code that position packets never touch: kill advisors, scoring, the prize drop,
+        /// and respawn.
+        /// </remarks>
+        public int DeathsPerMinute { get; private set; }
+
         public string Host { get; private set; } = "127.0.0.1";
 
         /// <summary>
@@ -144,6 +163,16 @@
                             options.Protocol = LoadProtocol.Chat;
                         else
                             return null;
+                        i++;
+                        break;
+
+                    case "--weapons" when next is not null && int.TryParse(next, out int weaponPercent) && weaponPercent >= 0 && weaponPercent <= 100:
+                        options.WeaponPercent = weaponPercent;
+                        i++;
+                        break;
+
+                    case "--deaths" when next is not null && int.TryParse(next, out int deaths) && deaths >= 0:
+                        options.DeathsPerMinute = deaths;
                         i++;
                         break;
 

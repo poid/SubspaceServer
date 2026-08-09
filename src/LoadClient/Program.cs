@@ -1,4 +1,5 @@
-﻿using System.Diagnostics;
+﻿using SS.Packets.Game;
+using System.Diagnostics;
 using System.Text;
 
 namespace SS.LoadClient
@@ -121,12 +122,14 @@ namespace SS.LoadClient
 
             long positionUpdates = 0;
             long bytes = 0;
+            long kills = 0;
             int stillUp = 0;
 
             foreach (GameClient client in clients)
             {
                 positionUpdates += Interlocked.Read(ref client.PositionUpdatesReceived);
                 bytes += Interlocked.Read(ref client.BytesReceived);
+                kills += Interlocked.Read(ref client.KillsSeen);
 
                 if (client.IsConnected && client.FailureReason is null)
                     stillUp++;
@@ -134,6 +137,9 @@ namespace SS.LoadClient
 
             Console.WriteLine($"Finished. {stillUp}/{connected} client(s) survived.");
             Console.WriteLine($"Server sent {positionUpdates / seconds:F0} position updates/s and {bytes / seconds / 1024d:F0} KB/s to these clients ({positionUpdates / (double)Math.Max(connected, 1) / seconds:F1} updates/s each).");
+
+            if (options.DeathsPerMinute > 0)
+                Console.WriteLine($"Kill notifications seen: {kills / seconds:F0}/s, which confirms deaths were processed rather than rejected.");
 
             await Task.WhenAll(clients.Select(c => c.DisconnectAsync(CancellationToken.None)));
 
@@ -179,6 +185,10 @@ namespace SS.LoadClient
                 const int Radius = 200;
                 sbyte rotation = 0;
                 double angle = index;
+                int tick = 0;
+
+                // Deaths per minute, converted to a probability per 10Hz tick.
+                double deathChancePerTick = options.DeathsPerMinute / 60d / 10d;
 
                 try
                 {
@@ -188,13 +198,23 @@ namespace SS.LoadClient
                     while (await timer.WaitForNextTickAsync(token))
                     {
                         angle += 0.1d;
+                        tick++;
 
                         short x = (short)Math.Clamp(originX + (Radius * Math.Cos(angle)), 0, 16383);
                         short y = (short)Math.Clamp(originY + (Radius * Math.Sin(angle)), 0, 16383);
 
                         rotation = (sbyte)((rotation + 1) % 40);
 
-                        await client.SendPositionAsync(x, y, 0, 0, rotation, token);
+                        // Bullets and bombs, mixed, since they take different paths through the weapon
+                        // range logic. Spread across clients by index so they do not all fire together.
+                        WeaponCodes weapon = WeaponCodes.Null;
+                        if (options.WeaponPercent > 0 && (tick + index) % 100 < options.WeaponPercent)
+                            weapon = (tick + index) % 5 == 0 ? WeaponCodes.Bomb : WeaponCodes.Bullet;
+
+                        await client.SendPositionAsync(x, y, 0, 0, rotation, weapon, token);
+
+                        if (deathChancePerTick > 0d && Random.Shared.NextDouble() < deathChancePerTick)
+                            await client.SendDeathAsync(token);
                     }
                 }
                 catch (OperationCanceledException)
