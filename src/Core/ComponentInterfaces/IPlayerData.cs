@@ -29,6 +29,27 @@ namespace SS.Core.ComponentInterfaces
         void WriteUnlock();
 
         /// <summary>
+        /// Whether the calling thread holds the global player lock for reading.
+        /// </summary>
+        /// <remarks>
+        /// For asserting that a caller has taken the lock its contract requires. Not for deciding
+        /// whether to take it: code that has to ask does not know who owns the data it is touching.
+        /// </remarks>
+        bool IsReadLockHeld { get; }
+
+        /// <summary>
+        /// Whether the calling thread holds the global player lock for writing.
+        /// </summary>
+        /// <inheritdoc cref="IsReadLockHeld" path="/remarks"/>
+        bool IsWriteLockHeld { get; }
+
+        /// <summary>
+        /// Whether the calling thread holds the global player lock as an upgradeable reader.
+        /// </summary>
+        /// <inheritdoc cref="IsReadLockHeld" path="/remarks"/>
+        bool IsUpgradeableReadLockHeld { get; }
+
+        /// <summary>
         /// Use to enumerate over all of the players.
         /// </summary>
         /// <remarks>

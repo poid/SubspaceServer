@@ -147,9 +147,26 @@ namespace SS.Core.Modules
             _rwLock.ExitWriteLock();
         }
 
+        public bool IsReadLockHeld => _rwLock.IsReadLockHeld;
+
+        public bool IsWriteLockHeld => _rwLock.IsWriteLockHeld;
+
+        public bool IsUpgradeableReadLockHeld => _rwLock.IsUpgradeableReadLockHeld;
+
         #endregion
 
-        Dictionary<int, Player>.ValueCollection IPlayerData.Players => _playerDictionary.Values;
+        Dictionary<int, Player>.ValueCollection IPlayerData.Players
+        {
+            get
+            {
+                // Enumerating this while another thread adds or removes a player is undefined, so the
+                // lock is not advisory. It is only ever taken by convention today, which is why this
+                // asserts rather than trusting the caller.
+                ThreadingAssert.PlayerLockHeld(this);
+
+                return _playerDictionary.Values;
+            }
+        }
 
         Player IPlayerData.NewPlayer(ClientType clientType)
         {
