@@ -382,16 +382,30 @@ namespace SS.Core
         /// <summary>
         /// The player's current arena, or <see langword="null"/> if not in an arena yet.
         /// </summary>
+        /// <remarks>
+        /// Only <see cref="Modules.PlayerData.SetPlayerArena"/> may change this, because the arena's
+        /// player collection has to be kept in step with it and both are guarded by the player write
+        /// lock. Assigning here directly would leave the arena holding a player it no longer has, or
+        /// missing one it does.
+        /// </remarks>
         public Arena? Arena
         {
             get => _arena;
-            internal set
+            private set
             {
                 if (value != null)
                     Debug.Assert(Manager.Broker == value.Manager.Broker);
 
                 _arena = value;
             }
+        }
+
+        /// <summary>
+        /// Sets <see cref="Arena"/>. For <see cref="Modules.PlayerData"/> only.
+        /// </summary>
+        internal void SetArena(Arena? arena)
+        {
+            Arena = arena;
         }
 
         private Arena? _newArena;
@@ -777,7 +791,13 @@ namespace SS.Core
             ClientFeatures = ClientFeatures.None;
             Status = PlayerState.Uninitialized;
             WhenLoggedIn = PlayerState.Uninitialized;
-            Arena = null;
+
+            // By this point the player has already been taken out of its arena, since freeing removes
+            // it from the dictionary and the arena together. Asserting rather than clearing, because
+            // clearing here would leave the arena still holding this player.
+            Debug.Assert(_arena is null, "A player is being reset while still in an arena.");
+            _arena = null;
+
             NewArena = null;
             Name = null;
             Squad = null;

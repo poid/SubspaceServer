@@ -1464,7 +1464,11 @@ namespace SS.Core.Modules
                         DoSpawnCallback(player, SpawnCallback.SpawnReason.AfterDeath);
                     }
 
-                    foreach (Player otherPlayer in _playerData.Players)
+                    // The arena's own players rather than the zone's, filtered by arena. This runs once
+                    // per position packet per player, so scanning the whole zone made the cost of every
+                    // packet the zone's population instead of the arena's — and the wider apart the
+                    // players were spread, the more of that scan could not produce a send.
+                    foreach (Player otherPlayer in arena.Players)
                     {
                         candidatesScanned++;
 
@@ -1473,7 +1477,6 @@ namespace SS.Core.Modules
 
                         if (otherPlayer.Status == PlayerState.Playing
                             && otherPlayer.IsStandard
-                            && otherPlayer.Arena == arena
                             && (otherPlayer != player || player.Flags.SeeOwnPosition))
                         {
                             int dist = Hypot(x1 - otherPlayerData.Position.X, y1 - otherPlayerData.Position.Y);

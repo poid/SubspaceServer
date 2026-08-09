@@ -99,7 +99,19 @@ namespace SS.Core.Modules
             player.ClientName = "<internal fake player>";
             player.Ship = ship;
             player.Freq = freq;
-            player.Arena = arena;
+
+            // Under the write lock, because it also puts the player into the arena's collection. This
+            // was previously assigned with no lock at all.
+            _playerData.WriteLock();
+
+            try
+            {
+                _playerData.SetPlayerArena(player, arena);
+            }
+            finally
+            {
+                _playerData.WriteUnlock();
+            }
 
             _network?.SendToArena(arena, player, ref player.Packet, NetSendFlags.Reliable);
             _chatNetwork?.SendToArena(arena, player, $"ENTERING:{player.Name}:{ship:D}:{freq:D}");

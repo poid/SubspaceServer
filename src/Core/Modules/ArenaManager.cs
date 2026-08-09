@@ -60,6 +60,12 @@ namespace SS.Core.Modules
         private readonly IPlayerData _playerData;
         private readonly IServerTimer _serverTimer;
 
+        /// <summary>
+        /// The player data service, so that <see cref="Arena"/> can assert the player lock is held when
+        /// its player collection is touched.
+        /// </summary>
+        internal IPlayerData PlayerData => _playerData;
+
         // optional dependencies
         private IChatNetwork? _chatNetwork;
         private INetwork? _network;
