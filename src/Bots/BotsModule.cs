@@ -1082,6 +1082,10 @@ namespace SS.Bots
 
             _chat.SendMessage(player, $"Bots: spawned {spawned} bot(s) across {targetArenas.Count} arena(s).");
 
+            int requested = botsPerArena * targetArenas.Count;
+            if (spawned < requested)
+                _chat.SendMessage(player, $"Bots: wanted {requested} but the simulation ran out of ship slots. Spread the load over more arenas.");
+
             if (targetArenas.Count < arenaCount)
                 _chat.SendMessage(player, $"Bots: wanted {arenaCount} arenas but only {targetArenas.Count} had this module attached.");
 
@@ -1158,7 +1162,23 @@ namespace SS.Bots
 
                 _game.SetShipAndFreq(botPlayer, ship, 0);
 
-                int slot = world.GetOrAllocateShipSlot(new ID(botPlayer.Id));
+                // The simulation has a fixed number of ship slots (MaxShips) and throws once they are
+                // gone, so a request for more bots than the arena can hold would otherwise abort the
+                // whole command part way and leave this bot behind as a player with no ship.
+                int slot;
+                try
+                {
+                    slot = world.GetOrAllocateShipSlot(new ID(botPlayer.Id));
+                }
+                catch (Exception ex)
+                {
+                    _fake.EndFaked(botPlayer);
+
+                    _logManager.LogA(LogLevel.Info, nameof(BotsModule), arena,
+                        $"Load test stopped at {spawned} bot(s): the simulation has no ship slots left. {ex.Message}");
+
+                    break;
+                }
 
                 GetScatteredSpawn(arena, ref random, out short spawnX, out short spawnY);
                 C2S_PositionPacket spawn = new() { X = spawnX, Y = spawnY };
