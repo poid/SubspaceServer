@@ -2801,6 +2801,17 @@ namespace SS.Core.Modules
                 // Wait at least 1 tick from the start of the iteration, 1/100 second
                 int msToWait = (10 - (int)Math.Floor(Stopwatch.GetElapsedTime(start).TotalMilliseconds));
 
+                IServerMetrics? serverMetrics = _serverMetrics;
+                if (serverMetrics is not null && serverMetrics.IsEnabled)
+                {
+                    serverMetrics.Increment(ServerMetric.SendThreadIterations);
+
+                    // The iteration used its whole interval, so the send thread is not keeping up and
+                    // outgoing data is going out later than it should.
+                    if (msToWait <= 0)
+                        serverMetrics.Increment(ServerMetric.SendThreadOverruns);
+                }
+
 #if CFG_LOG_SEND_THREAD_PERFORMANCE
                 if (msToWait < 10)
                 {
@@ -4072,7 +4083,11 @@ namespace SS.Core.Modules
                 buffer.NumBytes = data.Length;
 
                 Interlocked.Increment(ref conn.ProcessingHolds);
-                if (!_mainloop.QueueMainWorkItem(_mainloopWork_CallPacketHandlers, buffer)) // The workitem disposes the buffer.
+
+                // Sheddable: an incoming game packet is the one thing worth dropping when the mainloop
+                // is too far behind, since the client will send another shortly and this path already
+                // releases the buffer when refused.
+                if (!_mainloop.QueueSheddableMainWorkItem(_mainloopWork_CallPacketHandlers, buffer)) // The workitem disposes the buffer.
                 {
                     Interlocked.Decrement(ref conn.ProcessingHolds);
                     buffer.Dispose();

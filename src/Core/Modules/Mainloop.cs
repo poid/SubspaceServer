@@ -1,4 +1,4 @@
-using Microsoft.Extensions.ObjectPool;
+﻿using Microsoft.Extensions.ObjectPool;
 using SS.Core.ComponentCallbacks;
 using SS.Core.ComponentInterfaces;
 using SS.Utilities;
@@ -51,6 +51,11 @@ namespace SS.Core.Modules
         /// </para>
         /// </remarks>
         private int _maxQueueDepth;
+
+        /// <summary>
+        /// When the last shedding warning was written, so that it is not written per refused item.
+        /// </summary>
+        private long _lastSheddingWarningTimestamp;
 
         // for IMainloopTimer
         private readonly LinkedList<MainloopTimer> _mainloopTimerList = new();
@@ -112,8 +117,11 @@ namespace SS.Core.Modules
         [ConfigHelp<int>("Mainloop", "MaxQueueDepth", ConfigScope.Global, Default = 0, Min = 0,
             Description = """
                 The most work items allowed to wait in the mainloop queue at once, or 0 for no limit.
-                When the limit is reached, further work is rejected rather than queued, which sheds load
-                instead of letting latency and memory grow without bound. Rejections are counted and logged.
+                When the limit is reached, work whose caller has said it can be lost is refused rather
+                than queued, which sheds load instead of letting latency and memory grow without bound.
+                In practice that means incoming game packets; player and arena life cycle work is never
+                refused, since losing it would leak state rather than shed a burst.
+                Refusals are counted, and warned about in the log at most once a minute.
                 """)]
         void IModuleLoaderAware.PostLoad(IComponentBroker broker)
         {
@@ -395,6 +403,28 @@ namespace SS.Core.Modules
             Monitor.Exit(_mainloopTimerLock);
         }
 
+        /// <summary>
+        /// Logs that work is being refused, at most once a minute.
+        /// </summary>
+        /// <remarks>
+        /// Shedding means the server is dropping work it was asked to do, which an operator needs to
+        /// know about even when the metrics module is not loaded to count it. Rate limited because it
+        /// happens once per refused item, which by definition is when the server is already struggling.
+        /// </remarks>
+        private void WarnAboutShedding()
+        {
+            long now = Stopwatch.GetTimestamp();
+            long previous = Interlocked.Read(ref _lastSheddingWarningTimestamp);
+
+            if (previous != 0 && Stopwatch.GetElapsedTime(previous, now) < TimeSpan.FromMinutes(1))
+                return;
+
+            if (Interlocked.CompareExchange(ref _lastSheddingWarningTimestamp, now, previous) != previous)
+                return;
+
+            WriteLog(LogLevel.Warn, $"Mainloop queue is at its limit ({_maxQueueDepth}); refusing work. See Mainloop:MaxQueueDepth.");
+        }
+
         private void DrainRunInMain()
         {
             // This differs from ASSS in is that it will only process up to the initial count.
@@ -453,18 +483,34 @@ namespace SS.Core.Modules
 
         bool IMainloop.QueueMainWorkItem<TState>(Action<TState> callback, TState state)
         {
+            return QueueMainWorkItem(callback, state, sheddable: false);
+        }
+
+        bool IMainloop.QueueSheddableMainWorkItem<TState>(Action<TState> callback, TState state)
+        {
+            return QueueMainWorkItem(callback, state, sheddable: true);
+        }
+
+        private bool QueueMainWorkItem<TState>(Action<TState> callback, TState state, bool sheddable)
+        {
             ArgumentNullException.ThrowIfNull(callback);
 
             if (_runInMainQueue.IsAddingCompleted)
                 return false;
 
-            // Shed load rather than letting the queue grow without bound.
-            // Callers already handle a false return by discarding the work and any buffer it holds.
-            int maxQueueDepth = _maxQueueDepth;
-            if (maxQueueDepth > 0 && _runInMainQueue.Count >= maxQueueDepth)
+            // Only work the caller has said it can lose is refused. Dropping anything else would be
+            // worse than the latency it saves: most callers ignore the result, and among them are player
+            // and arena life cycle steps and await continuations, where losing the work leaks state or
+            // wedges a state machine permanently rather than shedding a burst.
+            if (sheddable)
             {
-                _serverMetrics?.Increment(ServerMetric.MainloopWorkItemsDropped);
-                return false;
+                int maxQueueDepth = _maxQueueDepth;
+                if (maxQueueDepth > 0 && _runInMainQueue.Count >= maxQueueDepth)
+                {
+                    _serverMetrics?.Increment(ServerMetric.MainloopWorkItemsDropped);
+                    WarnAboutShedding();
+                    return false;
+                }
             }
 
             RunInMainWorkItem<TState> workItem = (_objectPoolManager?.GetPool<RunInMainWorkItem<TState>>() ?? Pool<RunInMainWorkItem<TState>>.Default).Get();
