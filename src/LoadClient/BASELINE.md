@@ -118,11 +118,18 @@ at 15% of a core each and everything else is negligible, on a 32 core machine us
 total. Adding cores does nothing here; the parallelism is bounded by the thread count, not the core
 count.
 
-**Memory and allocation are flat.** 104 KB/s allocated at 537 players, the same as idle, with no
-garbage collection in any generation across every run. Working set went from 131 MB idle to 169 MB.
-Notably 537 players is past `Constants.TargetPlayerCount` (512), which sizes the object pools, and
-there is still no allocation growth — so the pools are not a bottleneck at these counts and do not
-need retuning yet. Recheck this if a run ever shows sustained allocation or a rising gen0 count.
+**Memory and allocation are flat.** No garbage collection in any generation across any run, and
+working set went from 131 MB idle to 169 MB. 537 players is past `Constants.TargetPlayerCount`
+(512), which sizes the object pools, and there is still no allocation growth and no collection, so
+the pools are not a bottleneck at these counts and do not need retuning. Recheck if a run ever shows
+sustained allocation or a rising gen0 count.
+
+> The allocation rates in the table above, around 100 to 150 KB/s, are wrong. They are left as
+> recorded because that is what those runs reported. A review afterwards found the metrics module
+> was sampling per thread processor time out of /proc *after* taking the window's allocation
+> baseline, so its own string allocations were being counted as the server's. Measured again once
+> that was fixed, allocation under the same load is **about 1 KB/s**. The conclusion is unchanged
+> and in fact stronger: the server barely allocates at all in steady state.
 
 ## Caveats
 
@@ -132,6 +139,8 @@ need retuning yet. Recheck this if a run ever shows sustained allocation or a ri
   investigated, so treat the client count as measured rather than requested.
 - Combat runs are less repeatable than positions-only ones, since what happens depends on who ends
   up near whom. Compare changes on the positions-only rows and use combat to check behaviour.
+- The send thread iteration and overrun counters were not wired up during these runs, so the zeros
+  they reported were not a measurement of an idle send thread. Fixed after review.
 - The chat protocol mode drives the player life cycle but sends no position packets, so it cannot
   produce any of the above. It is limited to about five logins per second by the server's chat
   module, which is single threaded at 10Hz.
