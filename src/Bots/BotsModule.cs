@@ -1006,13 +1006,15 @@ namespace SS.Bots
 
         [CommandHelp(
             Targets = CommandTarget.None,
-            Args = "<bots per arena> [arena count] | stop",
+            Args = "<bots per arena> [arena count] [combat] | stop",
             Description = """
                 Spawns bots to generate load for performance measurement, and reports what it did.
                 Bots are spread over a wide area of each map rather than spawned on top of the caller,
                 because the cost being measured depends on how many of them are in view of each other.
                 Give an arena count to spread the load over that many arenas; only arenas that are
-                running and have this module attached are used. Use ?loadtest stop to remove them all.
+                running and have this module attached are used. Add 'combat' to have them fight
+                rather than orbit, which drives the weapon and kill paths at the cost of a noisier and
+                less repeatable run. Use ?loadtest stop to remove them all.
                 """)]
         private void Command_loadtest(ReadOnlySpan<char> commandName, ReadOnlySpan<char> parameters, Player player, ITarget target)
         {
@@ -1026,7 +1028,7 @@ namespace SS.Bots
 
             if (!int.TryParse(PeekToken(parms), out int botsPerArena) || botsPerArena <= 0)
             {
-                _chat.SendMessage(player, "Bots: usage is ?loadtest <bots per arena> [arena count], or ?loadtest stop.");
+                _chat.SendMessage(player, "Bots: usage is ?loadtest <bots per arena> [arena count] [combat], or ?loadtest stop.");
                 return;
             }
 
@@ -1034,7 +1036,12 @@ namespace SS.Bots
 
             int arenaCount = 1;
             if (int.TryParse(PeekToken(parms), out int parsedArenaCount) && parsedArenaCount > 0)
+            {
                 arenaCount = parsedArenaCount;
+                parms = PopToken(parms);
+            }
+
+            bool combat = PeekToken(parms).Equals("combat", StringComparison.OrdinalIgnoreCase);
 
             // Collect the arenas to load, starting with the caller's so that a plain "?loadtest 100"
             // does the obvious thing.
@@ -1077,10 +1084,10 @@ namespace SS.Bots
             int spawned = 0;
             foreach (Arena arena in targetArenas)
             {
-                spawned += SpawnLoadTestBots(arena, botsPerArena);
+                spawned += SpawnLoadTestBots(arena, botsPerArena, combat);
             }
 
-            _chat.SendMessage(player, $"Bots: spawned {spawned} bot(s) across {targetArenas.Count} arena(s).");
+            _chat.SendMessage(player, $"Bots: spawned {spawned} {(combat ? "combat" : "orbit")} bot(s) across {targetArenas.Count} arena(s).");
 
             int requested = botsPerArena * targetArenas.Count;
             if (spawned < requested)
@@ -1131,8 +1138,12 @@ namespace SS.Bots
         /// </remarks>
         /// <param name="arena">The arena to spawn in.</param>
         /// <param name="count">How many bots to spawn.</param>
+        /// <param name="combat">
+        /// Whether the bots should fight. Combat bots fire and get killed, which drives the weapon and
+        /// kill paths that orbiting bots never touch, at the cost of a noisier and less repeatable run.
+        /// </param>
         /// <returns>How many bots were actually spawned.</returns>
-        private int SpawnLoadTestBots(Arena arena, int count)
+        private int SpawnLoadTestBots(Arena arena, int count, bool combat)
         {
             if (!arena.TryGetExtraData(_adKey, out ArenaData? ad))
                 return 0;
@@ -1156,11 +1167,15 @@ namespace SS.Bots
             {
                 const ShipType ship = ShipType.Warbird;
 
-                Player? botPlayer = _fake.CreateFakePlayer($"LoadBot{i:D4}", arena, ShipType.Spec, 0);
+                // Combat bots are split across two freqs so that they have someone to fight. Orbiting
+                // bots all sit on freq 0, since freq only adds noise when nobody is shooting.
+                short freq = combat ? (short)(i % 2) : (short)0;
+
+                Player? botPlayer = _fake.CreateFakePlayer($"LoadBot{i:D4}", arena, ShipType.Spec, freq);
                 if (botPlayer is null)
                     break;
 
-                _game.SetShipAndFreq(botPlayer, ship, 0);
+                _game.SetShipAndFreq(botPlayer, ship, freq);
 
                 // The simulation has a fixed number of ship slots (MaxShips) and throws once they are
                 // gone, so a request for more bots than the arena can hold would otherwise abort the
@@ -1182,11 +1197,14 @@ namespace SS.Bots
 
                 GetScatteredSpawn(arena, ref random, out short spawnX, out short spawnY);
                 C2S_PositionPacket spawn = new() { X = spawnX, Y = spawnY };
-                world.EnqueueCommand(PhysicsAdapter.ShipAddCommand(slot, world.CurrentTick + 1, botPlayer.Id, ship, 0, in spawn));
+                world.EnqueueCommand(PhysicsAdapter.ShipAddCommand(slot, world.CurrentTick + 1, botPlayer.Id, ship, freq, in spawn));
 
                 ad.AddedShipIds.Add(botPlayer.Id);
                 ad.PlayerById[botPlayer.Id] = botPlayer;
-                ad.Bots.Add(new Bot { Player = botPlayer, ShipSlot = slot, Brain = new Brains.OrbitBrain() });
+
+                IBotBrain brain = combat ? new Brains.CombatBrain(BotProfile.Medium) : new Brains.OrbitBrain();
+
+                ad.Bots.Add(new Bot { Player = botPlayer, ShipSlot = slot, Brain = brain });
 
                 spawned++;
             }
