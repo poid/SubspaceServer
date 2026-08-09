@@ -177,6 +177,11 @@ namespace SS.LoadClient
                 Status = 0,
             };
 
+            // The server rejects a position packet whose bytes do not exclusive-or to zero, so this is
+            // not optional padding. Without it every packet is discarded as malicious and the run looks
+            // like the server is doing nothing.
+            position.SetChecksum();
+
             ReadOnlySpan<byte> bytes = MemoryMarshal.AsBytes(MemoryMarshal.CreateReadOnlySpan(ref position, 1))[..C2S_PositionPacket.Length];
             return SendRawAsync(bytes.ToArray(), cancellationToken);
         }
