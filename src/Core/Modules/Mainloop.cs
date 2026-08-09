@@ -343,6 +343,9 @@ namespace SS.Core.Modules
 
         private void ProcessTimers()
         {
+            // Every IMainloopTimer callback runs from here, so asserting once covers all of them.
+            ThreadingAssert.OnMainloop(this);
+
             DateTime now = DateTime.UtcNow;
 
             Monitor.Enter(_mainloopTimerLock);
@@ -427,6 +430,10 @@ namespace SS.Core.Modules
 
         private void DrainRunInMain()
         {
+            // Every queued mainloop work item runs from here, so asserting once covers all of them.
+            // Unload drains the queue as well, and does so on the mainloop thread.
+            ThreadingAssert.OnMainloop(this);
+
             // This differs from ASSS in is that it will only process up to the initial count.
             // This protects against the possibility not being able to fully drain if producers
             // out produce what the single consumer (mainloop thread) can process.
