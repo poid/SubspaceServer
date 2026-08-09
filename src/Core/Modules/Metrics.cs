@@ -249,6 +249,11 @@ namespace SS.Core.Modules
             if (!OperatingSystem.IsLinux())
                 return;
 
+            // The main thread keeps the process name rather than the managed thread name, so it would
+            // otherwise show up as the executable. It is worth calling out, because the mainloop runs
+            // there and almost all game logic runs on the mainloop.
+            int mainThreadId = Environment.ProcessId;
+
             try
             {
                 foreach (string taskDirectory in Directory.EnumerateDirectories("/proc/self/task"))
@@ -273,6 +278,9 @@ namespace SS.Core.Modules
 
                     if (string.IsNullOrEmpty(name) || !TryGetThreadCpuTicks(stat, out long ticks))
                         continue;
+
+                    if (int.TryParse(Path.GetFileName(taskDirectory.AsSpan()), out int threadId) && threadId == mainThreadId)
+                        name = $"{name} (main, runs the mainloop)";
 
                     // Threads that share a name (the reliable threads are Network-rel-0, -1, ...) are
                     // summed, which is what is wanted: together they are one pool doing one job.
