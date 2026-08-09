@@ -1,7 +1,9 @@
 ﻿using Microsoft.Extensions.ObjectPool;
 using SS.Core.ComponentInterfaces;
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
+using System.IO;
 using System.Text;
 using System.Threading;
 using MetricsSettings = SS.Core.ConfigHelp.Constants.Global.Metrics;
@@ -68,6 +70,37 @@ namespace SS.Core.Modules
         private int _windowStartGen0;
         private int _windowStartGen1;
         private int _windowStartGen2;
+
+        /// <summary>
+        /// Processor time the whole process had used when the window started.
+        /// </summary>
+        /// <remarks>
+        /// Sampled from the runtime at the window boundaries, like the garbage collection counters.
+        /// The difference over the window says how much processor time the load actually cost.
+        /// </remarks>
+        private TimeSpan _windowStartCpuTime;
+
+        /// <summary>
+        /// Processor time each thread had used when the window started. Key is the thread name.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// Per thread rather than per core, because a thread is the unit of parallelism here and a
+        /// thread cannot use more than one core. Which cores the operating system happens to run those
+        /// threads on changes constantly and is not attributed per process, so a per core breakdown
+        /// would be guesswork. A saturated thread is effectively a core in use, and naming it says
+        /// which part of the server that core is going to.
+        /// </para>
+        /// <para>
+        /// Linux only, since it comes from /proc. Elsewhere only the process total is reported.
+        /// </para>
+        /// </remarks>
+        private readonly Dictionary<string, long> _windowStartThreadCpuTicks = new(32);
+
+        /// <summary>
+        /// Reused between samples so that reporting does not allocate a dictionary each window.
+        /// </summary>
+        private readonly Dictionary<string, long> _threadCpuTicks = new(32);
 
         private bool _isEnabled;
 
@@ -194,8 +227,106 @@ namespace SS.Core.Modules
             _windowStartGen0 = GC.CollectionCount(0);
             _windowStartGen1 = GC.CollectionCount(1);
             _windowStartGen2 = GC.CollectionCount(2);
+            _windowStartCpuTime = Environment.CpuUsage.TotalTime;
+
+            SampleThreadCpu(_windowStartThreadCpuTicks);
 
             Interlocked.Exchange(ref _windowStartTimestamp, Stopwatch.GetTimestamp());
+        }
+
+        /// <summary>
+        /// Reads how much processor time each named thread has used, from /proc.
+        /// </summary>
+        /// <remarks>
+        /// Does nothing on platforms other than Linux, leaving <paramref name="destination"/> empty so
+        /// that callers simply report no per thread breakdown.
+        /// </remarks>
+        /// <param name="destination">Cleared and filled with thread name to processor time in clock ticks.</param>
+        private static void SampleThreadCpu(Dictionary<string, long> destination)
+        {
+            destination.Clear();
+
+            if (!OperatingSystem.IsLinux())
+                return;
+
+            try
+            {
+                foreach (string taskDirectory in Directory.EnumerateDirectories("/proc/self/task"))
+                {
+                    string name;
+                    string stat;
+
+                    try
+                    {
+                        name = File.ReadAllText(Path.Combine(taskDirectory, "comm")).Trim();
+                        stat = File.ReadAllText(Path.Combine(taskDirectory, "stat"));
+                    }
+                    catch (IOException)
+                    {
+                        // The thread ended between listing and reading it.
+                        continue;
+                    }
+                    catch (UnauthorizedAccessException)
+                    {
+                        continue;
+                    }
+
+                    if (string.IsNullOrEmpty(name) || !TryGetThreadCpuTicks(stat, out long ticks))
+                        continue;
+
+                    // Threads that share a name (the reliable threads are Network-rel-0, -1, ...) are
+                    // summed, which is what is wanted: together they are one pool doing one job.
+                    destination[name] = destination.TryGetValue(name, out long existing) ? existing + ticks : ticks;
+                }
+            }
+            catch (DirectoryNotFoundException)
+            {
+                // No /proc, so no breakdown.
+            }
+        }
+
+        /// <summary>
+        /// Pulls the user and system times out of a /proc stat line.
+        /// </summary>
+        /// <remarks>
+        /// The thread name sits in parentheses and can itself contain spaces and brackets, so the fields
+        /// are counted from the last close parenthesis rather than by splitting the whole line.
+        /// </remarks>
+        private static bool TryGetThreadCpuTicks(ReadOnlySpan<char> stat, out long ticks)
+        {
+            ticks = 0;
+
+            int commEnd = stat.LastIndexOf(')');
+            if (commEnd < 0 || commEnd + 2 >= stat.Length)
+                return false;
+
+            // Fields after the name, zero based: 0 is state, so utime is 11 and stime is 12.
+            const int UTimeIndex = 11;
+            const int STimeIndex = 12;
+
+            ReadOnlySpan<char> remaining = stat[(commEnd + 2)..];
+            long uTime = 0;
+            long sTime = 0;
+
+            for (int index = 0; index <= STimeIndex; index++)
+            {
+                int space = remaining.IndexOf(' ');
+                ReadOnlySpan<char> field = space < 0 ? remaining : remaining[..space];
+
+                if (index == UTimeIndex && !long.TryParse(field, out uTime))
+                    return false;
+
+                if (index == STimeIndex && !long.TryParse(field, out sTime))
+                    return false;
+
+                if (space < 0)
+                    return false;
+
+                remaining = remaining[(space + 1)..];
+            }
+
+            ticks = uTime + sTime;
+            return true;
         }
 
         private bool MainloopTimer_Report()
@@ -274,6 +405,18 @@ namespace SS.Core.Modules
                 // server is written to avoid allocating in steady state.
                 sb.Append($"  gc: {(GC.GetTotalAllocatedBytes() - _windowStartAllocatedBytes) / seconds / 1024d:F0} KB/s allocated, gen0 {GC.CollectionCount(0) - _windowStartGen0}, gen1 {GC.CollectionCount(1) - _windowStartGen1}, gen2 {GC.CollectionCount(2) - _windowStartGen2}");
                 Emit(sb, player);
+
+                // Cores used is the process' processor time over elapsed time: 1.0 means it kept one
+                // core busy. It is reported against the machine's core count so that a number like 2.4
+                // can be read as either comfortable or nearly everything available.
+                double coresUsed = (Environment.CpuUsage.TotalTime - _windowStartCpuTime).TotalSeconds / seconds;
+                sb.Append($"  cpu: {coresUsed:F2} cores used of {Environment.ProcessorCount}, {coresUsed * 100d:F0}% of one core");
+                Emit(sb, player);
+
+                AppendThreadCpu(sb, player, seconds);
+
+                sb.Append($"  memory: {Environment.WorkingSet / (1024d * 1024d):F0} MB working set, {GC.GetTotalMemory(false) / (1024d * 1024d):F0} MB managed heap");
+                Emit(sb, player);
             }
             finally
             {
@@ -287,6 +430,66 @@ namespace SS.Core.Modules
             static double TotalMilliseconds(long stopwatchTicks) => stopwatchTicks * 1000d / Stopwatch.Frequency;
 
             static double MeanMilliseconds(long stopwatchTicks, long count) => count > 0 ? TotalMilliseconds(stopwatchTicks) / count : 0d;
+        }
+
+        /// <summary>
+        /// Writes the per thread processor usage for the window, busiest first.
+        /// </summary>
+        /// <remarks>
+        /// Each figure is a percentage of one core, so a thread at 100% is saturated and is the limit on
+        /// what the server can do no matter how many cores the machine has. That is the number worth
+        /// watching: the server's parallelism is bounded by its threads, not by the core count.
+        /// </remarks>
+        /// <param name="sb">The builder to write into. Cleared on return.</param>
+        /// <param name="player">Who to send to, or <see langword="null"/> for the log.</param>
+        /// <param name="seconds">Length of the window.</param>
+        private void AppendThreadCpu(StringBuilder sb, Player? player, double seconds)
+        {
+            SampleThreadCpu(_threadCpuTicks);
+
+            if (_threadCpuTicks.Count == 0)
+                return;
+
+            // /proc reports processor time in clock ticks, which is USER_HZ, fixed at 100 on Linux.
+            const double TicksPerSecond = 100d;
+
+            // Below this a thread is idle bookkeeping rather than doing work, and listing every one of
+            // them would bury the threads that matter.
+            const double ActiveThresholdPercent = 1d;
+
+            List<(string Name, double Percent)> active = [];
+
+            foreach ((string name, long endTicks) in _threadCpuTicks)
+            {
+                _windowStartThreadCpuTicks.TryGetValue(name, out long startTicks);
+
+                double percent = (endTicks - startTicks) / TicksPerSecond / seconds * 100d;
+                if (percent >= ActiveThresholdPercent)
+                    active.Add((name, percent));
+            }
+
+            if (active.Count == 0)
+                return;
+
+            active.Sort(static (a, b) => b.Percent.CompareTo(a.Percent));
+
+            double total = 0d;
+            foreach ((_, double percent) in active)
+                total += percent;
+
+            sb.Append($"  threads: {active.Count} active, mean {total / active.Count:F0}% of a core each");
+            Emit(sb, player);
+
+            sb.Append("   ");
+            for (int i = 0; i < active.Count; i++)
+            {
+                if (i > 0)
+                    sb.Append(',');
+
+                sb.Append($" {active[i].Name} {active[i].Percent:F0}%");
+            }
+
+            Emit(sb, player);
         }
 
         /// <summary>
