@@ -54,6 +54,10 @@ namespace SS.Core.Modules
         private readonly IObjectPoolManager _objectPoolManager;
         private readonly IPlayerData _playerData;
         private readonly IPrng _prng;
+
+        // Optional dependency
+        private IServerMetrics? _serverMetrics;
+
         private InterfaceRegistrationToken<INetwork>? _iNetworkToken;
         private InterfaceRegistrationToken<INetworkClient>? _iNetworkClientToken;
         private InterfaceRegistrationToken<INetworkTimerMode>? _iNetworkTimerModeToken;
@@ -309,6 +313,8 @@ namespace SS.Core.Modules
         {
             _connKey = _playerData.AllocatePlayerData(new PlayerConnectionPooledObjectPolicy(_config.PlayerReliableReceiveWindowSize));
 
+            _serverMetrics = broker.GetInterface<IServerMetrics>();
+
             PlayerActionCallback.Register(broker, Callback_PlayerAction);
 
             if (!InitializeSockets())
@@ -545,6 +551,11 @@ namespace SS.Core.Modules
 
             if (broker.UnregisterInterface(ref _iRawNetworkToken) != 0)
                 return false;
+
+            if (_serverMetrics is not null)
+            {
+                broker.ReleaseInterface(ref _serverMetrics);
+            }
 
             // Normally, all threads are already stopped and all connections disconnected by this point because PreUnload should have ran.
             // However, if there's a failure to load all modules during startup, then the PostLoad/PreUnload steps will NOT be run.
@@ -4304,6 +4315,8 @@ namespace SS.Core.Modules
 
             if (!player.TryGetExtraData(_connKey, out PlayerConnection? conn))
                 return;
+
+            _serverMetrics?.Increment(ServerMetric.NetworkSendToOne);
 
             SendToOne(conn, data, flags);
         }
