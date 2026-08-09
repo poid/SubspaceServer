@@ -4108,6 +4108,11 @@ namespace SS.Core.Modules
 
         private void MainloopWork_CallPacketHandlers(SubspaceBuffer buffer)
         {
+            // Every game packet handler in the server is dispatched from here, so asserting once covers
+            // all of them. Handlers are written assuming they are on the mainloop and would be unsafe
+            // anywhere else.
+            ThreadingAssert.OnMainloop(_mainloop);
+
             if (buffer is null)
                 return;
 
@@ -4592,15 +4597,14 @@ namespace SS.Core.Modules
             // Check some conditions that should be true and would normally be caught when developing in debug mode.
             //
 
-            // TODO: If OutLock is already being held, then the lock to read connection status must already be held too.
-            //Debug.Assert(
-            //    !Monitor.IsEntered(conn.OutLock)
-            //    || (Monitor.IsEntered(conn.OutLock)
-            //        && ((playerConnection is not null && (_playerData.IsReadLockHeld || _playerData.IsWriteLockHeld || _playerData.IsUpgradeableReadLockHeld))
-            //            || (clientConnection is not null && (_clientConnectionsLock.IsReadLockHeld || _clientConnectionsLock.IsWriteLockHeld || _clientConnectionsLock.IsUpgradeableReadLockHeld))
-            //        )
-            //    )
-            //);
+            // If OutLock is already held, the lock that guards connection status must already be held
+            // too. That ordering is what stops this from deadlocking against the send thread, which
+            // takes them in that order, and it was previously only written down in a comment.
+            Debug.Assert(
+                !conn.OutLock.IsHeldByCurrentThread
+                || (playerConnection is not null && (_playerData.IsReadLockHeld || _playerData.IsWriteLockHeld || _playerData.IsUpgradeableReadLockHeld))
+                || (clientConnection is not null && (_clientConnectionsLock.IsReadLockHeld || _clientConnectionsLock.IsWriteLockHeld || _clientConnectionsLock.IsUpgradeableReadLockHeld)),
+                "OutLock is held without the connection status lock, which is the wrong lock order.");
 
             // data has to be able to fit (a reliable packet has an additional header, so account for that too)
             Debug.Assert((isReliable && len <= Constants.MaxPacket - ReliableHeader.Length) || (!isReliable && len <= Constants.MaxPacket));

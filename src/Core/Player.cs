@@ -8,6 +8,7 @@ using System.Collections.Specialized;
 using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using System.Net;
+using System.Threading;
 
 namespace SS.Core
 {
@@ -350,12 +351,26 @@ namespace SS.Core
         /// </summary>
         public ClientFeatures ClientFeatures { get; internal set; }
 
+        private int _status = (int)PlayerState.Uninitialized;
+
         /// <summary>
         /// The player's state.
         /// Core modules use this to transition a player between various stages.
         /// Other modules will mostly just care whether the player is <see cref="PlayerState.Playing"/>.
         /// </summary>
-        public PlayerState Status { get; internal set; } = PlayerState.Uninitialized;
+        /// <remarks>
+        /// Read and written from several threads: the mainloop drives the state machine, while the
+        /// network receive, reliable and send threads read it to decide whether a connection is usable,
+        /// and reach it for writing through <see cref="ComponentInterfaces.IPlayerData.KickPlayer"/>.
+        /// The enum is int backed so a read can never tear, but a plain field carries no ordering
+        /// guarantee, so a thread could act on a stale state indefinitely. Volatile access costs nothing
+        /// measurable here and removes that.
+        /// </remarks>
+        public PlayerState Status
+        {
+            get => (PlayerState)Volatile.Read(ref _status);
+            internal set => Volatile.Write(ref _status, (int)value);
+        }
 
         /// <summary>
         /// The state to move to after returning to <see cref="PlayerState.LoggedIn"/>.
