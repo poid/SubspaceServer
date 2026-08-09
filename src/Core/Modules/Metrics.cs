@@ -32,6 +32,7 @@ namespace SS.Core.Modules
     public sealed class Metrics(
         IConfigManager configManager,
         ILogManager logManager,
+        IMainloop mainloop,
         IMainloopTimer mainloopTimer,
         IObjectPoolManager objectPoolManager) : IModule, IModuleLoaderAware, IServerMetrics
     {
@@ -40,6 +41,7 @@ namespace SS.Core.Modules
         // before the hot paths that report to it (Mainloop, PlayerData, Network, Game).
         private readonly IConfigManager _configManager = configManager ?? throw new ArgumentNullException(nameof(configManager));
         private readonly ILogManager _logManager = logManager ?? throw new ArgumentNullException(nameof(logManager));
+        private readonly IMainloop _mainloop = mainloop ?? throw new ArgumentNullException(nameof(mainloop));
         private readonly IMainloopTimer _mainloopTimer = mainloopTimer ?? throw new ArgumentNullException(nameof(mainloopTimer));
         private readonly IObjectPoolManager _objectPoolManager = objectPoolManager ?? throw new ArgumentNullException(nameof(objectPoolManager));
 
@@ -101,6 +103,16 @@ namespace SS.Core.Modules
         /// Reused between samples so that reporting does not allocate a dictionary each window.
         /// </summary>
         private readonly Dictionary<string, long> _threadCpuTicks = new(32);
+
+        /// <summary>
+        /// Guards the two thread processor dictionaries.
+        /// </summary>
+        /// <remarks>
+        /// Reset is documented as callable from any thread and rewrites the window's starting sample
+        /// while reporting reads it, so without this the report can throw for enumerating a dictionary
+        /// that changed underneath it. Taken once per window.
+        /// </remarks>
+        private readonly Lock _threadCpuLock = new();
 
         private bool _isEnabled;
 
@@ -223,13 +235,19 @@ namespace SS.Core.Modules
                 Interlocked.Exchange(ref _values[i], 0);
             }
 
-            _windowStartAllocatedBytes = GC.GetTotalAllocatedBytes();
+            // Sampling per thread processor time reads files and allocates strings, so it happens before
+            // the allocation baseline is taken. The other way round, the measurement's own allocations
+            // land inside the window it is starting and get reported as the server's.
+            lock (_threadCpuLock)
+            {
+                SampleThreadCpu(_windowStartThreadCpuTicks);
+            }
+
+            _windowStartCpuTime = Environment.CpuUsage.TotalTime;
             _windowStartGen0 = GC.CollectionCount(0);
             _windowStartGen1 = GC.CollectionCount(1);
             _windowStartGen2 = GC.CollectionCount(2);
-            _windowStartCpuTime = Environment.CpuUsage.TotalTime;
-
-            SampleThreadCpu(_windowStartThreadCpuTicks);
+            _windowStartAllocatedBytes = GC.GetTotalAllocatedBytes();
 
             Interlocked.Exchange(ref _windowStartTimestamp, Stopwatch.GetTimestamp());
         }
@@ -339,10 +357,24 @@ namespace SS.Core.Modules
 
         private bool MainloopTimer_Report()
         {
-            WriteReport(null);
-            Reset();
+            // Reporting reads per thread processor time out of /proc, which is blocking file I/O, and
+            // it would run on the mainloop thread if done here. That would stall the mainloop on a
+            // schedule, so a load test would show a periodic hitch caused by the measurement and then
+            // blame whatever change was being evaluated. The counters are all interlocked, and the log
+            // and chat interfaces are safe from any thread, so the whole report is done off it.
+            _mainloop.QueueThreadPoolWorkItem(ThreadPoolWork_Report, (Player?)null);
 
             return true;
+        }
+
+        private void ThreadPoolWork_Report(Player? player)
+        {
+            WriteReport(player);
+
+            // Only the timed report starts a new window; ?metrics reports what has accumulated without
+            // disturbing it, so that reading the numbers does not change them.
+            if (player is null)
+                Reset();
         }
 
         [CommandHelp(
@@ -367,7 +399,9 @@ namespace SS.Core.Modules
                 return;
             }
 
-            WriteReport(player);
+            // Off the mainloop for the same reason as the timed report: reading per thread processor
+            // time out of /proc is blocking file I/O, and this command handler runs on the mainloop.
+            _mainloop.QueueThreadPoolWorkItem(ThreadPoolWork_Report, player);
         }
 
         /// <summary>
@@ -453,11 +487,6 @@ namespace SS.Core.Modules
         /// <param name="seconds">Length of the window.</param>
         private void AppendThreadCpu(StringBuilder sb, Player? player, double seconds)
         {
-            SampleThreadCpu(_threadCpuTicks);
-
-            if (_threadCpuTicks.Count == 0)
-                return;
-
             // /proc reports processor time in clock ticks, which is USER_HZ, fixed at 100 on Linux.
             const double TicksPerSecond = 100d;
 
@@ -467,13 +496,20 @@ namespace SS.Core.Modules
 
             List<(string Name, double Percent)> active = [];
 
-            foreach ((string name, long endTicks) in _threadCpuTicks)
+            // Held across the sample and the comparison, since Reset can rewrite the window's starting
+            // sample from another thread and this would otherwise enumerate it as it changed.
+            lock (_threadCpuLock)
             {
-                _windowStartThreadCpuTicks.TryGetValue(name, out long startTicks);
+                SampleThreadCpu(_threadCpuTicks);
 
-                double percent = (endTicks - startTicks) / TicksPerSecond / seconds * 100d;
-                if (percent >= ActiveThresholdPercent)
-                    active.Add((name, percent));
+                foreach ((string name, long endTicks) in _threadCpuTicks)
+                {
+                    _windowStartThreadCpuTicks.TryGetValue(name, out long startTicks);
+
+                    double percent = (endTicks - startTicks) / TicksPerSecond / seconds * 100d;
+                    if (percent >= ActiveThresholdPercent)
+                        active.Add((name, percent));
+                }
             }
 
             if (active.Count == 0)

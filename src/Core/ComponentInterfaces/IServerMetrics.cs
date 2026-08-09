@@ -79,10 +79,16 @@ namespace SS.Core.ComponentInterfaces
     /// All methods are safe to call from any thread.
     /// </para>
     /// <para>
-    /// Callers on hot paths must accumulate locally and report once at a natural boundary rather than
-    /// calling per iteration. The position fan-out, for example, tallies candidates and recipients in
-    /// locals and reports once per position packet, not once per candidate. Reporting per candidate
-    /// would add an interlocked operation to the single hottest loop in the server.
+    /// Reporting once per operation is fine for anything happening at up to a few hundred thousand a
+    /// second: an interlocked add is a few nanoseconds, so at that rate it costs a fraction of a
+    /// percent of one core. Sends and lock acquisitions are counted that way.
+    /// </para>
+    /// <para>
+    /// Inner loops that run in the millions per second are different, and there callers must accumulate
+    /// locally and report once at a natural boundary. The position fan-out tallies candidates and
+    /// recipients in locals and reports once per position packet rather than once per candidate,
+    /// because that loop runs at several million iterations a second at a few hundred players, where
+    /// per-iteration reporting would be a measurable tax on the hottest loop in the server.
     /// </para>
     /// <para>
     /// Check <see cref="IsEnabled"/> before doing any work that exists only to produce a metric.
