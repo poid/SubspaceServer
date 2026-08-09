@@ -300,8 +300,10 @@ namespace SS.Core.Modules
                     if (int.TryParse(Path.GetFileName(taskDirectory.AsSpan()), out int threadId) && threadId == mainThreadId)
                         name = $"{name} (main, runs the mainloop)";
 
-                    // Threads that share a name (the reliable threads are Network-rel-0, -1, ...) are
-                    // summed, which is what is wanted: together they are one pool doing one job.
+                    // Threads that genuinely share a name, such as the runtime's thread pool workers, are
+                    // summed, which is what is wanted: together they are one pool doing one job. The
+                    // server's own pools number their threads instead (Network-send-0, Network-rel-0, ...)
+                    // and so stay separate, which is what shows whether the work is evenly split.
                     destination[name] = destination.TryGetValue(name, out long existing) ? existing + ticks : ticks;
                 }
             }
