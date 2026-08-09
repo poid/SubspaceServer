@@ -73,6 +73,7 @@ namespace SS.Core.Modules
         // Cached delegates
         private readonly Action<Player> _mainloopWork_FireNewPlayerCallback;
         private readonly Action<Player> _mainloopWork_CompleteFreePlayer;
+        private readonly Action<Player> _mainloopWork_KickPlayer;
 
         public PlayerData(
             IComponentBroker broker,
@@ -85,6 +86,7 @@ namespace SS.Core.Modules
             _mainloop = mainloop ?? throw new ArgumentNullException(nameof(mainloop));
             _mainloopWork_FireNewPlayerCallback = MainloopWork_FireNewPlayerCallback;
             _mainloopWork_CompleteFreePlayer = MainloopWork_CompleteFreePlayer;
+            _mainloopWork_KickPlayer = MainloopWork_KickPlayer;
         }
 
         #region Module Members
@@ -446,6 +448,34 @@ namespace SS.Core.Modules
         {
             if (player is null)
                 return;
+
+            // Kicking changes gameplay state: it drives the player out of its arena, which runs the
+            // leave-arena callbacks, and sets where the state machine goes next. Most callers are on
+            // the mainloop, but the network receive, reliable and send threads all kick on lagout or
+            // disconnect, and the chat thread does the same. Doing that work on those threads makes
+            // them writers of state the mainloop otherwise owns alone, which is the thing that has to
+            // stop before arenas can be given to worker threads.
+            //
+            // Deferring is safe: the state machine's leave handling is a no-op for a player already on
+            // the way out, so a player kicked twice before the first one runs is fine, and connection
+            // teardown was already asynchronous.
+            if (!_mainloop.IsMainloop)
+            {
+                _mainloop.QueueMainWorkItem(_mainloopWork_KickPlayer, player);
+                return;
+            }
+
+            KickPlayerOnMainloop(player);
+        }
+
+        private void MainloopWork_KickPlayer(Player player)
+        {
+            KickPlayerOnMainloop(player);
+        }
+
+        private void KickPlayerOnMainloop(Player player)
+        {
+            ThreadingAssert.OnMainloop(_mainloop);
 
             WriteLock();
 
