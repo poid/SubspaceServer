@@ -1,4 +1,5 @@
 ﻿using System.Diagnostics;
+using System.Text;
 
 namespace SS.LoadClient
 {
@@ -14,6 +15,9 @@ namespace SS.LoadClient
     {
         private static async Task<int> Main(string[] args)
         {
+            // The packet structs encode strings as Windows-1252, which .NET does not carry by default.
+            Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
+
             Options? options = Options.Parse(args);
             if (options is null)
             {
