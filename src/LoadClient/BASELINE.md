@@ -25,9 +25,76 @@ encryption and the load client, which cannot do that, connects and then silently
 | 100 | 1 | 994 | 100.0 | 99.0 | 98,441 | 102,570 | 0.09 | 4% | 4% | 145 KB/s | 0 |
 | 100 | 4 | 1000 | 100.0 | 24.0 | 24,022 | 28,138 | 0.05 | 2% | 2% | 103 KB/s | 0 |
 | 537 | 12 | 5338 | **537.0** | **42.8** | 228,808 | 255,705 | 0.34 | 15% | 15% | 104 KB/s | 0 |
+| 567 † | 12 | 5353 | **567.0** | **42.7** | 230,911 | 305,379 | **0.61** | 32% | 21% | 121 KB/s | 0 |
+
+† with combat: `--weapons 20 --deaths 6`
 
 Thread percentages are of one core. Idle CPU was measured separately; a dash means the thread was
 below the 1% reporting threshold.
+
+## What combat costs
+
+The last two rows are the same scenario with and without fighting, so they isolate what firing adds.
+20% of position packets carrying a weapon, plus six deaths per client per minute:
+
+| | positions only | with combat | change |
+|---|---|---|---|
+| Updates sent to clients | 81,265/s | 166,642/s | **2.05x** |
+| Bandwidth out | 1,775 KB/s | 3,684 KB/s | **2.08x** |
+| Processor | 0.34 cores | 0.61 cores | **1.79x** |
+| Mainloop thread | 15% | 32% | 2.1x |
+| Send thread | 15% | 21% | 1.4x |
+
+Bandwidth roughly doubled from a fifth of packets carrying fire, because a weapon shot cannot use
+either compact batched form — every recipient gets the largest position packet instead — and it uses
+the weapon's range rather than the plain view range, so it reaches further. Kill notifications came
+back at 2,505/s, confirming the deaths were processed rather than rejected.
+
+A measurement without combat therefore flatters the server by about half on the send side. The
+positions-only rows are the better basis for comparing one change against another, because combat
+depends on who runs into whom, but they are not a picture of a real game.
+
+## Bots, for comparison
+
+Bots are fake players, so the fan out skips them: they generate scan load but the server never sends
+to them. They are cheap to run in bulk and useful for loading the game logic, not the network.
+
+| bots | brain | pos pkt/s | scanned/pkt | cores | mainloop | alloc |
+|---|---|---|---|---|---|---|
+| 50 | orbit | 502 | 51.0 | 0.10 | 9% | – |
+| 200 | orbit | 1875 | 201.0 | 0.37 | 34% | – |
+| 250 | orbit | 2275 | 251.0 | 0.44 | 40% | – |
+| 150 | combat | 1440 | 150.3 | 0.42 | 40% | 249 KB/s |
+
+Combat bots cost noticeably more each: 150 of them use more processor than 200 orbiting ones. Most
+of that is the bot AI itself, which runs on the server, rather than anything the server does for a
+real player.
+
+The physics engine allocates a fixed number of ship slots, so an arena tops out at **256 bots**.
+That happens to be the same ceiling as the protocol's byte sized player id in the ordinary position
+packet.
+
+## Against the developer's earlier stress test
+
+For context, the server's developer previously ran 500 zerobots at 50 per arena, plus a Continuum
+client, on a Ryzen 5 5600X with the Visual Studio debugger attached, and reported nearly exhausting
+32 GB of RAM. Separately, all in one arena, he saw around 200 before things became processor bound.
+
+The 567 client combat row above is the closest comparison: a similar population at a similar spread,
+now with fighting rather than just movement. Differences worth keeping in mind before treating the
+two as equivalent:
+
+- His bots were playing properly, including repels, on a small map where they were constantly
+  killing each other. Ours fire bullets and bombs on a timer and die on a timer.
+- His RAM figure is about his clients, not the server. 500 separate bot programs plus a debugger is
+  what filled the memory; the server here used 167 MB for 567 players. The load client is a single
+  process holding 567 sockets, which is far cheaper than 500 processes, so that number is not
+  comparable and is not evidence of an improvement.
+- His processor limit in a single arena appears to have been the bots, not the server.
+- This machine has 32 cores against his 6. That did not matter much, since the server only reached
+  0.61 cores, but it did mean the load generator never competed with the server for processor.
+
+So: the same order of population, with a comparable but not identical workload, on better hardware.
 
 ## What the numbers say
 
@@ -61,8 +128,10 @@ need retuning yet. Recheck this if a run ever shows sustained allocation or a ri
 
 - Debug build. Absolute CPU is pessimistic; the shape of the curves is what matters.
 - Client and server share a machine, so they compete for CPU.
-- 600 clients were requested for the last row and 537 connected. The shortfall was not
+- 600 clients were requested for the last two rows and 537 then 567 connected. The shortfall was not
   investigated, so treat the client count as measured rather than requested.
+- Combat runs are less repeatable than positions-only ones, since what happens depends on who ends
+  up near whom. Compare changes on the positions-only rows and use combat to check behaviour.
 - The chat protocol mode drives the player life cycle but sends no position packets, so it cannot
   produce any of the above. It is limited to about five logins per second by the server's chat
   module, which is single threaded at 10Hz.
