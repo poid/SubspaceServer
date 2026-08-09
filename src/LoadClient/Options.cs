@@ -43,6 +43,25 @@
 
         public short ViewHeight { get; private set; } = 1080;
 
+        /// <summary>
+        /// Percentage of position packets that carry weapon fire.
+        /// </summary>
+        /// <remarks>
+        /// Firing is not a small addition to the load. A position packet with a weapon on it cannot be
+        /// sent in either of the compact batched forms, so every recipient gets the largest position
+        /// packet instead, and it runs the weapon range logic rather than the plain view range.
+        /// </remarks>
+        public int WeaponPercent { get; private set; }
+
+        /// <summary>
+        /// Deaths per client per minute, or zero for none.
+        /// </summary>
+        /// <remarks>
+        /// Deaths reach code that position packets never touch: kill advisors, scoring, the prize drop,
+        /// and respawn.
+        /// </remarks>
+        public int DeathsPerMinute { get; private set; }
+
         public string Host { get; private set; } = "127.0.0.1";
 
         /// <summary>
@@ -147,6 +166,16 @@
                         i++;
                         break;
 
+                    case "--weapons" when next is not null && int.TryParse(next, out int weaponPercent) && weaponPercent >= 0 && weaponPercent <= 100:
+                        options.WeaponPercent = weaponPercent;
+                        i++;
+                        break;
+
+                    case "--deaths" when next is not null && int.TryParse(next, out int deaths) && deaths >= 0:
+                        options.DeathsPerMinute = deaths;
+                        i++;
+                        break;
+
                     case "--spread" when next is not null && int.TryParse(next, out int spread) && spread > 0:
                         options.SpreadPixels = spread;
                         i++;
@@ -186,8 +215,13 @@
                   SS.LoadClient [options]
 
                 Options:
+                  --protocol chat|game     chat drives the player life cycle over TCP; game sends
+                                           position packets over UDP and is the only mode that loads
+                                           the position fan out and the network send path.
+                                           Default chat
                   --host <host>            Server host. Default 127.0.0.1
-                  --port <port>            Chat protocol TCP port (Net:ChatListen). Default 5000
+                  --port <port>            Server port. Chat uses Net:ChatListen over TCP, game uses
+                                           the [Listen] port over UDP. Default 5000
                   --clients <n>            How many clients to connect. Default 100
                   --arenas <a,b,c>         Arenas to spread clients over, round robin. Default 0
                   --name-prefix <prefix>   Player name prefix. Default Load
@@ -196,11 +230,30 @@
                   --connect-delay <ms>     Wait between connecting each client. Default 0
                   --command <command>      Command to issue once connected, without '?'. Repeatable
 
+                Game mode only:
+                  --spread <pixels>        How far apart to place clients in an arena. This decides
+                                           how many end up within view of each other, which is what
+                                           the fan out cost scales with. Default 4096
+                  --view <width>x<height>  Screen size the clients claim, which the server uses as
+                                           their view range. Default 1920x1080
+                  --weapons <percent>      Percentage of position packets carrying weapon fire.
+                                           Firing stops the server using either compact batched
+                                           position form and widens the range it sends to, so it
+                                           costs far more than the percentage suggests. Default 0
+                  --deaths <per minute>    Deaths per client per minute, which drives the kill
+                                           advisors, scoring, prizes and respawn. Default 0
+
                 Examples:
-                  Drive the player life cycle with 200 clients over four arenas for two minutes:
+                  Position load over the network, which is the main measurement:
+                    SS.LoadClient --protocol game --clients 500 --arenas 0,1,2,3 --duration 60
+
+                  The same with fighting, which roughly doubles the send side:
+                    SS.LoadClient --protocol game --clients 500 --arenas 0,1,2,3 --weapons 20 --deaths 6 --duration 60
+
+                  Drive the player life cycle with 200 chat clients over four arenas:
                     SS.LoadClient --clients 200 --arenas 0,1,2,3 --duration 120
 
-                  Start a bot load test, which is what exercises the position fan out:
+                  Start a bot load test, using one chat client just to issue the command:
                     SS.LoadClient --clients 1 --arenas 0 --command "loadtest 200 4" --duration 120
 
                 Notes:

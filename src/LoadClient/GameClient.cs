@@ -60,6 +60,19 @@ namespace SS.LoadClient
         public long PacketsReceived;
         public long BytesReceived;
 
+        /// <summary>
+        /// Kill notifications seen, which confirms deaths are actually being processed rather than
+        /// silently rejected.
+        /// </summary>
+        public long KillsSeen;
+
+        /// <summary>
+        /// Ids of other players seen entering this arena, used to name a killer the server will accept.
+        /// </summary>
+        private readonly List<short> _knownPlayerIds = new(64);
+
+        private short _ownPlayerId = -1;
+
         public async Task<bool> ConnectAsync(string host, int port, CancellationToken cancellationToken)
         {
             try
@@ -77,18 +90,27 @@ namespace SS.LoadClient
                 using CancellationTokenSource timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
                 timeout.CancelAfter(TimeSpan.FromSeconds(10));
 
-                while (!timeout.IsCancellationRequested)
+                try
                 {
-                    int received = await _socket.ReceiveAsync(_receiveBuffer, SocketFlags.None, timeout.Token);
-                    if (received >= 6 && _receiveBuffer[0] == 0x00 && _receiveBuffer[1] == 0x02)
+                    while (true)
                     {
-                        IsConnected = true;
-                        return true;
+                        int received = await _socket.ReceiveAsync(_receiveBuffer, SocketFlags.None, timeout.Token);
+                        if (received >= 6 && _receiveBuffer[0] == 0x00 && _receiveBuffer[1] == 0x02)
+                        {
+                            IsConnected = true;
+                            return true;
+                        }
                     }
                 }
-
-                FailureReason = "no connection init response";
-                return false;
+                catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+                {
+                    // Our own timeout, rather than the run ending. Worth saying so specifically: by far
+                    // the most likely cause is another encryption module sitting ahead of EncryptionNull,
+                    // which answers the handshake and then expects encryption this client cannot do.
+                    // Reported as a plain cancellation, that is close to impossible to guess.
+                    FailureReason = "no connection init response; is EncryptionNull loaded before EncryptionVIE?";
+                    return false;
+                }
             }
             catch (OperationCanceledException)
             {
@@ -162,7 +184,12 @@ namespace SS.LoadClient
         /// <summary>
         /// Sends one position update, unreliably, exactly as a real client does.
         /// </summary>
-        public Task SendPositionAsync(short x, short y, short xSpeed, short ySpeed, sbyte rotation, CancellationToken cancellationToken)
+        /// <param name="weapon">
+        /// The weapon being fired this tick, or <see cref="WeaponCodes.Null"/> for none.
+        /// Firing changes what the server does with the packet: it can no longer use either of the
+        /// small batched forms, so every recipient gets the largest position packet there is.
+        /// </param>
+        public Task SendPositionAsync(short x, short y, short xSpeed, short ySpeed, sbyte rotation, WeaponCodes weapon, CancellationToken cancellationToken)
         {
             C2S_PositionPacket position = new()
             {
@@ -176,6 +203,12 @@ namespace SS.LoadClient
                 Energy = 1000,
                 Status = 0,
             };
+
+            if (weapon != WeaponCodes.Null)
+            {
+                position.Weapon.Type = weapon;
+                position.Weapon.Level = 1;
+            }
 
             // The server rejects a position packet whose bytes do not exclusive-or to zero, so this is
             // not optional padding. Without it every packet is discarded as malicious and the run looks
@@ -247,6 +280,14 @@ namespace SS.LoadClient
             if (span[0] != 0x00)
             {
                 CountIfPosition(span[0]);
+
+                if (span[0] == (byte)S2CPacketType.PlayerEntering)
+                    NotePlayerEntering(span);
+                else if (span[0] == (byte)S2CPacketType.WhoAmI && span.Length >= 3)
+                    _ownPlayerId = LittleEndianConverter.Convert(MemoryMarshal.Read<short>(span.Slice(1, 2)));
+                else if (span[0] == (byte)S2CPacketType.Kill)
+                    Interlocked.Increment(ref KillsSeen);
+
                 return;
             }
 
@@ -282,6 +323,56 @@ namespace SS.LoadClient
                 case 0x07: // the server dropped us
                     FailureReason ??= "disconnected by server";
                     break;
+            }
+        }
+
+        /// <summary>
+        /// Tells the server this client died, naming another player as the killer.
+        /// </summary>
+        /// <remarks>
+        /// Drives the kill path: the kill advisors, scoring, the green (prize) drop, and the respawn,
+        /// none of which a position packet touches. Does nothing until at least one other player has
+        /// been seen, since the server rejects a killer it cannot resolve in this arena.
+        /// </remarks>
+        /// <returns><see langword="true"/> if a death was sent.</returns>
+        public Task<bool> SendDeathAsync(CancellationToken cancellationToken)
+        {
+            short killer;
+
+            lock (_knownPlayerIds)
+            {
+                if (_knownPlayerIds.Count == 0)
+                    return Task.FromResult(false);
+
+                killer = _knownPlayerIds[Random.Shared.Next(_knownPlayerIds.Count)];
+            }
+
+            C2S_Die die = new(killer, 0);
+            ReadOnlySpan<byte> bytes = MemoryMarshal.AsBytes(MemoryMarshal.CreateReadOnlySpan(ref die, 1));
+            return SendRawAsync(bytes.ToArray(), cancellationToken);
+        }
+
+        /// <summary>
+        /// Records another player's id from a player entering packet, so that a death can name a killer
+        /// the server will accept.
+        /// </summary>
+        private void NotePlayerEntering(ReadOnlySpan<byte> span)
+        {
+            // Offset of the player id within S2C_PlayerData: type, ship and audio flag, then the 20 byte
+            // name, the 20 byte squad, and two four byte score fields.
+            const int PlayerIdOffset = 51;
+
+            if (span.Length < PlayerIdOffset + 2)
+                return;
+
+            short playerId = LittleEndianConverter.Convert(MemoryMarshal.Read<short>(span.Slice(PlayerIdOffset, 2)));
+            if (playerId < 0 || playerId == _ownPlayerId)
+                return;
+
+            lock (_knownPlayerIds)
+            {
+                if (_knownPlayerIds.Count < 64 && !_knownPlayerIds.Contains(playerId))
+                    _knownPlayerIds.Add(playerId);
             }
         }
 

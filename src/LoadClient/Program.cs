@@ -1,4 +1,6 @@
-﻿using System.Diagnostics;
+﻿using SS.Packets.Game;
+using System.Diagnostics;
+using System.Text;
 
 namespace SS.LoadClient
 {
@@ -14,6 +16,9 @@ namespace SS.LoadClient
     {
         private static async Task<int> Main(string[] args)
         {
+            // The packet structs encode strings as Windows-1252, which .NET does not carry by default.
+            Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
+
             Options? options = Options.Parse(args);
             if (options is null)
             {
@@ -52,12 +57,16 @@ namespace SS.LoadClient
             Console.WriteLine($"Spread {options.SpreadPixels}px, view {options.ViewWidth}x{options.ViewHeight}. The server needs the EncryptionNull module loaded.");
 
             GameClient[] clients = new GameClient[options.ClientCount];
-            List<Task> tasks = new(options.ClientCount * 2);
+
+            // Indexed per client rather than appended to a shared list, because every client is set up
+            // concurrently and List is not safe to add to from several threads at once.
+            Task?[] receiveTasks = new Task?[options.ClientCount];
+            Task?[] positionTasks = new Task?[options.ClientCount];
 
             int connected = 0;
             long startTimestamp = Stopwatch.GetTimestamp();
 
-            Task[] setupTasks = new Task[options.ClientCount];
+            Task?[] setupTasks = new Task?[options.ClientCount];
 
             for (int i = 0; i < options.ClientCount; i++)
             {
@@ -82,19 +91,24 @@ namespace SS.LoadClient
 
             try
             {
-                await Task.WhenAll(setupTasks);
+                // Interrupting the staggered start leaves the rest of the array unset, and WhenAll
+                // throws on a null element, so only the entries that were filled are awaited.
+                await Task.WhenAll(setupTasks.Where(t => t is not null)!);
             }
             catch (OperationCanceledException)
             {
                 // Expected if the run was cut short while clients were still arriving.
             }
 
+            // Same reason: only the clients that were actually constructed.
+            GameClient[] startedClients = clients.Where(c => c is not null).ToArray()!;
+
             Console.WriteLine($"Connected {connected}/{options.ClientCount} in {Stopwatch.GetElapsedTime(startTimestamp).TotalSeconds:F1}s");
 
             if (connected == 0)
             {
-                Console.WriteLine("No client connected. First failure: " + (Array.Find(clients, c => c.FailureReason is not null)?.FailureReason ?? "unknown"));
-                Console.WriteLine("Check that the EncryptionNull module is enabled in Modules.config.");
+                Console.WriteLine("No client connected. First failure: " + (Array.Find(startedClients, c => c.FailureReason is not null)?.FailureReason ?? "unknown"));
+                Console.WriteLine("Check that EncryptionNull is loaded, and loaded before EncryptionVIE.");
                 return 1;
             }
 
@@ -106,7 +120,7 @@ namespace SS.LoadClient
 
             try
             {
-                await Task.WhenAll(tasks);
+                await Task.WhenAll(receiveTasks.Concat(positionTasks).Where(t => t is not null)!);
             }
             catch (OperationCanceledException)
             {
@@ -117,12 +131,14 @@ namespace SS.LoadClient
 
             long positionUpdates = 0;
             long bytes = 0;
+            long kills = 0;
             int stillUp = 0;
 
-            foreach (GameClient client in clients)
+            foreach (GameClient client in startedClients)
             {
                 positionUpdates += Interlocked.Read(ref client.PositionUpdatesReceived);
                 bytes += Interlocked.Read(ref client.BytesReceived);
+                kills += Interlocked.Read(ref client.KillsSeen);
 
                 if (client.IsConnected && client.FailureReason is null)
                     stillUp++;
@@ -131,9 +147,12 @@ namespace SS.LoadClient
             Console.WriteLine($"Finished. {stillUp}/{connected} client(s) survived.");
             Console.WriteLine($"Server sent {positionUpdates / seconds:F0} position updates/s and {bytes / seconds / 1024d:F0} KB/s to these clients ({positionUpdates / (double)Math.Max(connected, 1) / seconds:F1} updates/s each).");
 
-            await Task.WhenAll(clients.Select(c => c.DisconnectAsync(CancellationToken.None)));
+            if (options.DeathsPerMinute > 0)
+                Console.WriteLine($"Kill notifications seen: {kills / seconds:F0}/s, which confirms deaths were processed rather than rejected.");
 
-            foreach (GameClient client in clients)
+            await Task.WhenAll(startedClients.Select(c => c.DisconnectAsync(CancellationToken.None)));
+
+            foreach (GameClient client in startedClients)
                 client.Dispose();
 
             return 0;
@@ -145,7 +164,7 @@ namespace SS.LoadClient
 
                 Interlocked.Increment(ref connected);
 
-                tasks.Add(client.ReceiveLoopAsync(cancellationToken));
+                receiveTasks[index] = client.ReceiveLoopAsync(cancellationToken);
 
                 await client.LoginAsync(cancellationToken);
 
@@ -158,7 +177,7 @@ namespace SS.LoadClient
 
                 await Task.Delay(1500, cancellationToken);
 
-                tasks.Add(PositionLoopAsync(client, index, cancellationToken));
+                positionTasks[index] = PositionLoopAsync(client, index, cancellationToken);
             }
 
             async Task PositionLoopAsync(GameClient client, int index, CancellationToken token)
@@ -175,6 +194,10 @@ namespace SS.LoadClient
                 const int Radius = 200;
                 sbyte rotation = 0;
                 double angle = index;
+                int tick = 0;
+
+                // Deaths per minute, converted to a probability per 10Hz tick.
+                double deathChancePerTick = options.DeathsPerMinute / 60d / 10d;
 
                 try
                 {
@@ -184,13 +207,23 @@ namespace SS.LoadClient
                     while (await timer.WaitForNextTickAsync(token))
                     {
                         angle += 0.1d;
+                        tick++;
 
                         short x = (short)Math.Clamp(originX + (Radius * Math.Cos(angle)), 0, 16383);
                         short y = (short)Math.Clamp(originY + (Radius * Math.Sin(angle)), 0, 16383);
 
                         rotation = (sbyte)((rotation + 1) % 40);
 
-                        await client.SendPositionAsync(x, y, 0, 0, rotation, token);
+                        // Bullets and bombs, mixed, since they take different paths through the weapon
+                        // range logic. Spread across clients by index so they do not all fire together.
+                        WeaponCodes weapon = WeaponCodes.Null;
+                        if (options.WeaponPercent > 0 && (tick + index) % 100 < options.WeaponPercent)
+                            weapon = (tick + index) % 5 == 0 ? WeaponCodes.Bomb : WeaponCodes.Bullet;
+
+                        await client.SendPositionAsync(x, y, 0, 0, rotation, weapon, token);
+
+                        if (deathChancePerTick > 0d && Random.Shared.NextDouble() < deathChancePerTick)
+                            await client.SendDeathAsync(token);
                     }
                 }
                 catch (OperationCanceledException)
