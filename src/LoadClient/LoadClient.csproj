@@ -1,4 +1,4 @@
-<Project Sdk="Microsoft.NET.Sdk">
+﻿<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
     <OutputType>Exe</OutputType>
@@ -10,4 +10,9 @@
     <VersionPrefix>4.0.0</VersionPrefix>
   </PropertyGroup>
 
+
+  <ItemGroup>
+    <ProjectReference Include="..\Packets\Packets.csproj" />
+    <ProjectReference Include="..\Utilities\Utilities.csproj" />
+  </ItemGroup>
 </Project>

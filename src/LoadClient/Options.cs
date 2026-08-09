@@ -1,10 +1,48 @@
 ﻿namespace SS.LoadClient
 {
     /// <summary>
+    /// Which protocol simulated clients speak, and therefore what they can put load on.
+    /// </summary>
+    internal enum LoadProtocol
+    {
+        /// <summary>
+        /// The chat protocol over TCP. Drives the player life cycle but sends no position packets.
+        /// </summary>
+        Chat,
+
+        /// <summary>
+        /// The game protocol over UDP. Sends position packets and receives updates, so it is the only
+        /// one that loads the position fan out and the network send path. Needs EncryptionNull loaded.
+        /// </summary>
+        Game,
+    }
+
+    /// <summary>
     /// Command line options for the load client.
     /// </summary>
     internal sealed class Options
     {
+        /// <summary>
+        /// Which protocol the simulated clients speak.
+        /// </summary>
+        public LoadProtocol Protocol { get; private set; } = LoadProtocol.Chat;
+
+        /// <summary>
+        /// How far apart, in pixels, to spread the game clients when they enter an arena.
+        /// </summary>
+        /// <remarks>
+        /// This is what decides how many of them end up within view of each other, which is what the
+        /// position fan out costs scale with, so it is the main dial on this kind of run.
+        /// </remarks>
+        public int SpreadPixels { get; private set; } = 4096;
+
+        /// <summary>
+        /// Screen size the game clients claim, which is what the server uses as their view range.
+        /// </summary>
+        public short ViewWidth { get; private set; } = 1920;
+
+        public short ViewHeight { get; private set; } = 1080;
+
         public string Host { get; private set; } = "127.0.0.1";
 
         /// <summary>
@@ -96,6 +134,30 @@
 
                     case "--command" when next is not null:
                         options.Commands.Add(next);
+                        i++;
+                        break;
+
+                    case "--protocol" when next is not null:
+                        if (next.Equals("game", StringComparison.OrdinalIgnoreCase))
+                            options.Protocol = LoadProtocol.Game;
+                        else if (next.Equals("chat", StringComparison.OrdinalIgnoreCase))
+                            options.Protocol = LoadProtocol.Chat;
+                        else
+                            return null;
+                        i++;
+                        break;
+
+                    case "--spread" when next is not null && int.TryParse(next, out int spread) && spread > 0:
+                        options.SpreadPixels = spread;
+                        i++;
+                        break;
+
+                    case "--view" when next is not null:
+                        string[] parts = next.Split('x', StringSplitOptions.TrimEntries);
+                        if (parts.Length != 2 || !short.TryParse(parts[0], out short width) || !short.TryParse(parts[1], out short height))
+                            return null;
+                        options.ViewWidth = width;
+                        options.ViewHeight = height;
                         i++;
                         break;
 
