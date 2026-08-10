@@ -66,6 +66,53 @@ send thread's 23%, so the next ceiling is the mainloop reaching one core at roug
 That is what Phase 5 (arena-sharded workers) addresses, and the measurement gate in the plan is
 satisfied: the single mainloop thread is genuinely the remaining bottleneck.
 
+## Letting the server pick the number of send threads
+
+A setting only helps someone who predicted the load. A zone sitting at a hundred players that fills to
+several thousand needs more send threads at the moment nobody is likely to be watching. So each send
+thread measures what fraction of its interval it spends working, and shard 0 starts another when they
+are all busy.
+
+Getting this right took two corrections, both of which the measurements caught and neither of which
+was obvious beforehand.
+
+**A threshold near the top is its own resting point.** At 70%, the server went from one thread to two
+and stopped, sitting at 70–74% and still recording 30 overruns. Splitting a thread's work in two
+leaves each half at about half the utilization, so a high threshold guarantees the threads settle just
+above it and stay there, late. At 50% a split lands below the threshold and stops. A thread is also
+counted as busy if it used its whole interval on any iteration in the window, since a thread that is
+late on some and idle on others averages out below any threshold while still sending late.
+
+**Assigning at connect only spreads future connections.** With that fixed threshold, the second thread
+still sat at 5% of a core while the first stayed at 71% — it had started just after the last client
+connected, so there were no new connections left to give it. A thread started because the server
+filled up gets nothing when the players causing the load are already connected, which is the whole
+case this exists for. So each thread now hands its excess to emptier ones.
+
+Moving a connection between threads does not reorder its data: everything sent for a connection is
+done holding that connection's `OutLock` and its outgoing queues are first in first out, so whichever
+thread drains them next carries on where the last left off. What must not happen is two threads both
+deciding a connection has lagged out, so a thread only ever removes from its own shard and does so
+before adding to the other.
+
+The result, 2,000 clients, starting from `SendThreads = 1` with nobody intervening:
+
+| | one thread, fixed | four threads, fixed | adaptive |
+|---|---|---|---|
+| threads | 1 | 4 | **3, found on its own** |
+| busiest | 74% | 23% | 27% |
+| total send processor time | 74% | 91% | **78%** |
+| overruns | 43 | 0 | **0** |
+
+It grew 1 → 2 → 3 and settled at 25/26/27% — evenly spread, which is the rebalancing working. It also
+landed on a cheaper configuration than the four threads picked by hand: three threads do the same work
+for 78% of a core rather than 91%, because each extra thread costs its own scan and its own share of
+the player lock.
+
+Threads are not given back when load falls. An idle send thread costs one wakeup per interval, and the
+alternatives are worse: retiring one means agreeing with the assignment path about exactly when a
+shard stopped being usable, for a saving that does not justify it.
+
 ## What indexing per-player data by array did
 
 Per-player data was fetched from a `ConcurrentDictionary` on every access, including from the
