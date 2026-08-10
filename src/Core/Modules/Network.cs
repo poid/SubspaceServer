@@ -119,8 +119,53 @@ namespace SS.Core.Modules
         /// connection, and arena changes are frequent, so partitioning by arena would migrate
         /// connections between threads constantly for no gain.
         /// </para>
+        /// <para>
+        /// This array is allocated at its maximum size when the module loads and never replaced, so that
+        /// starting another thread does not disturb the threads already running. Only the first
+        /// <see cref="_activeSendThreads"/> entries have a thread behind them and may be assigned to.
+        /// </para>
         /// </remarks>
         private ConcurrentDictionary<int, Player>[] _sendShards = [];
+
+        /// <summary>
+        /// How many players are in each shard, so that a new connection can be given to the emptiest one
+        /// without asking a <see cref="ConcurrentDictionary{TKey, TValue}"/> for its count, which takes
+        /// all of its locks.
+        /// </summary>
+        private int[] _sendShardPlayerCounts = [];
+
+        /// <summary>
+        /// What fraction of its interval each send thread spent working, as a percentage, over that
+        /// thread's most recent measurement window.
+        /// </summary>
+        /// <remarks>Written by the thread it belongs to, read by the supervisor.</remarks>
+        private int[] _sendShardUtilization = [];
+
+        /// <summary>
+        /// How many send threads are running. Only shards below this may be assigned to.
+        /// </summary>
+        /// <remarks>
+        /// Only ever increased, and only by the supervisor. See <see cref="ConsiderStartingSendThread"/>
+        /// for why it does not come back down.
+        /// </remarks>
+        private int _activeSendThreads;
+
+        /// <summary>
+        /// The most send threads allowed to be running.
+        /// </summary>
+        private int _maxSendThreads;
+
+        /// <summary>
+        /// Rotated through when shards are tied for emptiest, so that a burst of connections arriving at
+        /// once does not all land on the lowest numbered one.
+        /// </summary>
+        private int _nextSendShardHint = -1;
+
+        /// <summary>
+        /// How many consecutive windows every running send thread has been busy for.
+        /// </summary>
+        /// <remarks>Only touched by the supervisor.</remarks>
+        private int _sendThreadBusyWindows;
 
         /// <summary>
         /// Dictionary of active client connections.
@@ -199,7 +244,36 @@ namespace SS.Core.Modules
         private readonly CancellationTokenSource _stopCancellationTokenSource = new();
         private CancellationToken _stopToken;
 
+        /// <summary>
+        /// The threads this module started, so that <see cref="IModule.Unload"/> can join them.
+        /// </summary>
+        /// <remarks>
+        /// Guarded by <see cref="_threadListLock"/>, because send threads are started while the server is
+        /// running as well as when it loads.
+        /// </remarks>
         private readonly List<Thread> _threadList = new(8);
+        private readonly Lock _threadListLock = new();
+
+        /// <summary>
+        /// How much of its interval a send thread has to spend working, as a percentage, to be counted as
+        /// unable to keep up.
+        /// </summary>
+        /// <remarks>
+        /// Below one hundred, because a thread that is already using its whole interval is late, and the
+        /// point is to add capacity before that rather than after.
+        /// </remarks>
+        private const int SendThreadBusyPercent = 70;
+
+        /// <summary>
+        /// How many measurement windows in a row every send thread has to be busy for before another is
+        /// started, so that a burst lasting a moment does not.
+        /// </summary>
+        private const int SendThreadBusyWindowsBeforeStarting = 3;
+
+        /// <summary>
+        /// How long a send thread measures its own utilization over.
+        /// </summary>
+        private static readonly TimeSpan SendThreadUtilizationWindow = TimeSpan.FromSeconds(2);
 
         /// <summary>
         /// List of info about the sockets being listened on.
@@ -331,11 +405,20 @@ namespace SS.Core.Modules
 
         [ConfigHelp<int>("Net", "SendThreads", ConfigScope.Global, Default = 1, Min = 1,
             Description = """
-                How many threads to send outgoing data on.
-                Each one is responsible for a fixed share of the connections, decided when a connection
-                is made, so a player's outgoing data is always handled by the same thread. Raising this
-                only helps once sending is actually the limit; watch the send thread's share of a core
-                and its overrun count in ?metrics before changing it.
+                How many threads to start for sending outgoing data.
+                More are started automatically when the ones running cannot keep up, so this is a floor
+                rather than a fixed count, and the default suits a server of any size. Raise it only to
+                skip the ramp up on a server that is known to start busy.
+                """)]
+        [ConfigHelp<int>("Net", "MaxSendThreads", ConfigScope.Global, Default = 0, Min = 0,
+            Description = """
+                The most threads allowed for sending outgoing data, or 0 to pick a number from the
+                processor count.
+                A thread is added when every one already running has been busy for most of its interval
+                over several seconds, so a zone that is quiet uses one and a zone that fills up grows
+                into as many as it needs without anyone having to be there to change a setting.
+                Threads are not given back when the load falls, since an idle one costs almost nothing
+                and handing a connection to a different thread could reorder that player's data.
                 """)]
         bool IModule.Load(IComponentBroker broker)
         {
@@ -356,24 +439,40 @@ namespace SS.Core.Modules
             if (sendThreadCount < 1)
                 sendThreadCount = 1;
 
-            _sendShards = new ConcurrentDictionary<int, Player>[sendThreadCount];
-            for (int i = 0; i < sendThreadCount; i++)
+            _maxSendThreads = _configManager.GetInt(_configManager.Global, "Net", "MaxSendThreads", ConfigHelp.Constants.Global.Net.MaxSendThreads.Default);
+            if (_maxSendThreads <= 0)
+            {
+                // Leave the machine room for the mainloop, the receive thread and the arena workers.
+                // Sending is a fraction of the server's work, so a large share of the cores would only
+                // add threads that never have enough to do.
+                _maxSendThreads = Math.Clamp(Environment.ProcessorCount / 4, 1, 8);
+            }
+
+            if (_maxSendThreads < sendThreadCount)
+                _maxSendThreads = sendThreadCount;
+
+            // Allocated at the maximum and never replaced, so that starting a thread later does not
+            // disturb the ones already running.
+            _sendShards = new ConcurrentDictionary<int, Player>[_maxSendThreads];
+            for (int i = 0; i < _maxSendThreads; i++)
             {
                 _sendShards[i] = new ConcurrentDictionary<int, Player>();
             }
 
+            _sendShardPlayerCounts = new int[_maxSendThreads];
+            _sendShardUtilization = new int[_maxSendThreads];
+
+            // The list is taken under its lock from here on, because a send thread that decides more are
+            // needed starts one, and the first of them can do that while this is still starting others.
+
             // receive thread
             Thread thread = new(ReceiveThread) { Name = $"{nameof(Network)}-recv" };
-            thread.Start();
-            _threadList.Add(thread);
+            AddAndStartThread(thread);
 
             // send threads
             for (int i = 0; i < sendThreadCount; i++)
             {
-                int shard = i;
-                thread = new Thread(() => SendThread(shard)) { Name = $"{nameof(Network)}-send-{shard}" };
-                thread.Start();
-                _threadList.Add(thread);
+                StartSendThread(i);
             }
 
             // reliable threads
@@ -383,15 +482,11 @@ namespace SS.Core.Modules
 
             for (int i = 0; i < reliableThreadCount; i++)
             {
-                thread = new Thread(RelThread) { Name = $"{nameof(Network)}-rel-" + i };
-                thread.Start();
-                _threadList.Add(thread);
+                AddAndStartThread(new Thread(RelThread) { Name = $"{nameof(Network)}-rel-" + i });
             }
 
             // sized send thread
-            thread = new(SizedSendThread) { Name = $"{nameof(Network)}-sized-send" };
-            thread.Start();
-            _threadList.Add(thread);
+            AddAndStartThread(new Thread(SizedSendThread) { Name = $"{nameof(Network)}-sized-send" });
 
             _iNetworkToken = broker.RegisterInterface<INetwork>(this);
             _iNetworkClientToken = broker.RegisterInterface<INetworkClient>(this);
@@ -643,11 +738,21 @@ namespace SS.Core.Modules
             // and there will not be any further processing on the connections we're forcing to disconnect.
             _stopCancellationTokenSource.Cancel();
 
-            foreach (Thread thread in _threadList)
+            // Take a copy under the lock rather than joining while holding it. A send thread that is
+            // starting another one at this moment takes the same lock, and cancellation is already set,
+            // so the newcomer stops on its first check. Joining under the lock would deadlock against it.
+            Thread[] threads;
+
+            lock (_threadListLock)
+            {
+                threads = [.. _threadList];
+                _threadList.Clear();
+            }
+
+            foreach (Thread thread in threads)
             {
                 thread.Join();
             }
-            _threadList.Clear();
 
             // Give a chance for any queued mainloop work to complete (remaining packets to process).
             _mainloop.WaitForMainWorkItemDrain();
@@ -737,6 +842,10 @@ namespace SS.Core.Modules
             // The send threads have stopped, so nothing is reading these. Dropping the references keeps
             // the disconnected players from being held alive if the module is loaded again.
             _sendShards = [];
+            _sendShardPlayerCounts = [];
+            _sendShardUtilization = [];
+            _activeSendThreads = 0;
+            _sendThreadBusyWindows = 0;
         }
 
         #endregion
@@ -901,7 +1010,10 @@ namespace SS.Core.Modules
 
             // Fixed for the life of the connection, so that one player's outgoing data is always
             // handled by the same thread and cannot be reordered by moving between them.
-            _sendShards[GetSendShard(player)][player.Id] = player;
+            int sendShard = ChooseSendShard();
+            conn.SendShard = sendShard;
+            _sendShards[sendShard][player.Id] = player;
+            Interlocked.Increment(ref _sendShardPlayerCounts[sendShard]);
 
             _playerData.WriteLock();
             try
@@ -2662,17 +2774,146 @@ namespace SS.Core.Modules
         }
 
         /// <summary>
-        /// Gets which send thread is responsible for a player.
+        /// Starts a send thread and allows connections to be assigned to it.
         /// </summary>
         /// <remarks>
-        /// Derived from the player id, which does not change while the player is connected, so the
-        /// answer is the same every time it is asked for a given connection.
+        /// The count is raised only after the thread is running, so a connection can never be given to a
+        /// shard that has nothing draining it.
         /// </remarks>
-        /// <param name="player">The player to get the shard of.</param>
-        /// <returns>The index into <see cref="_sendShards"/>.</returns>
-        private int GetSendShard(Player player)
+        /// <param name="shard">Which shard the thread is to own.</param>
+        private void StartSendThread(int shard)
         {
-            return (int)((uint)player.Id % (uint)_sendShards.Length);
+            if (!AddAndStartThread(new Thread(() => SendThread(shard)) { Name = $"{nameof(Network)}-send-{shard}" }))
+                return;
+
+            // Only after the thread is running, so that a connection can never be given to a shard that
+            // has nothing draining it.
+            Volatile.Write(ref _activeSendThreads, shard + 1);
+        }
+
+        /// <summary>
+        /// Records a thread so that <see cref="IModule.Unload"/> will wait for it, and starts it.
+        /// </summary>
+        /// <remarks>
+        /// Recording before starting, and refusing once the server is stopping, is what makes sure every
+        /// thread that gets started is one Unload knows to join. Send threads are started while the
+        /// server is running, so a thread started just after Unload took its list would otherwise be left
+        /// behind. It stops on its first check either way, but nothing would have waited for it.
+        /// </remarks>
+        /// <param name="thread">The thread to record and start.</param>
+        /// <returns><see langword="true"/> if it was started; <see langword="false"/> if the server is stopping.</returns>
+        private bool AddAndStartThread(Thread thread)
+        {
+            lock (_threadListLock)
+            {
+                if (_stopCancellationTokenSource.IsCancellationRequested)
+                    return false;
+
+                _threadList.Add(thread);
+                thread.Start();
+                return true;
+            }
+        }
+
+        /// <summary>
+        /// Chooses which send thread should own a new connection.
+        /// </summary>
+        /// <remarks>
+        /// The emptiest running shard, so that the threads started after a rise in load are the ones that
+        /// take on the players causing it. Connections already placed are never moved, so this is the
+        /// only opportunity to balance them.
+        /// </remarks>
+        /// <returns>The index into <see cref="_sendShards"/>.</returns>
+        private int ChooseSendShard()
+        {
+            int activeSendThreads = Volatile.Read(ref _activeSendThreads);
+            if (activeSendThreads <= 1)
+                return 0;
+
+            // Start from a different shard each time, so that connections arriving together while the
+            // counts are still equal are spread rather than piled onto the lowest numbered one.
+            int start = (int)((uint)Interlocked.Increment(ref _nextSendShardHint) % (uint)activeSendThreads);
+
+            int best = start;
+            int bestCount = Volatile.Read(ref _sendShardPlayerCounts[start]);
+
+            for (int i = 1; i < activeSendThreads; i++)
+            {
+                int shard = (start + i) % activeSendThreads;
+                int count = Volatile.Read(ref _sendShardPlayerCounts[shard]);
+
+                if (count < bestCount)
+                {
+                    best = shard;
+                    bestCount = count;
+                }
+            }
+
+            return best;
+        }
+
+        /// <summary>
+        /// Starts another send thread if the ones running cannot keep up.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// Called by the supervising send thread once per measurement window. A thread is added only when
+        /// every thread already running has been busy for most of its interval for several windows in a
+        /// row, so that a burst lasting a second or two does not start threads that are then not needed.
+        /// </para>
+        /// <para>
+        /// Nothing is ever given back. An idle send thread costs one wakeup per interval, which is
+        /// nothing next to what the server is doing by the time several are running, and the alternatives
+        /// are both worse: moving a connection to another thread could reorder that player's outgoing
+        /// data, and retiring a thread means agreeing with the assignment path about exactly when a shard
+        /// stopped being usable, for a saving that does not justify it.
+        /// </para>
+        /// </remarks>
+        private void ConsiderStartingSendThread()
+        {
+            int activeSendThreads = Volatile.Read(ref _activeSendThreads);
+
+            bool allBusy = true;
+            int busiest = 0;
+
+            for (int i = 0; i < activeSendThreads; i++)
+            {
+                int utilization = Volatile.Read(ref _sendShardUtilization[i]);
+
+                if (utilization > busiest)
+                    busiest = utilization;
+
+                if (utilization < SendThreadBusyPercent)
+                    allBusy = false;
+            }
+
+            IServerMetrics? serverMetrics = _serverMetrics;
+            if (serverMetrics is not null && serverMetrics.IsEnabled)
+            {
+                serverMetrics.SetGauge(ServerMetric.SendThreadsActive, activeSendThreads);
+                serverMetrics.SetGauge(ServerMetric.SendThreadBusiestPercent, busiest);
+            }
+
+            if (activeSendThreads >= _maxSendThreads)
+                return;
+
+            if (!allBusy)
+            {
+                // At least one thread has time to spare, so another would not help. Connections are
+                // spread over the running threads as they arrive, so the spare capacity gets used.
+                _sendThreadBusyWindows = 0;
+                return;
+            }
+
+            if (++_sendThreadBusyWindows < SendThreadBusyWindowsBeforeStarting)
+                return;
+
+            _sendThreadBusyWindows = 0;
+
+            StartSendThread(activeSendThreads);
+
+            _logManager.LogM(LogLevel.Info, nameof(Network),
+                $"All {activeSendThreads} send thread(s) were busy for {SendThreadBusyWindowsBeforeStarting} windows; started another (max {_maxSendThreads}). See Net:MaxSendThreads.");
         }
 
         /// <summary>
@@ -2680,7 +2921,8 @@ namespace SS.Core.Modules
         /// </summary>
         /// <param name="shard">
         /// Which share this thread owns. Shard 0 additionally handles the client connections, since
-        /// there are only ever a handful of those and splitting them would cost more than it saved.
+        /// there are only ever a handful of those and splitting them would cost more than it saved, and
+        /// decides when another send thread is needed.
         /// </param>
         private void SendThread(int shard)
         {
@@ -2690,6 +2932,13 @@ namespace SS.Core.Modules
 
             ConcurrentDictionary<int, Player> shardPlayers = _sendShards[shard];
             bool handlesClientConnections = shard == 0;
+            bool supervises = shard == 0;
+
+            // How much of the window this thread spent working rather than waiting, which is what says
+            // whether the send threads are keeping up. Measured per thread because that is the thing that
+            // runs out: total processor time says nothing when the limit is one thread's share of a core.
+            long windowStart = Stopwatch.GetTimestamp();
+            long windowBusyTicks = 0;
 
             List<Player> toKick = new(Constants.TargetPlayerCount);
             List<Player> toFree = new(Constants.TargetPlayerCount);
@@ -2788,6 +3037,7 @@ namespace SS.Core.Modules
                     return;
 
                 // Wait at least 1 tick from the start of the iteration, 1/100 second
+                long busyTicks = Stopwatch.GetTimestamp() - start;
                 int msToWait = (10 - (int)Math.Floor(Stopwatch.GetElapsedTime(start).TotalMilliseconds));
 
                 IServerMetrics? serverMetrics = _serverMetrics;
@@ -2799,6 +3049,26 @@ namespace SS.Core.Modules
                     // outgoing data is going out later than it should.
                     if (msToWait <= 0)
                         serverMetrics.Increment(ServerMetric.SendThreadOverruns);
+                }
+
+                // Publish how busy this thread has been, and let shard 0 decide whether the send threads
+                // as a group need another one. Doing this from a send thread rather than the mainloop
+                // means the decision still gets made when the mainloop is the thing that is behind.
+                windowBusyTicks += busyTicks;
+
+                TimeSpan windowElapsed = Stopwatch.GetElapsedTime(windowStart);
+                if (windowElapsed >= SendThreadUtilizationWindow)
+                {
+                    long windowTicks = Stopwatch.GetTimestamp() - windowStart;
+                    Volatile.Write(ref _sendShardUtilization[shard], windowTicks > 0 ? (int)(windowBusyTicks * 100 / windowTicks) : 0);
+
+                    windowStart = Stopwatch.GetTimestamp();
+                    windowBusyTicks = 0;
+
+                    if (supervises)
+                    {
+                        ConsiderStartingSendThread();
+                    }
                 }
 
 #if CFG_LOG_SEND_THREAD_PERFORMANCE
@@ -3065,9 +3335,14 @@ namespace SS.Core.Modules
                 SendRaw(playerConnection, disconnectSpan);
             }
 
-            // Stop the send thread that owns this connection from looking at it again.
-            // GetSendShard is stable for a given player, so this always targets the shard it was added to.
-            _sendShards[GetSendShard(player)].TryRemove(player.Id, out _);
+            // Stop the send thread that owns this connection from looking at it again. The shard is the
+            // one recorded when the connection was made, which is the only thing that still identifies it
+            // after the number of send threads has changed.
+            int sendShard = playerConnection.SendShard;
+            if (sendShard >= 0 && _sendShards[sendShard].TryRemove(player.Id, out _))
+            {
+                Interlocked.Decrement(ref _sendShardPlayerCounts[sendShard]);
+            }
 
             // Cleanup encryptor.
             if (playerConnection.Encryptor is not null)
@@ -5536,6 +5811,18 @@ namespace SS.Core.Modules
             /// </remarks>
             public bool AlternateTimerModeEnabled;
 
+            /// <summary>
+            /// Which send thread is responsible for this connection.
+            /// </summary>
+            /// <remarks>
+            /// Chosen when the connection is made and never changed, so that a player's outgoing data is
+            /// always handled by the same thread and cannot be reordered by moving between them. It is
+            /// held here rather than computed, because the number of send threads changes while the
+            /// server runs and anything computed from it would stop matching where the connection
+            /// actually is.
+            /// </remarks>
+            public int SendShard = -1;
+
             public void Initialize(IEncrypt? encryptor, string? encryptorName, IBandwidthLimiter bandwidthLimiter)
             {
                 Initialize();
@@ -5550,6 +5837,7 @@ namespace SS.Core.Modules
                 Player = null;
                 Encryptor = null;
                 AlternateTimerModeEnabled = false;
+                SendShard = -1;
 
                 return base.TryReset();
             }

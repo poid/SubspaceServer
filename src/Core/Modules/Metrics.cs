@@ -445,6 +445,9 @@ namespace SS.Core.Modules
                 sb.Append($"  network: {Read(ServerMetric.NetworkSendToOne) / seconds:F0} SendToOne/s, send thread {Read(ServerMetric.SendThreadIterations) / seconds:F0} iter/s, {Read(ServerMetric.SendThreadOverruns)} overruns");
                 Emit(sb, player);
 
+                sb.Append($"  send threads: {Read(ServerMetric.SendThreadsActive)} running, busiest {Read(ServerMetric.SendThreadBusiestPercent)}% of its interval");
+                Emit(sb, player);
+
                 sb.Append($"  player lock: {Read(ServerMetric.PlayerDataReadLocks) / seconds:F0} read/s, {Read(ServerMetric.PlayerDataWriteLocks) / seconds:F0} write/s, write held {TotalMilliseconds(Read(ServerMetric.PlayerDataWriteLockHeldTicks)):F1}ms");
                 Emit(sb, player);
 
