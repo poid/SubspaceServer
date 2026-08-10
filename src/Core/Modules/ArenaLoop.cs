@@ -98,12 +98,16 @@ namespace SS.Core.Modules
             int workerCount = _configManager.GetInt(_configManager.Global, "ArenaLoop", "Workers", ConfigHelp.Constants.Global.ArenaLoop.Workers.Default);
             if (workerCount <= 0)
             {
-                // Leave room for the mainloop, the receive thread, and the send threads, which are all
-                // busy at the point this starts to matter. Two workers is the least that is worth having.
-                // The upper bound is because these are dedicated threads rather than pool threads, and
-                // past a point more of them only costs stacks: a zone that could keep more than sixteen
-                // busy would be far past what any other part of the server can feed them.
-                workerCount = Math.Clamp(Environment.ProcessorCount - 4, 2, 16);
+                // Deliberately a small fraction of the machine, because more workers is not better here
+                // and measurably worse past a point. The work they do reads player state under a lock
+                // shared with the mainloop and the send threads, so every extra worker adds contention on
+                // it rather than capacity.
+                //
+                // Measured at two thousand players over twenty arenas: two workers cost 1.94 cores in
+                // total and left the mainloop at 10%, four cost 2.56, and sixteen cost 4.84 and pushed
+                // the mainloop back up to 30% through that contention. Sixteen threads each doing a
+                // sixteenth of the work still each pay the per pass overhead.
+                workerCount = Math.Clamp(Environment.ProcessorCount / 8, 2, 8);
             }
 
             _workers = new Worker[workerCount];
