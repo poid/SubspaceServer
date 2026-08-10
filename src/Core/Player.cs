@@ -3,7 +3,6 @@ using SS.Core.Modules;
 using SS.Packets.Game;
 using SS.Utilities;
 using System;
-using System.Collections.Concurrent;
 using System.Collections.Specialized;
 using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
@@ -846,7 +845,7 @@ namespace SS.Core
             LastDeath = 0;
             NextRespawn = 0;
             Flags.Initialize();
-            _extraData.Clear();
+            Array.Clear(_extraData);
         }
 
         /// <summary>
@@ -867,12 +866,23 @@ namespace SS.Core
         #region Extra Data (Per-Player Data)
 
         /// <summary>
-        /// Used to store Per Player Data (PPD). 
+        /// Used to store Per Player Data (PPD), indexed by the key id.
         /// </summary>
         /// <remarks>
-        /// Using ConcurrentDictionary to allow multiple readers and 1 writer (the PlayerData module).
+        /// The keys are dense, sequential ints handed out by <see cref="Modules.PlayerData"/>, so this is
+        /// an array rather than a dictionary. That matters because it is read in the position fan-out's
+        /// inner loop, which at two thousand players is around two million lookups a second, and at ten
+        /// thousand would be far more. An array index is a great deal cheaper than a hash probe.
+        /// <para>
+        /// There are many readers on several threads and one writer, the <see cref="Modules.PlayerData"/>
+        /// module, which is serialized with itself by its own write lock. Readers are safe without any
+        /// lock because reference reads and writes are atomic, and because growing the array replaces it
+        /// rather than resizing it in place: a reader holding the previous array sees the values it
+        /// already had, and a key too new to be in it simply reads as absent, which is what a dictionary
+        /// would have done as well.
+        /// </para>
         /// </remarks>
-        private readonly ConcurrentDictionary<int, object> _extraData = new(-1, Constants.TargetPlayerExtraDataCount);
+        private object?[] _extraData = new object?[Constants.TargetPlayerExtraDataCount];
 
         /// <summary>
         /// Attempts to get extra data with the specified key.
@@ -883,8 +893,13 @@ namespace SS.Core
         /// <returns>True if the data was found and was of type <typeparamref name="T"/>. Otherwise, false.</returns>
         public bool TryGetExtraData<T>(PlayerDataKey<T> key, [MaybeNullWhen(false)] out T data) where T : class
         {
-            if (_extraData.TryGetValue(key.Id, out object? obj)
-                && obj is T tData)
+            // Read the reference once. It can be replaced by a concurrent grow, and every later use has
+            // to be of the same array as the bounds check.
+            object?[] extraData = Volatile.Read(ref _extraData);
+
+            int keyId = key.Id;
+            if ((uint)keyId < (uint)extraData.Length
+                && extraData[keyId] is T tData)
             {
                 data = tData;
                 return true;
@@ -897,25 +912,55 @@ namespace SS.Core
         /// <summary>
         /// Sets extra data.
         /// </summary>
-        /// <remarks>Only to be used by the <see cref="PlayerData"/> module.</remarks>
+        /// <remarks>Only to be used by the <see cref="PlayerData"/> module, which serializes calls to this
+        /// with its own write lock.</remarks>
         /// <param name="keyId">Id of the data to set.</param>
         /// <param name="data">The data to set.</param>
         /// <exception cref="ArgumentNullException"><paramref name="data"/> was null.</exception>
         internal void SetExtraData(int keyId, object data)
         {
-            _extraData[keyId] = data ?? throw new ArgumentNullException(nameof(data));
+            ArgumentNullException.ThrowIfNull(data);
+
+            object?[] extraData = _extraData;
+
+            if ((uint)keyId >= (uint)extraData.Length)
+            {
+                // Grow by replacing rather than resizing in place, so that a reader either sees the whole
+                // old array or the whole new one. Publishing the reference last is what makes the copied
+                // contents visible to a reader that picks up the new array.
+                object?[] grown = new object?[Math.Max(keyId + 1, extraData.Length * 2)];
+                Array.Copy(extraData, grown, extraData.Length);
+                grown[keyId] = data;
+
+                Volatile.Write(ref _extraData, grown);
+                return;
+            }
+
+            extraData[keyId] = data;
         }
 
         /// <summary>
         /// Removes extra data.
         /// </summary>
-        /// <remarks>Only to be used by the <see cref="PlayerData"/> module.</remarks>
+        /// <remarks>Only to be used by the <see cref="PlayerData"/> module, which serializes calls to this
+        /// with its own write lock.</remarks>
         /// <param name="keyId">Id of the data to remove.</param>
         /// <param name="data">The data removed, or the default value if nothing was removed.</param>
         /// <returns><see langword="true"/> if the data was removed; otherwise <see langword="false"/>.</returns>
         internal bool TryRemoveExtraData(int keyId, [MaybeNullWhen(false)] out object data)
         {
-            return _extraData.TryRemove(keyId, out data);
+            object?[] extraData = _extraData;
+
+            if ((uint)keyId < (uint)extraData.Length
+                && extraData[keyId] is object existing)
+            {
+                extraData[keyId] = null;
+                data = existing;
+                return true;
+            }
+
+            data = default;
+            return false;
         }
 
         #endregion
