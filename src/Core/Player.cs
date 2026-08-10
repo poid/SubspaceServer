@@ -628,26 +628,44 @@ namespace SS.Core
         /// </summary>
         public ServerTick NextRespawn { get; internal set; }
 
+        /// <summary>
+        /// Extra flags about a player that don't have a better place to go.
+        /// </summary>
+        /// <remarks>
+        /// The flags are held in two words rather than one, split by which thread writes them.
+        /// <para>
+        /// Setting a bit is a read-modify-write of the whole word, so two threads setting different bits
+        /// of the same word can lose one of the writes. Every one of these is written on the mainloop
+        /// today, so the split changes nothing now. It matters once arena game logic runs on arena
+        /// threads: the gameplay flags move with it while the life-cycle flags stay on the mainloop, and
+        /// sharing a word would make every ship change able to silently clear <see cref="Authenticated"/>.
+        /// </para>
+        /// <para>
+        /// A flag that is written from both sides therefore belongs in the gameplay word, and the two
+        /// writers must be kept apart by the player's life-cycle state rather than by this split.
+        /// <see cref="SentPositionPacket"/> and <see cref="SentWeaponPacket"/> are the two of those: the
+        /// game logic sets them, and the life cycle clears them on arena entry.
+        /// </para>
+        /// </remarks>
         public class PlayerFlags
         {
-            private BitVector32 flagVector = new(0);
+            /// <summary>
+            /// Flags written by the player and arena life cycle, which runs on the mainloop.
+            /// </summary>
+            private BitVector32 lifeCycleFlagVector = new(0);
+
+            /// <summary>
+            /// Flags written by arena game logic, which runs on the thread that owns the arena.
+            /// </summary>
+            private BitVector32 gameplayFlagVector = new(0);
 
             /// <summary>
             /// if the player has been authenticated by either a billing server or a password file
             /// </summary>
             public bool Authenticated
             {
-                get { return flagVector[BitVector32Masks.GetMask(0)]; }
-                internal set { flagVector[BitVector32Masks.GetMask(0)] = value; }
-            }
-
-            /// <summary>
-            /// This is set when the player has changed freqs or ships, but before he has acknowledged it.
-            /// </summary>
-            public bool DuringChange
-            {
-                get { return flagVector[BitVector32Masks.GetMask(1)]; }
-                internal set { flagVector[BitVector32Masks.GetMask(1)] = value; }
+                get { return lifeCycleFlagVector[BitVector32Masks.GetMask(0)]; }
+                internal set { lifeCycleFlagVector[BitVector32Masks.GetMask(0)] = value; }
             }
 
             /// <summary>
@@ -655,8 +673,8 @@ namespace SS.Core
             /// </summary>
             public bool WantAllLvz
             {
-                get { return flagVector[BitVector32Masks.GetMask(2)]; }
-                internal set { flagVector[BitVector32Masks.GetMask(2)] = value; }
+                get { return lifeCycleFlagVector[BitVector32Masks.GetMask(1)]; }
+                internal set { lifeCycleFlagVector[BitVector32Masks.GetMask(1)] = value; }
             }
 
             /// <summary>
@@ -664,62 +682,8 @@ namespace SS.Core
             /// </summary>
             public bool DuringQuery
             {
-                get { return flagVector[BitVector32Masks.GetMask(3)]; }
-                internal set { flagVector[BitVector32Masks.GetMask(3)] = value; }
-            }
-
-            /// <summary>
-            /// if the player's lag is too high to let him be in a ship
-            /// </summary>
-            public bool NoShip
-            {
-                get { return flagVector[BitVector32Masks.GetMask(4)]; }
-                internal set { flagVector[BitVector32Masks.GetMask(4)] = value; }
-            }
-
-            /// <summary>
-            /// if the player's lag is too high to let him have flags or balls
-            /// </summary>
-            public bool NoFlagsBalls
-            {
-                get { return flagVector[BitVector32Masks.GetMask(5)]; }
-                internal set { flagVector[BitVector32Masks.GetMask(5)] = value; }
-            }
-
-            /// <summary>
-            /// if the player has sent a position packet since entering the arena
-            /// </summary>
-            public bool SentPositionPacket
-            {
-                get { return flagVector[BitVector32Masks.GetMask(6)]; }
-                internal set { flagVector[BitVector32Masks.GetMask(6)] = value; }
-            }
-
-            /// <summary>
-            /// if the player has sent a position packet with a weapon since this flag was reset
-            /// </summary>
-            public bool SentWeaponPacket
-            {
-                get { return flagVector[BitVector32Masks.GetMask(7)]; }
-                internal set { flagVector[BitVector32Masks.GetMask(7)] = value; }
-            }
-
-            /// <summary>
-            /// if the player is a bot who wants all position packets
-            /// </summary>
-            public bool SeeAllPositionPackets
-            {
-                get { return flagVector[BitVector32Masks.GetMask(8)]; }
-                internal set { flagVector[BitVector32Masks.GetMask(8)] = value; }
-            }
-
-            /// <summary>
-            /// if the player is a bot who wants his own position packets
-            /// </summary>
-            public bool SeeOwnPosition
-            {
-                get { return flagVector[BitVector32Masks.GetMask(9)]; }
-                internal set { flagVector[BitVector32Masks.GetMask(9)] = value; }
+                get { return lifeCycleFlagVector[BitVector32Masks.GetMask(2)]; }
+                internal set { lifeCycleFlagVector[BitVector32Masks.GetMask(2)] = value; }
             }
 
             /// <summary>
@@ -727,8 +691,8 @@ namespace SS.Core
             /// </summary>
             public bool LeaveArenaWhenDoneWaiting
             {
-                get { return flagVector[BitVector32Masks.GetMask(10)]; }
-                internal set { flagVector[BitVector32Masks.GetMask(10)] = value; }
+                get { return lifeCycleFlagVector[BitVector32Masks.GetMask(3)]; }
+                internal set { lifeCycleFlagVector[BitVector32Masks.GetMask(3)] = value; }
             }
 
             /// <summary>
@@ -736,8 +700,71 @@ namespace SS.Core
             /// </summary>
             public bool ObscenityFilter
             {
-                get { return flagVector[BitVector32Masks.GetMask(11)]; }
-                internal set { flagVector[BitVector32Masks.GetMask(11)] = value; }
+                get { return lifeCycleFlagVector[BitVector32Masks.GetMask(4)]; }
+                internal set { lifeCycleFlagVector[BitVector32Masks.GetMask(4)] = value; }
+            }
+
+            /// <summary>
+            /// This is set when the player has changed freqs or ships, but before he has acknowledged it.
+            /// </summary>
+            public bool DuringChange
+            {
+                get { return gameplayFlagVector[BitVector32Masks.GetMask(0)]; }
+                internal set { gameplayFlagVector[BitVector32Masks.GetMask(0)] = value; }
+            }
+
+            /// <summary>
+            /// if the player's lag is too high to let him be in a ship
+            /// </summary>
+            public bool NoShip
+            {
+                get { return gameplayFlagVector[BitVector32Masks.GetMask(1)]; }
+                internal set { gameplayFlagVector[BitVector32Masks.GetMask(1)] = value; }
+            }
+
+            /// <summary>
+            /// if the player's lag is too high to let him have flags or balls
+            /// </summary>
+            public bool NoFlagsBalls
+            {
+                get { return gameplayFlagVector[BitVector32Masks.GetMask(2)]; }
+                internal set { gameplayFlagVector[BitVector32Masks.GetMask(2)] = value; }
+            }
+
+            /// <summary>
+            /// if the player has sent a position packet since entering the arena
+            /// </summary>
+            public bool SentPositionPacket
+            {
+                get { return gameplayFlagVector[BitVector32Masks.GetMask(3)]; }
+                internal set { gameplayFlagVector[BitVector32Masks.GetMask(3)] = value; }
+            }
+
+            /// <summary>
+            /// if the player has sent a position packet with a weapon since this flag was reset
+            /// </summary>
+            public bool SentWeaponPacket
+            {
+                get { return gameplayFlagVector[BitVector32Masks.GetMask(4)]; }
+                internal set { gameplayFlagVector[BitVector32Masks.GetMask(4)] = value; }
+            }
+
+            /// <summary>
+            /// if the player is a bot who wants all position packets
+            /// </summary>
+            public bool SeeAllPositionPackets
+            {
+                get { return gameplayFlagVector[BitVector32Masks.GetMask(5)]; }
+                internal set { gameplayFlagVector[BitVector32Masks.GetMask(5)] = value; }
+            }
+
+            /// <summary>
+            /// if the player is a bot who wants his own position packets
+            /// </summary>
+            public bool SeeOwnPosition
+            {
+                get { return gameplayFlagVector[BitVector32Masks.GetMask(6)]; }
+                internal set { gameplayFlagVector[BitVector32Masks.GetMask(6)] = value; }
             }
 
             /// <summary>
@@ -745,13 +772,14 @@ namespace SS.Core
             /// </summary>
             public bool IsDead
             {
-                get { return flagVector[BitVector32Masks.GetMask(12)]; }
-                internal set { flagVector[BitVector32Masks.GetMask(12)] = value; }
+                get { return gameplayFlagVector[BitVector32Masks.GetMask(7)]; }
+                internal set { gameplayFlagVector[BitVector32Masks.GetMask(7)] = value; }
             }
 
             internal void Initialize()
             {
-                flagVector = new(0);
+                lifeCycleFlagVector = new(0);
+                gameplayFlagVector = new(0);
             }
         }
 
