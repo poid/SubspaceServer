@@ -37,7 +37,34 @@ leaves the other at 100% and moves the ceiling very little:
 - Sharding the mainloop across arenas (Phase 5) without sharding the send thread leaves the send
   thread at 100%.
 
+(The first of those is now measured rather than predicted — see below.)
+
 Both are needed to move past roughly 2,600 players, and neither is worth doing alone.
+
+## What sharding the send thread did
+
+Measured after `Net:SendThreads` was added, same conditions, 2,000 clients over 20 arenas:
+
+| Net:SendThreads | mainloop | busiest send thread | send total | send iter/s | overruns | SendToOne/s | cores |
+|---|---|---|---|---|---|---|---|
+| 1 | 65% | **74%** | 74% | 94 | 43 | 1,570,087 | 1.56 |
+| 4 | 69% | **23%** | 91% | 381 | **0** | 1,711,373 | 1.76 |
+
+The send side is no longer anywhere near a limit: the busiest of the four threads uses under a
+quarter of a core, and the iterations that used their whole 10 ms interval went from 43 in the window
+to none. Because it is no longer running late, it also gets more done — 1.71M single-player sends per
+second against 1.57M.
+
+Total send processor time rose from 74% to 91%. That is the cost of four threads each taking the
+player read lock and keeping their own bookkeeping, plus the extra throughput. It is worth paying
+here because the machine has 32 cores and the constraint was one thread, not total work — but it is
+also why the default is 1. Below roughly a thousand players a single send thread is not close to
+busy, and splitting it would only add the overhead.
+
+**The mainloop is now the only thing in the way.** At 2,000 players it is at 69% against the busiest
+send thread's 23%, so the next ceiling is the mainloop reaching one core at roughly 2,900 players.
+That is what Phase 5 (arena-sharded workers) addresses, and the measurement gate in the plan is
+satisfied: the single mainloop thread is genuinely the remaining bottleneck.
 
 ## What is not the limit
 
