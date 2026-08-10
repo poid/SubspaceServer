@@ -35,6 +35,15 @@ namespace SS.Core.ComponentInterfaces
         /// <summary>Gauge. Work items waiting in the mainloop queue.</summary>
         MainloopQueueDepth,
 
+        /// <summary>Counter. Work items processed by the arena workers, across all of them.</summary>
+        ArenaLoopWorkItemsProcessed,
+
+        /// <summary>
+        /// Counter. Work items rejected because an arena worker's queue was full.
+        /// Any non-zero value means the server is shedding work and the numbers around it are suspect.
+        /// </summary>
+        ArenaLoopWorkItemsDropped,
+
         /// <summary>Counter. Position packets put through the fan-out.</summary>
         PositionPacketsHandled,
 
