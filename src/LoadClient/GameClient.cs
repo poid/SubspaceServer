@@ -284,7 +284,7 @@ namespace SS.LoadClient
 
             if (span[0] != 0x00)
             {
-                CountIfPosition(span[0]);
+                CountIfPosition(span);
 
                 if (span[0] == (byte)S2CPacketType.PlayerEntering)
                     NotePlayerEntering(span);
@@ -381,16 +381,36 @@ namespace SS.LoadClient
             }
         }
 
-        private void CountIfPosition(byte packetType)
+        /// <summary>
+        /// Counts the position updates in a packet, which is not always one.
+        /// </summary>
+        /// <remarks>
+        /// The four shapes a position update can arrive in. Which one the server picks depends on the
+        /// player's id, whether a weapon was fired, and what the client said it supports.
+        /// <para>
+        /// The two batched forms carry a packet type byte followed by <em>one or more</em> fixed size
+        /// position items: the send thread merges consecutive ones for the same recipient into a single
+        /// packet. Counting those as one update each undercounted by roughly a factor of five, which made
+        /// the server look like it was sending far fewer, far larger updates than it was.
+        /// </para>
+        /// </remarks>
+        /// <param name="span">The packet, starting at its type byte.</param>
+        private void CountIfPosition(ReadOnlySpan<byte> span)
         {
-            // The four shapes a position update can arrive in. Which one the server picks depends on
-            // the player's id, whether a weapon was fired, and what the client said it supports.
+            byte packetType = span[0];
+
             if (packetType == (byte)S2CPacketType.Position
-                || packetType == (byte)S2CPacketType.Weapon
-                || packetType == (byte)S2CPacketType.BatchedSmallPosition
-                || packetType == (byte)S2CPacketType.BatchedLargePosition)
+                || packetType == (byte)S2CPacketType.Weapon)
             {
                 Interlocked.Increment(ref PositionUpdatesReceived);
+            }
+            else if (packetType == (byte)S2CPacketType.BatchedSmallPosition)
+            {
+                Interlocked.Add(ref PositionUpdatesReceived, (span.Length - 1) / SmallPosition.Length);
+            }
+            else if (packetType == (byte)S2CPacketType.BatchedLargePosition)
+            {
+                Interlocked.Add(ref PositionUpdatesReceived, (span.Length - 1) / LargePosition.Length);
             }
         }
 
