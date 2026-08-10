@@ -66,6 +66,41 @@ send thread's 23%, so the next ceiling is the mainloop reaching one core at roug
 That is what Phase 5 (arena-sharded workers) addresses, and the measurement gate in the plan is
 satisfied: the single mainloop thread is genuinely the remaining bottleneck.
 
+## What indexing per-player data by array did
+
+Per-player data was fetched from a `ConcurrentDictionary` on every access, including from the
+fan-out's inner loop — around two million hash probes a second at this load. The keys are dense
+sequential ints, so an array replaces it. Same 2,000 clients, `Net:SendThreads` at 4, and at a
+near-identical load (19,565 against 19,575 pkt/s, 87.5 in-view both):
+
+| | dictionary | array |
+|---|---|---|
+| mainloop | 69% | **65%** |
+| mean mainloop iteration | 0.798 ms | **0.628 ms** |
+| mainloop iterations/s | 877 | 982 |
+| managed heap | 95 MB | **74 MB** |
+
+The mean mainloop iteration is 21% shorter, which is the honest measure of the change since it is
+what the work per iteration actually became. The 22% smaller managed heap is the dictionary's buckets
+and nodes going away — about 64 entries per player across 2,000 players.
+
+## Where the mainloop's time actually goes, and what that means for Phase 5
+
+At 2,000 players the mainloop handles 19,600 position packets a second. For each one it walks the
+arena's players (98 candidates), and for the 88 that pass the distance check it builds and hands a
+packet to the network layer — 1.7 million `SendToOne` calls a second.
+
+That fan-out loop is the mainloop. And reading it, **it writes almost nothing shared**: the packet it
+builds is a stack local, and its only two effects on anything shared are `INetwork.SendToOne` and an
+interlocked lag counter, both already documented as callable from any thread. Everything else it
+touches on other players — position, ship, freq, resolution, spectating — it only reads, under a read
+lock that several threads already hold at once.
+
+So the fan-out can move to an arena thread with a snapshot of the sending player's position, and it
+does not need the full arena-threading model to do it. That is a much smaller change than moving the
+packet *handlers*, which cannot be done piecemeal: the handlers mutate player game state, so moving
+some of them and not others just splits one writer into two.
+
 ## What is not the limit
 
 **Not the position scan.** 94 scanned per packet against 92 sent to, so 98% of the scan produces a
