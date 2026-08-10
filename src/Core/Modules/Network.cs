@@ -142,6 +142,20 @@ namespace SS.Core.Modules
         private int[] _sendShardUtilization = [];
 
         /// <summary>
+        /// How many iterations each send thread used its whole interval for, over that thread's most
+        /// recent measurement window.
+        /// </summary>
+        /// <remarks>
+        /// Counted as well as the utilization because it is the more sensitive of the two. A thread that
+        /// is late on some intervals and idle on others can average out below the threshold while still
+        /// sending data later than it should, and the whole point is to notice that.
+        /// <para>
+        /// Written by the thread it belongs to, read by the supervisor.
+        /// </para>
+        /// </remarks>
+        private int[] _sendShardOverruns = [];
+
+        /// <summary>
         /// How many send threads are running. Only shards below this may be assigned to.
         /// </summary>
         /// <remarks>
@@ -259,10 +273,14 @@ namespace SS.Core.Modules
         /// unable to keep up.
         /// </summary>
         /// <remarks>
-        /// Below one hundred, because a thread that is already using its whole interval is late, and the
-        /// point is to add capacity before that rather than after.
+        /// Well below one hundred, and deliberately so. Splitting a thread's work in two leaves each half
+        /// at about half the utilization, so a threshold near the top is its own resting point: threads
+        /// settle just above it, stay there, and go on sending late. Measured at two thousand players, a
+        /// threshold of seventy stopped at two threads sitting at seventy to seventy four percent and
+        /// still recording overruns, where the same load spread over four used a quarter of an interval
+        /// each and recorded none. Halving from here lands below the threshold and stops.
         /// </remarks>
-        private const int SendThreadBusyPercent = 70;
+        private const int SendThreadBusyPercent = 50;
 
         /// <summary>
         /// How many measurement windows in a row every send thread has to be busy for before another is
@@ -273,7 +291,12 @@ namespace SS.Core.Modules
         /// <summary>
         /// How long a send thread measures its own utilization over.
         /// </summary>
-        private static readonly TimeSpan SendThreadUtilizationWindow = TimeSpan.FromSeconds(2);
+        /// <remarks>
+        /// Short enough that a zone filling up grows into what it needs in seconds rather than minutes,
+        /// since this exists for the case where nobody is watching, and still long enough to average over
+        /// a hundred intervals.
+        /// </remarks>
+        private static readonly TimeSpan SendThreadUtilizationWindow = TimeSpan.FromSeconds(1);
 
         /// <summary>
         /// List of info about the sockets being listened on.
@@ -461,6 +484,7 @@ namespace SS.Core.Modules
 
             _sendShardPlayerCounts = new int[_maxSendThreads];
             _sendShardUtilization = new int[_maxSendThreads];
+            _sendShardOverruns = new int[_maxSendThreads];
 
             // The list is taken under its lock from here on, because a send thread that decides more are
             // needed starts one, and the first of them can do that while this is still starting others.
@@ -844,6 +868,7 @@ namespace SS.Core.Modules
             _sendShards = [];
             _sendShardPlayerCounts = [];
             _sendShardUtilization = [];
+            _sendShardOverruns = [];
             _activeSendThreads = 0;
             _sendThreadBusyWindows = 0;
         }
@@ -2883,7 +2908,9 @@ namespace SS.Core.Modules
                 if (utilization > busiest)
                     busiest = utilization;
 
-                if (utilization < SendThreadBusyPercent)
+                // Either signal counts. A thread can average out below the threshold while still using
+                // its whole interval on some of them, and those are already going out late.
+                if (utilization < SendThreadBusyPercent && Volatile.Read(ref _sendShardOverruns[i]) == 0)
                     allBusy = false;
             }
 
@@ -2939,6 +2966,7 @@ namespace SS.Core.Modules
             // runs out: total processor time says nothing when the limit is one thread's share of a core.
             long windowStart = Stopwatch.GetTimestamp();
             long windowBusyTicks = 0;
+            int windowOverruns = 0;
 
             List<Player> toKick = new(Constants.TargetPlayerCount);
             List<Player> toFree = new(Constants.TargetPlayerCount);
@@ -3056,14 +3084,18 @@ namespace SS.Core.Modules
                 // means the decision still gets made when the mainloop is the thing that is behind.
                 windowBusyTicks += busyTicks;
 
-                TimeSpan windowElapsed = Stopwatch.GetElapsedTime(windowStart);
-                if (windowElapsed >= SendThreadUtilizationWindow)
+                if (msToWait <= 0)
+                    windowOverruns++;
+
+                if (Stopwatch.GetElapsedTime(windowStart) >= SendThreadUtilizationWindow)
                 {
                     long windowTicks = Stopwatch.GetTimestamp() - windowStart;
                     Volatile.Write(ref _sendShardUtilization[shard], windowTicks > 0 ? (int)(windowBusyTicks * 100 / windowTicks) : 0);
+                    Volatile.Write(ref _sendShardOverruns[shard], windowOverruns);
 
                     windowStart = Stopwatch.GetTimestamp();
                     windowBusyTicks = 0;
+                    windowOverruns = 0;
 
                     if (supervises)
                     {
