@@ -610,6 +610,27 @@ namespace SS.Core
 
         private event Action<Type>? AdvisorChanged;
 
+        /// <summary>
+        /// Stops this broker from being told when the parent's advisors change.
+        /// </summary>
+        /// <remarks>
+        /// To be called when the broker is being discarded, and only then.
+        /// <para>
+        /// The subscription made in the constructor is what keeps a child's combined advisor list in
+        /// step with the parent's. It is also a reference the parent holds to the child, so a child
+        /// that is discarded without detaching is kept alive for as long as the parent lives, and every
+        /// advisor registered on the parent from then on still walks into it and takes its lock.
+        /// Arenas are created and reaped over the life of the zone, so this would accumulate.
+        /// </para>
+        /// </remarks>
+        protected internal void DetachFromParent()
+        {
+            if (Parent is ComponentBroker parentBroker)
+            {
+                parentBroker.AdvisorChanged -= Parent_AdvisorChanged;
+            }
+        }
+
         private void Parent_AdvisorChanged(Type advisorType)
         {
             _advisorLock.EnterWriteLock();

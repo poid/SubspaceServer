@@ -1876,6 +1876,10 @@ namespace SS.Core.Modules
 
             arena.Status = ArenaState.Destroyed;
 
+            // The arena is not coming back, so stop the zone-wide broker from holding onto it.
+            // Without this, every arena ever reaped stays subscribed for the life of the server.
+            arena.DetachFromParent();
+
             _logManager.LogA(LogLevel.Info, nameof(ArenaManager), arena, "Arena removed.");
 
             // make sure that any work associated with the arena that is to run on the mainloop is complete
