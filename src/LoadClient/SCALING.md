@@ -148,6 +148,55 @@ does not need the full arena-threading model to do it. That is a much smaller ch
 packet *handlers*, which cannot be done piecemeal: the handlers mutate player game state, so moving
 some of them and not others just splits one writer into two.
 
+## Moving the fan-out off the mainloop
+
+Done, and the mainloop stops being the limit. Same 2,000 clients over 20 arenas, everything on its
+defaults, nobody intervening:
+
+| | before | after |
+|---|---|---|
+| mainloop | 65% | **12%** |
+| mean mainloop iteration | 0.630 ms | **0.065 ms** |
+| mainloop iterations/s | 982 | 1,979 |
+| total processor time | 1.73 cores | 2.54 cores |
+| overruns | 0 | 0 |
+
+The mainloop iteration is roughly ten times shorter, which is the honest measure: it is what the work
+per iteration actually became. The fan-out now runs on four arena workers at about 30% of a core each.
+
+**More worker threads is worse, not better, and this was the one thing measurement had to settle.**
+The first default was the processor count less four, which on this machine meant sixteen workers. That
+cost **4.84 cores** and pushed the mainloop back up to 30%:
+
+| ArenaLoop workers | total cores | mainloop | mean mainloop iteration |
+|---|---|---|---|
+| 2 | 1.94 | 10% | 0.059 ms |
+| 4 (default now) | 2.54 | 12% | 0.065 ms |
+| 16 | 4.84 | 30% | 0.222 ms |
+
+The work the workers do reads player state under a lock shared with the mainloop and the send threads.
+Past a handful of threads, each extra one adds contention on that lock rather than capacity — enough
+of it to make the mainloop itself measurably slower. Sixteen threads each doing a sixteenth of the
+work still each pay the per-pass cost. The default is now a small fraction of the machine.
+
+The offload does cost total processor time: 2.54 cores against 1.73. That is the queue hop per packet
+plus four threads' share of the player lock. It is worth paying because the constraint was never total
+work, it was one thread's share of one core — and that constraint is now gone.
+
+### What it means for the ceiling
+
+Nothing in the server is close to saturated at 2,000 players any more. The busiest thing is an arena
+worker at about 30% of a core, with the mainloop at 12% and the send threads at 25%. Extrapolating
+from one point is worth little, but the shape has changed: the limits from here are the arena workers
+and the send threads, both of which grow with load, rather than a single thread that cannot.
+
+### The advisor contract changed
+
+`IPlayerPositionAdvisor.EditIndividualPositionPacket` is now called from an arena thread rather than
+the mainloop, and for two arenas at once. It is documented on the interface. The one implementation in
+the tree, `Matchmaking/MatchFocus`, only reads player data and edits the packet it is given, so it was
+already safe.
+
 ## What is not the limit
 
 **Not the position scan.** 94 scanned per packet against 92 sent to, so 98% of the scan produces a
