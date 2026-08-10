@@ -2,6 +2,7 @@
 using SS.Core.ComponentCallbacks;
 using SS.Core.ComponentInterfaces;
 using System;
+using System.Collections.Generic;
 using System.Threading;
 using LagSettings = SS.Core.ConfigHelp.Constants.Arena.Lag;
 
@@ -189,59 +190,116 @@ namespace SS.Core.Modules
             }
         }
 
+        /// <summary>
+        /// Checks each player's lag in turn, spread evenly over <see cref="_checkInterval"/>.
+        /// </summary>
+        /// <remarks>
+        /// The players due for checking are collected in one pass and then taken one at a time, rather
+        /// than searching for the least recently checked player on every wake up.
+        /// <para>
+        /// That search made this cost the square of the player count every interval: the thread wakes
+        /// once per player, and each wake up walked every player and took a lock on each one. It also
+        /// took the zone wide player lock once per player rather than once per interval, which every
+        /// other thread that needs that lock had to wait behind. Collecting first makes it linear.
+        /// </para>
+        /// <para>
+        /// Working from a list collected earlier means a player can leave, or stop being eligible,
+        /// between being collected and being reached, so each one is checked again when it is taken.
+        /// A player who joins mid interval is picked up by the next pass rather than immediately, which
+        /// is the one behavioural difference and is bounded by one interval.
+        /// </para>
+        /// </remarks>
         private void CheckThread()
         {
             WaitHandle cancellationWaitHandle = _cancellationToken.WaitHandle;
 
+            // Reused rather than allocated per pass. Holds the players still to be checked this interval,
+            // taken from the end so that removing is not a shuffle.
+            List<Player> due = new(Constants.TargetPlayerCount);
+
             while (!_cancellationToken.IsCancellationRequested)
             {
-                DateTime now = DateTime.UtcNow;
-                Player? toCheck = null;
-                PlayerData? toCheckPlayerData = null;
                 int playerCount;
 
-                _playerData.Lock();
-
-                try
+                if (due.Count == 0)
                 {
-                    DateTime? lastChecked = null;
+                    DateTime collectedAt = DateTime.UtcNow;
 
-                    foreach (Player p in _playerData.Players)
+                    _playerData.Lock();
+
+                    try
                     {
-                        if (p.Status == PlayerState.Playing
-                            && p.IsStandard
-                            && p.TryGetExtraData(_pdKey, out PlayerData? pd))
+                        foreach (Player p in _playerData.Players)
                         {
-                            lock (pd.Lock)
+                            if (p.Status == PlayerState.Playing
+                                && p.IsStandard
+                                && p.TryGetExtraData(_pdKey, out PlayerData? pd))
                             {
-                                if (!pd.IsChecking
-                                    && now - pd.LastCheck > _checkInterval
-                                    && (toCheck == null || pd.LastCheck < lastChecked))
+                                lock (pd.Lock)
                                 {
-                                    toCheck = p;
-                                    toCheckPlayerData = pd;
+                                    if (!pd.IsChecking && collectedAt - pd.LastCheck > _checkInterval)
+                                    {
+                                        due.Add(p);
+                                    }
                                 }
                             }
                         }
+
+                        playerCount = _playerData.Players.Count;
+                    }
+                    finally
+                    {
+                        _playerData.Unlock();
+                    }
+                }
+                else
+                {
+                    playerCount = due.Count;
+                }
+
+                Player? toCheck = null;
+                PlayerData? toCheckPlayerData = null;
+                DateTime now = DateTime.UtcNow;
+
+                while (due.Count > 0)
+                {
+                    Player candidate = due[^1];
+                    due.RemoveAt(due.Count - 1);
+
+                    // Still eligible? It was when it was collected, which may have been a while ago.
+                    if (candidate.Status != PlayerState.Playing
+                        || !candidate.IsStandard
+                        || !candidate.TryGetExtraData(_pdKey, out PlayerData? pd))
+                    {
+                        continue;
                     }
 
-                    playerCount = _playerData.Players.Count;
-                }
-                finally
-                {
-                    _playerData.Unlock();
+                    lock (pd.Lock)
+                    {
+                        if (pd.IsChecking || now - pd.LastCheck <= _checkInterval)
+                            continue;
+
+                        pd.IsChecking = true;
+                    }
+
+                    toCheck = candidate;
+                    toCheckPlayerData = pd;
+                    break;
                 }
 
                 if (toCheck is not null)
                 {
-                    lock (toCheckPlayerData!.Lock)
-                    {
-                        toCheckPlayerData.IsChecking = true;
-                    }
-
                     // TODO: Review threading logic and maybe move the logic onto this worker thread if it's safe. For now, using the mainloop thread to do it.
                     // Queue the actual lag check to be done by the mainloop thread.
-                    _mainloop.QueueMainWorkItem(_mainloopWorkItem_checkPlayer, toCheck);
+                    if (!_mainloop.QueueMainWorkItem(_mainloopWorkItem_checkPlayer, toCheck))
+                    {
+                        // It will not run, so release the claim rather than leaving the player marked as
+                        // being checked, which would stop it ever being checked again.
+                        lock (toCheckPlayerData!.Lock)
+                        {
+                            toCheckPlayerData.IsChecking = false;
+                        }
+                    }
                 }
 
                 cancellationWaitHandle.WaitOne(playerCount > 0 ? _checkInterval / playerCount : _checkInterval);
