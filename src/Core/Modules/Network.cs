@@ -299,6 +299,25 @@ namespace SS.Core.Modules
         private static readonly TimeSpan SendThreadUtilizationWindow = TimeSpan.FromSeconds(1);
 
         /// <summary>
+        /// How many connections above its fair share a send thread is allowed before it starts handing
+        /// them to emptier threads.
+        /// </summary>
+        /// <remarks>
+        /// Without some slack, shards that differ by a handful of connections would trade them back and
+        /// forth for as long as the server runs.
+        /// </remarks>
+        private const int SendShardRebalanceSlack = 16;
+
+        /// <summary>
+        /// The most connections a send thread will hand over in one window.
+        /// </summary>
+        /// <remarks>
+        /// Spreading the move over several windows keeps a thread that has just been started from being
+        /// handed thousands of connections in one go, before anything has measured whether it helped.
+        /// </remarks>
+        private const int SendShardRebalanceMaxPerWindow = 128;
+
+        /// <summary>
         /// List of info about the sockets being listened on.
         /// </summary>
         private readonly List<ListenData> _listenDataList = new(8);
@@ -2894,6 +2913,97 @@ namespace SS.Core.Modules
         /// stopped being usable, for a saving that does not justify it.
         /// </para>
         /// </remarks>
+        /// <summary>
+        /// Hands some of a send thread's connections to emptier ones, if it is carrying more than its share.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// Connections are given to the emptiest shard when they are made, but that only spreads
+        /// connections made from then on. A thread started because the server filled up therefore gets
+        /// nothing at all if the players causing the load were already connected, which is precisely the
+        /// case this whole arrangement exists for. Without this, a zone that fills up and then stays full
+        /// starts a second thread and leaves it idle.
+        /// </para>
+        /// <para>
+        /// Moving a connection does not reorder its data. Everything a send thread sends for a connection
+        /// is done holding that connection's <see cref="ConnData.OutLock"/>, and its outgoing queues are
+        /// first in first out, so whichever thread drains them next carries on where the last one left off.
+        /// </para>
+        /// <para>
+        /// What must not happen is two threads deciding the same connection has lagged out or
+        /// disconnected. So a thread only ever removes from its own shard, and does so before adding to
+        /// the other one: for the moment in between, no thread considers the connection its own, which
+        /// costs it at most one interval of waiting and is the only ordering of the two that is safe.
+        /// </para>
+        /// </remarks>
+        /// <param name="shard">The shard belonging to the calling thread.</param>
+        /// <param name="shardPlayers">That shard's players.</param>
+        private void RebalanceSendShard(int shard, ConcurrentDictionary<int, Player> shardPlayers)
+        {
+            int activeSendThreads = Volatile.Read(ref _activeSendThreads);
+            if (activeSendThreads <= 1)
+                return;
+
+            int mine = Volatile.Read(ref _sendShardPlayerCounts[shard]);
+
+            int total = 0;
+            int emptiest = -1;
+            int emptiestCount = int.MaxValue;
+
+            for (int i = 0; i < activeSendThreads; i++)
+            {
+                int count = Volatile.Read(ref _sendShardPlayerCounts[i]);
+                total += count;
+
+                if (i != shard && count < emptiestCount)
+                {
+                    emptiest = i;
+                    emptiestCount = count;
+                }
+            }
+
+            if (emptiest < 0)
+                return;
+
+            int fairShare = total / activeSendThreads;
+
+            // Only worth doing if this thread is meaningfully over its share and the target is under it,
+            // so that shards that differ by a handful are left alone rather than trading players forever.
+            if (mine <= fairShare + SendShardRebalanceSlack || emptiestCount >= fairShare)
+                return;
+
+            int toMove = Math.Min((mine - emptiestCount) / 2, SendShardRebalanceMaxPerWindow);
+            if (toMove <= 0)
+                return;
+
+            int moved = 0;
+
+            foreach (Player player in shardPlayers.Values)
+            {
+                if (moved >= toMove)
+                    break;
+
+                if (!player.TryGetExtraData(_connKey, out PlayerConnection? conn))
+                    continue;
+
+                // Leave anything on its way out where it is, so that the thread that is already partway
+                // through disconnecting it is the one that finishes.
+                if (player.Status >= PlayerState.TimeWait)
+                    continue;
+
+                if (!shardPlayers.TryRemove(player.Id, out _))
+                    continue;
+
+                Interlocked.Decrement(ref _sendShardPlayerCounts[shard]);
+
+                conn.SendShard = emptiest;
+                _sendShards[emptiest][player.Id] = player;
+                Interlocked.Increment(ref _sendShardPlayerCounts[emptiest]);
+
+                moved++;
+            }
+        }
+
         private void ConsiderStartingSendThread()
         {
             int activeSendThreads = Volatile.Read(ref _activeSendThreads);
@@ -3096,6 +3206,10 @@ namespace SS.Core.Modules
                     windowStart = Stopwatch.GetTimestamp();
                     windowBusyTicks = 0;
                     windowOverruns = 0;
+
+                    // Each thread hands over its own excess, since a thread must only ever remove from
+                    // its own shard for a connection to have one owner at a time.
+                    RebalanceSendShard(shard, shardPlayers);
 
                     if (supervises)
                     {
