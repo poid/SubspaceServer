@@ -226,3 +226,66 @@ and it is why the load client has `--connect-delay`.
 - Both rows are a single ten second window taken once the load had settled.
 - Positions only. Combat roughly doubles the send side, so a zone where people are actually fighting
   will reach the ceiling sooner.
+
+---
+
+# Pushing past two thousand
+
+With the fan-out on the arena threads, the mainloop is no longer the limit, so the load was raised
+until something else became one. Arenas were added along with players, to keep per-arena counts near
+the cap rather than letting them grow without bound.
+
+| clients | arenas | pkt/s | in-view/pkt | cores | mainloop | busiest thread |
+|---|---|---|---|---|---|---|
+| 3,000 | 20 | 20,019 | 109.1 | 3.24 | 15% | ArenaLoop, 42% |
+| 4,500 | 40 | 27,596 | 63.9 | 3.08 | 19% | ArenaLoop, 39% |
+| 6,000 | 60 | 30,824 | 47.5 | 3.17 | 24% | ArenaLoop, 39% |
+
+Nothing is saturated. At six thousand clients the busiest thread in the server is an arena worker at
+39% of a core, with the send threads at 25–33%, the mainloop at 24% and the receive thread at 20%.
+No overruns, no dropped work, no errors.
+
+## The lag check was the next wall, and it was quadratic
+
+The first run of this series found it immediately: at 4,500 and again at 6,000 clients, `LagAction`
+sat at **100% of a core** — a whole thread, and the busiest thing in the server, ahead of the arena
+workers at 45%.
+
+Its check thread wakes once per player per interval, and each wake up walked every player taking a
+lock on each one to find the least recently checked. The work therefore grew with the *square* of the
+population, the same shape as the position fan-out before it had a per-arena player collection. It
+also took the zone-wide player lock once per player rather than once per interval, so every other
+thread needing that lock waited behind it.
+
+Collecting the due players in one pass and then taking them one at a time makes it linear. It removed
+more than a core at six thousand players:
+
+| clients | before | after |
+|---|---|---|
+| 4,500 | 4.34 cores | **3.08** |
+| 6,000 | 4.60 cores | **3.17** |
+
+The cost stopped growing with the population at all — total processor time is now flat from 3,000 to
+6,000 clients, because the extra work is offset by the smaller in-view counts that come with spreading
+players over more arenas.
+
+## What the harness can no longer tell us
+
+**The load client is now the limit, not the server.** At six thousand clients it produces 30,824
+position packets a second, about 5 per client per second against the ~9.5 each is trying to send, and
+only about 4,900 of the 6,000 ever connected. It shares the machine with the server and has to
+*receive* 1.5 million packets a second to do it.
+
+So these numbers are a floor on what the server can do, not a ceiling. Finding the real one needs the
+load generated from other machines.
+
+## What to watch next
+
+- **The receive thread**, at 20% of a core at six thousand and climbing faster than anything else.
+  It is a single thread, and sharding it is the plan's Phase 7.
+- **The global player write lock**, held 6.5 ms, 14.7 ms and 19.9 ms per ten second window at 3,000,
+  4,500 and 6,000. Still under a quarter of a percent of wall time, but it is the one figure that
+  grows with player count rather than staying flat.
+- **Connection bursts.** Only 4,909 of 6,000 clients connected, staggered 3 ms apart. The receive
+  thread drops connection inits under burst arrival, which is a known limit and unrelated to steady
+  state, but it will matter for a zone that fills quickly.
