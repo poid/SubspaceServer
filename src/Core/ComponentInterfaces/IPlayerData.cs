@@ -29,6 +29,44 @@ namespace SS.Core.ComponentInterfaces
         void WriteUnlock();
 
         /// <summary>
+        /// Whether the calling thread holds the global player lock for reading.
+        /// </summary>
+        /// <remarks>
+        /// For asserting that a caller has taken the lock its contract requires. Not for deciding
+        /// whether to take it: code that has to ask does not know who owns the data it is touching.
+        /// </remarks>
+        bool IsReadLockHeld { get; }
+
+        /// <summary>
+        /// Whether the calling thread holds the global player lock for writing.
+        /// </summary>
+        /// <inheritdoc cref="IsReadLockHeld" path="/remarks"/>
+        bool IsWriteLockHeld { get; }
+
+        /// <summary>
+        /// Whether the calling thread holds the global player lock as an upgradeable reader.
+        /// </summary>
+        /// <inheritdoc cref="IsReadLockHeld" path="/remarks"/>
+        bool IsUpgradeableReadLockHeld { get; }
+
+        /// <summary>
+        /// Moves a player into an arena, out of one, or between two.
+        /// </summary>
+        /// <remarks>
+        /// The only way to change <see cref="Player.Arena"/>. It also maintains
+        /// <see cref="Arena.Players"/>, and the two must move together or an arena ends up holding a
+        /// player it no longer has, or missing one it does. Since the arena's collection is what the
+        /// position fan out and every other arena scoped operation reads, a discrepancy shows up as
+        /// players who cannot see each other.
+        /// <para>
+        /// The caller must hold the write lock.
+        /// </para>
+        /// </remarks>
+        /// <param name="player">The player to move.</param>
+        /// <param name="arena">The arena to move into, or <see langword="null"/> to leave.</param>
+        void SetPlayerArena(Player player, Arena? arena);
+
+        /// <summary>
         /// Use to enumerate over all of the players.
         /// </summary>
         /// <remarks>

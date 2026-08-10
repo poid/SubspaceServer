@@ -12,7 +12,7 @@ namespace SS.Core.Modules
     /// Module that manages <see cref="Player"/> objects.
     /// </summary>
     [CoreModuleInfo]
-    public sealed class PlayerData : IModule, IPlayerData
+    public sealed class PlayerData : IModule, IModuleLoaderAware, IPlayerData
     {
         internal readonly IComponentBroker Broker;
         private readonly ILogManager _logManager;
@@ -21,6 +21,13 @@ namespace SS.Core.Modules
 
         // Optional dependencies
         private IServerMetrics? _serverMetrics;
+
+#if DEBUG
+        // For the debug-only audit of the arena player collections. Retrieved in PostLoad, since
+        // ArenaManager loads after this module.
+        private IArenaManager? _auditArenaManager;
+        private IMainloopTimer? _auditMainloopTimer;
+#endif
 
         /// <summary>
         /// How long after a PlayerID can be reused after it is freed.
@@ -66,6 +73,7 @@ namespace SS.Core.Modules
         // Cached delegates
         private readonly Action<Player> _mainloopWork_FireNewPlayerCallback;
         private readonly Action<Player> _mainloopWork_CompleteFreePlayer;
+        private readonly Action<Player> _mainloopWork_KickPlayer;
 
         public PlayerData(
             IComponentBroker broker,
@@ -78,6 +86,7 @@ namespace SS.Core.Modules
             _mainloop = mainloop ?? throw new ArgumentNullException(nameof(mainloop));
             _mainloopWork_FireNewPlayerCallback = MainloopWork_FireNewPlayerCallback;
             _mainloopWork_CompleteFreePlayer = MainloopWork_CompleteFreePlayer;
+            _mainloopWork_KickPlayer = MainloopWork_KickPlayer;
         }
 
         #region Module Members
@@ -89,6 +98,64 @@ namespace SS.Core.Modules
             _iPlayerDataToken = broker.RegisterInterface<IPlayerData>(this);
             return true;
         }
+
+#if DEBUG
+        /// <summary>
+        /// How often the arena player collections are audited, in debug builds.
+        /// </summary>
+        private const int AuditIntervalMs = 5000;
+
+        void IModuleLoaderAware.PostLoad(IComponentBroker broker)
+        {
+            // Retrieved here rather than in Load, since ArenaManager loads after this module.
+            _auditArenaManager = broker.GetInterface<IArenaManager>();
+            _auditMainloopTimer = broker.GetInterface<IMainloopTimer>();
+
+            _auditMainloopTimer?.SetTimer(MainloopTimer_AuditArenaPlayers, AuditIntervalMs, AuditIntervalMs, null);
+        }
+
+        void IModuleLoaderAware.PreUnload(IComponentBroker broker)
+        {
+            _auditMainloopTimer?.ClearTimer(MainloopTimer_AuditArenaPlayers, null);
+
+            if (_auditArenaManager is not null)
+            {
+                broker.ReleaseInterface(ref _auditArenaManager);
+            }
+
+            if (_auditMainloopTimer is not null)
+            {
+                broker.ReleaseInterface(ref _auditMainloopTimer);
+            }
+        }
+
+        private bool MainloopTimer_AuditArenaPlayers()
+        {
+            if (_auditArenaManager is null)
+                return true;
+
+            Lock();
+
+            try
+            {
+                AuditArenaPlayers(_auditArenaManager);
+            }
+            finally
+            {
+                Unlock();
+            }
+
+            return true;
+        }
+#else
+        void IModuleLoaderAware.PostLoad(IComponentBroker broker)
+        {
+        }
+
+        void IModuleLoaderAware.PreUnload(IComponentBroker broker)
+        {
+        }
+#endif
 
         bool IModule.Unload(IComponentBroker broker)
         {
@@ -147,9 +214,111 @@ namespace SS.Core.Modules
             _rwLock.ExitWriteLock();
         }
 
+        public bool IsReadLockHeld => _rwLock.IsReadLockHeld;
+
+        public bool IsWriteLockHeld => _rwLock.IsWriteLockHeld;
+
+        public bool IsUpgradeableReadLockHeld => _rwLock.IsUpgradeableReadLockHeld;
+
+        /// <summary>
+        /// Moves a player into an arena, out of one, or between two, keeping each arena's player
+        /// collection in step with <see cref="Player.Arena"/>.
+        /// </summary>
+        /// <remarks>
+        /// The single place <see cref="Player.Arena"/> changes. The two have to move together, under the
+        /// write lock, or an arena ends up holding a player it no longer has or missing one it does —
+        /// and the arena collection is what the position fan out and every other arena scoped operation
+        /// reads, so a discrepancy shows up as players who cannot see each other.
+        /// </remarks>
+        /// <param name="player">The player to move.</param>
+        /// <param name="arena">The arena to move into, or <see langword="null"/> to leave.</param>
+        /// <summary>
+        /// Checks, in debug builds, that every arena's player collection matches what the players
+        /// themselves say, in both directions.
+        /// </summary>
+        /// <remarks>
+        /// The collection is derived state, and derived state drifts. It is maintained in one place,
+        /// but a player can leave through several routes — a normal arena change, a disconnect, a kick
+        /// from a network thread, an arena being recycled — and any route that misses the update leaves
+        /// a player who is in an arena's list but not in the arena, or the reverse. Neither is visible
+        /// until players mysteriously cannot see each other. This turns that into an immediate failure.
+        /// <para>
+        /// The caller must hold the player lock.
+        /// </para>
+        /// </remarks>
+        [Conditional("DEBUG")]
+        internal void AuditArenaPlayers(IArenaManager arenaManager)
+        {
+            ThreadingAssert.PlayerLockHeld(this);
+
+            // Every player claiming an arena must be in that arena's collection.
+            foreach (Player player in _playerDictionary.Values)
+            {
+                Arena? arena = player.Arena;
+                if (arena is null)
+                    continue;
+
+                bool found = false;
+                foreach (Player other in arena.Players)
+                {
+                    if (ReferenceEquals(other, player))
+                    {
+                        found = true;
+                        break;
+                    }
+                }
+
+                Debug.Assert(found, $"Player '{player.Name}' says it is in arena '{arena.Name}', but that arena does not list it.");
+            }
+
+            // And nothing else may be in a collection: not a player who has moved on, and not one that
+            // has been freed.
+            arenaManager.Lock();
+
+            try
+            {
+                foreach (Arena arena in arenaManager.Arenas)
+                {
+                    foreach (Player player in arena.Players)
+                    {
+                        Debug.Assert(ReferenceEquals(player.Arena, arena), $"Arena '{arena.Name}' lists player '{player.Name}', which is not in it.");
+                        Debug.Assert(_playerDictionary.ContainsKey(player.Id), $"Arena '{arena.Name}' lists player '{player.Name}', which has been freed.");
+                    }
+                }
+            }
+            finally
+            {
+                arenaManager.Unlock();
+            }
+        }
+
+        public void SetPlayerArena(Player player, Arena? arena)
+        {
+            ThreadingAssert.PlayerWriteLockHeld(this);
+
+            Arena? current = player.Arena;
+            if (current == arena)
+                return;
+
+            current?.RemovePlayer(player);
+            player.SetArena(arena);
+            arena?.AddPlayer(player);
+        }
+
         #endregion
 
-        Dictionary<int, Player>.ValueCollection IPlayerData.Players => _playerDictionary.Values;
+        Dictionary<int, Player>.ValueCollection IPlayerData.Players
+        {
+            get
+            {
+                // Enumerating this while another thread adds or removes a player is undefined, so the
+                // lock is not advisory. It is only ever taken by convention today, which is why this
+                // asserts rather than trusting the caller.
+                ThreadingAssert.PlayerLockHeld(this);
+
+                return _playerDictionary.Values;
+            }
+        }
 
         Player IPlayerData.NewPlayer(ClientType clientType)
         {
@@ -175,7 +344,7 @@ namespace SS.Core.Modules
                 // Set player info
                 player.Status = PlayerState.Uninitialized;
                 player.Type = clientType;
-                player.Arena = null;
+                SetPlayerArena(player, null);
                 player.NewArena = null;
                 player.Ship = ShipType.Spec;
                 player.Attached = -1;
@@ -217,6 +386,13 @@ namespace SS.Core.Modules
                 // Remove the player from the active players.
                 if (!_playerDictionary.Remove(player.Id))
                     return;
+
+                // And from its arena, here rather than where Player.Arena is cleared. Arena is not
+                // cleared until the queued work below runs, but the player disappears from the
+                // dictionary immediately, so tying the two together would leave the player visible in
+                // the arena for a mainloop hop after it had gone from everywhere else — a ghost that
+                // other players would still be sent updates about.
+                SetPlayerArena(player, null);
 
                 // Add the player to the players being freed.
                 if (!_playersBeingFreed.Add(player))
@@ -272,6 +448,34 @@ namespace SS.Core.Modules
         {
             if (player is null)
                 return;
+
+            // Kicking changes gameplay state: it drives the player out of its arena, which runs the
+            // leave-arena callbacks, and sets where the state machine goes next. Most callers are on
+            // the mainloop, but the network receive, reliable and send threads all kick on lagout or
+            // disconnect, and the chat thread does the same. Doing that work on those threads makes
+            // them writers of state the mainloop otherwise owns alone, which is the thing that has to
+            // stop before arenas can be given to worker threads.
+            //
+            // Deferring is safe: the state machine's leave handling is a no-op for a player already on
+            // the way out, so a player kicked twice before the first one runs is fine, and connection
+            // teardown was already asynchronous.
+            if (!_mainloop.IsMainloop)
+            {
+                _mainloop.QueueMainWorkItem(_mainloopWork_KickPlayer, player);
+                return;
+            }
+
+            KickPlayerOnMainloop(player);
+        }
+
+        private void MainloopWork_KickPlayer(Player player)
+        {
+            KickPlayerOnMainloop(player);
+        }
+
+        private void KickPlayerOnMainloop(Player player)
+        {
+            ThreadingAssert.OnMainloop(_mainloop);
 
             WriteLock();
 

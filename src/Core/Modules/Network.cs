@@ -103,6 +103,26 @@ namespace SS.Core.Modules
         private readonly ConcurrentDictionary<SocketAddress, Player> _playerConnections = new();
 
         /// <summary>
+        /// The players each send thread is responsible for, one entry per thread. Key is the player id.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// The send thread was a single thread walking every player in the zone twice per 10 ms tick,
+        /// once to send and once to look for lagouts, and it became the busiest thread in the server
+        /// before anything else did. Splitting the players between threads makes each pass cost its
+        /// share rather than the whole population.
+        /// </para>
+        /// <para>
+        /// A connection is assigned a shard when it is created and never moves, so a player's outgoing
+        /// data is always handled by the same thread and cannot be reordered by moving between them.
+        /// The split is deliberately by connection rather than by arena: the unit of work here is a
+        /// connection, and arena changes are frequent, so partitioning by arena would migrate
+        /// connections between threads constantly for no gain.
+        /// </para>
+        /// </remarks>
+        private ConcurrentDictionary<int, Player>[] _sendShards = [];
+
+        /// <summary>
         /// Dictionary of active client connections.
         /// </summary>
         /// <remarks>
@@ -309,6 +329,14 @@ namespace SS.Core.Modules
 
         #region Module Members
 
+        [ConfigHelp<int>("Net", "SendThreads", ConfigScope.Global, Default = 1, Min = 1,
+            Description = """
+                How many threads to send outgoing data on.
+                Each one is responsible for a fixed share of the connections, decided when a connection
+                is made, so a player's outgoing data is always handled by the same thread. Raising this
+                only helps once sending is actually the limit; watch the send thread's share of a core
+                and its overrun count in ?metrics before changing it.
+                """)]
         bool IModule.Load(IComponentBroker broker)
         {
             _connKey = _playerData.AllocatePlayerData(new PlayerConnectionPooledObjectPolicy(_config.PlayerReliableReceiveWindowSize));
@@ -322,15 +350,31 @@ namespace SS.Core.Modules
 
             _stopToken = _stopCancellationTokenSource.Token;
 
+            // The send shards have to exist before the receive thread starts, since the receive thread
+            // is what creates connections, and creating one assigns it to a shard.
+            int sendThreadCount = _configManager.GetInt(_configManager.Global, "Net", "SendThreads", ConfigHelp.Constants.Global.Net.SendThreads.Default);
+            if (sendThreadCount < 1)
+                sendThreadCount = 1;
+
+            _sendShards = new ConcurrentDictionary<int, Player>[sendThreadCount];
+            for (int i = 0; i < sendThreadCount; i++)
+            {
+                _sendShards[i] = new ConcurrentDictionary<int, Player>();
+            }
+
             // receive thread
             Thread thread = new(ReceiveThread) { Name = $"{nameof(Network)}-recv" };
             thread.Start();
             _threadList.Add(thread);
 
-            // send thread
-            thread = new Thread(SendThread) { Name = $"{nameof(Network)}-send" };
-            thread.Start();
-            _threadList.Add(thread);
+            // send threads
+            for (int i = 0; i < sendThreadCount; i++)
+            {
+                int shard = i;
+                thread = new Thread(() => SendThread(shard)) { Name = $"{nameof(Network)}-send-{shard}" };
+                thread.Start();
+                _threadList.Add(thread);
+            }
 
             // reliable threads
             int reliableThreadCount = _configManager.GetInt(_configManager.Global, "Net", "ReliableThreads", 1);
@@ -689,6 +733,10 @@ namespace SS.Core.Modules
 
             // Give a chance for any queued mainloop work to complete (reliable callbacks and IClientConnectionHandler.Disconnected).
             _mainloop.WaitForMainWorkItemDrain();
+
+            // The send threads have stopped, so nothing is reading these. Dropping the references keeps
+            // the disconnected players from being held alive if the module is loaded again.
+            _sendShards = [];
         }
 
         #endregion
@@ -851,6 +899,10 @@ namespace SS.Core.Modules
             conn.RemoteEndpoint = remoteEndpoint;
             _playerConnections[remoteAddress] = player;
 
+            // Fixed for the life of the connection, so that one player's outgoing data is always
+            // handled by the same thread and cannot be reordered by moving between them.
+            _sendShards[GetSendShard(player)][player.Id] = player;
+
             _playerData.WriteLock();
             try
             {
@@ -893,14 +945,31 @@ namespace SS.Core.Modules
 
                 try
                 {
-                    foreach (Player p in _playerData.Players)
+                    // A null arena means the whole zone, so that case still has to walk every player.
+                    // Otherwise only the arena's own, since scanning the zone to pick out one arena
+                    // makes each broadcast cost the zone's population.
+                    if (arena is null)
                     {
-                        if (p.Status == PlayerState.Playing
-                            && (p.Arena == arena || arena is null)
-                            && p != except
-                            && IsOurs(p))
+                        foreach (Player p in _playerData.Players)
                         {
-                            set.Add(p);
+                            if (p.Status == PlayerState.Playing
+                                && p != except
+                                && IsOurs(p))
+                            {
+                                set.Add(p);
+                            }
+                        }
+                    }
+                    else
+                    {
+                        foreach (Player p in arena.Players)
+                        {
+                            if (p.Status == PlayerState.Playing
+                                && p != except
+                                && IsOurs(p))
+                            {
+                                set.Add(p);
+                            }
                         }
                     }
                 }
@@ -2592,10 +2661,35 @@ namespace SS.Core.Modules
             }
         }
 
-        private void SendThread()
+        /// <summary>
+        /// Gets which send thread is responsible for a player.
+        /// </summary>
+        /// <remarks>
+        /// Derived from the player id, which does not change while the player is connected, so the
+        /// answer is the same every time it is asked for a given connection.
+        /// </remarks>
+        /// <param name="player">The player to get the shard of.</param>
+        /// <returns>The index into <see cref="_sendShards"/>.</returns>
+        private int GetSendShard(Player player)
         {
+            return (int)((uint)player.Id % (uint)_sendShards.Length);
+        }
+
+        /// <summary>
+        /// Sends outgoing data for one share of the connections.
+        /// </summary>
+        /// <param name="shard">
+        /// Which share this thread owns. Shard 0 additionally handles the client connections, since
+        /// there are only ever a handful of those and splitting them would cost more than it saved.
+        /// </param>
+        private void SendThread(int shard)
+        {
+            // Each thread has its own, since a PacketGrouper wraps a buffer that is being filled.
             Span<byte> groupedPacketBuffer = stackalloc byte[Constants.MaxGroupedPacketLength];
             PacketGrouper packetGrouper = new(this, groupedPacketBuffer);
+
+            ConcurrentDictionary<int, Player> shardPlayers = _sendShards[shard];
+            bool handlesClientConnections = shard == 0;
 
             List<Player> toKick = new(Constants.TargetPlayerCount);
             List<Player> toFree = new(Constants.TargetPlayerCount);
@@ -2609,20 +2703,30 @@ namespace SS.Core.Modules
                 // Players
                 //
 
-                // Send outgoing packets.
+                // Send outgoing packets, and look for lagouts and disconnects, in one pass over this
+                // thread's own share of the connections. This was two passes over every player in the
+                // zone, which made each tick cost the whole population on a single thread.
+                //
+                // The player lock is still taken, because the documented order is that the lock
+                // guarding connection status comes before OutLock, and because ProcessLagout and
+                // ProcessDisconnect read player state. Readers do not block each other, so the send
+                // threads do not contend with one another for it.
+                long now = Stopwatch.GetTimestamp();
+
                 _playerData.Lock();
 
                 try
                 {
-                    foreach (Player player in _playerData.Players)
+                    foreach (Player player in shardPlayers.Values)
                     {
-                        if (player.Status >= PlayerState.Connected
-                            && player.Status < PlayerState.TimeWait
-                            && IsOurs(player))
-                        {
-                            if (!player.TryGetExtraData(_connKey, out PlayerConnection? conn))
-                                continue;
+                        if (player.Status < PlayerState.Connected || !IsOurs(player))
+                            continue;
 
+                        if (!player.TryGetExtraData(_connKey, out PlayerConnection? conn))
+                            continue;
+
+                        if (player.Status < PlayerState.TimeWait)
+                        {
                             if (conn.OutLock.TryEnter())
                             {
                                 try
@@ -2635,34 +2739,13 @@ namespace SS.Core.Modules
                                     conn.OutLock.Exit();
                                 }
                             }
-
                         }
-                    }
-                }
-                finally
-                {
-                    _playerData.Unlock();
-                }
 
-                // Process lagouts and disconnects
-                _playerData.Lock();
-                long now = Stopwatch.GetTimestamp();
-                try
-                {
-                    foreach (Player player in _playerData.Players)
-                    {
-                        if (player.Status >= PlayerState.Connected
-                            && IsOurs(player))
-                        {
-                            if (!player.TryGetExtraData(_connKey, out PlayerConnection? conn))
-                                return;
+                        if (ProcessLagout(player, conn, now))
+                            toKick.Add(player);
 
-                            if (ProcessLagout(player, conn, now))
-                                toKick.Add(player);
-
-                            if (ProcessDisconnect(player, conn, false))
-                                toFree.Add(player);
-                        }
+                        if (ProcessDisconnect(player, conn, false))
+                            toFree.Add(player);
                     }
                 }
                 finally
@@ -2696,103 +2779,9 @@ namespace SS.Core.Modules
                 // Client connections
                 //
 
-                now = Stopwatch.GetTimestamp();
-
-                _clientConnectionsLock.EnterUpgradeableReadLock();
-
-                try
+                if (handlesClientConnections)
                 {
-                    foreach (ClientConnection clientConnection in _clientConnections.Values)
-                    {
-                        bool hitMaxRetries = false;
-                        bool hitMaxOutlist = false;
-
-                        // Send outgoing.
-                        if (clientConnection.Status >= ClientConnectionStatus.Connected
-                            && clientConnection.Status < ClientConnectionStatus.Disconnecting)
-                        {
-                            lock (clientConnection.OutLock)
-                            {
-                                SendOutgoing(clientConnection, ref packetGrouper);
-
-                                hitMaxRetries = clientConnection.HitMaxRetries;
-                                hitMaxOutlist = clientConnection.HitMaxOutlist;
-                            }
-                        }
-
-                        // Check drop conditions (ordered to disconnect or lag out).
-                        TimeSpan noDataLimit = Interlocked.CompareExchange(ref clientConnection.PacketsReceived, 0, 0) > 0 ? TimeSpan.FromSeconds(65) : TimeSpan.FromSeconds(10);
-
-                        string? reason;
-                        if (clientConnection.Status == ClientConnectionStatus.Disconnecting)
-                            reason = "command";
-                        else if (hitMaxRetries)
-                            reason = "too many reliable retries";
-                        else if (hitMaxOutlist)
-                            reason = "too many outgoing packets";
-                        else if (Stopwatch.GetElapsedTime(Interlocked.Read(ref clientConnection.LastReceiveTimestamp), now) > noDataLimit)
-                            reason = "no data";
-                        else
-                            reason = null;
-
-                        if (reason is not null)
-                        {
-                            if (TearDownConnection(clientConnection, false))
-                            {
-                                _logManager.LogM(LogLevel.Info, nameof(Network), $"Client connection dropped due to {reason}.");
-                                toDrop.Add(clientConnection);
-                            }
-                        }
-                    }
-
-                    // Drop any connections that need to be dropped.
-                    if (toDrop.Count > 0)
-                    {
-                        foreach (ClientConnection clientConnection in toDrop)
-                        {
-                            bool removed;
-
-                            _clientConnectionsLock.EnterWriteLock();
-
-                            try
-                            {
-                                removed = _clientConnections.Remove(clientConnection.RemoteAddress!);
-                            }
-                            finally
-                            {
-                                _clientConnectionsLock.ExitWriteLock();
-                            }
-
-                            if (removed)
-                            {
-                                ReadOnlySpan<byte> disconnectSpan = [0x00, 0x07];
-                                SendRaw(clientConnection, disconnectSpan);
-                            }
-
-                            if (clientConnection.Encryptor is not null)
-                            {
-                                clientConnection.Encryptor.Void(clientConnection);
-                                _broker.ReleaseInterface(ref clientConnection.Encryptor, clientConnection.EncryptorName);
-                            }
-
-                            clientConnection.Status = ClientConnectionStatus.Disconnected;
-                        }
-                    }
-                }
-                finally
-                {
-                    _clientConnectionsLock.ExitUpgradeableReadLock();
-                }
-
-                if (toDrop.Count > 0)
-                {
-                    foreach (ClientConnection clientConnection in toDrop)
-                    {
-                        // Tell the handler it's disconnected.
-                        _mainloop.QueueMainWorkItem(_mainloopWork_ClientConnectionHandlerDisconnected, clientConnection);
-                    }
-
-                    toDrop.Clear();
+                    SendClientConnections(ref packetGrouper, toDrop);
                 }
 
                 if (_stopToken.IsCancellationRequested)
@@ -2932,6 +2921,117 @@ namespace SS.Core.Modules
             }
         }
 
+        /// <summary>
+        /// Sends outgoing data for the client connections (billers, peers) and drops the ones that have gone away.
+        /// </summary>
+        /// <remarks>
+        /// Called by the send thread that owns shard 0. There are only ever a handful of client connections,
+        /// so sharding them would cost more than it saved.
+        /// </remarks>
+        /// <param name="packetGrouper">The calling thread's packet grouper.</param>
+        /// <param name="toDrop">The calling thread's scratch list. It is empty on return.</param>
+        private void SendClientConnections(ref PacketGrouper packetGrouper, List<ClientConnection> toDrop)
+        {
+            long now = Stopwatch.GetTimestamp();
+
+            _clientConnectionsLock.EnterUpgradeableReadLock();
+
+            try
+            {
+                foreach (ClientConnection clientConnection in _clientConnections.Values)
+                {
+                    bool hitMaxRetries = false;
+                    bool hitMaxOutlist = false;
+
+                    // Send outgoing.
+                    if (clientConnection.Status >= ClientConnectionStatus.Connected
+                        && clientConnection.Status < ClientConnectionStatus.Disconnecting)
+                    {
+                        lock (clientConnection.OutLock)
+                        {
+                            SendOutgoing(clientConnection, ref packetGrouper);
+
+                            hitMaxRetries = clientConnection.HitMaxRetries;
+                            hitMaxOutlist = clientConnection.HitMaxOutlist;
+                        }
+                    }
+
+                    // Check drop conditions (ordered to disconnect or lag out).
+                    TimeSpan noDataLimit = Interlocked.CompareExchange(ref clientConnection.PacketsReceived, 0, 0) > 0 ? TimeSpan.FromSeconds(65) : TimeSpan.FromSeconds(10);
+
+                    string? reason;
+                    if (clientConnection.Status == ClientConnectionStatus.Disconnecting)
+                        reason = "command";
+                    else if (hitMaxRetries)
+                        reason = "too many reliable retries";
+                    else if (hitMaxOutlist)
+                        reason = "too many outgoing packets";
+                    else if (Stopwatch.GetElapsedTime(Interlocked.Read(ref clientConnection.LastReceiveTimestamp), now) > noDataLimit)
+                        reason = "no data";
+                    else
+                        reason = null;
+
+                    if (reason is not null)
+                    {
+                        if (TearDownConnection(clientConnection, false))
+                        {
+                            _logManager.LogM(LogLevel.Info, nameof(Network), $"Client connection dropped due to {reason}.");
+                            toDrop.Add(clientConnection);
+                        }
+                    }
+                }
+
+                // Drop any connections that need to be dropped.
+                if (toDrop.Count > 0)
+                {
+                    foreach (ClientConnection clientConnection in toDrop)
+                    {
+                        bool removed;
+
+                        _clientConnectionsLock.EnterWriteLock();
+
+                        try
+                        {
+                            removed = _clientConnections.Remove(clientConnection.RemoteAddress!);
+                        }
+                        finally
+                        {
+                            _clientConnectionsLock.ExitWriteLock();
+                        }
+
+                        if (removed)
+                        {
+                            ReadOnlySpan<byte> disconnectSpan = [0x00, 0x07];
+                            SendRaw(clientConnection, disconnectSpan);
+                        }
+
+                        if (clientConnection.Encryptor is not null)
+                        {
+                            clientConnection.Encryptor.Void(clientConnection);
+                            _broker.ReleaseInterface(ref clientConnection.Encryptor, clientConnection.EncryptorName);
+                        }
+
+                        clientConnection.Status = ClientConnectionStatus.Disconnected;
+                    }
+                }
+            }
+            finally
+            {
+                _clientConnectionsLock.ExitUpgradeableReadLock();
+            }
+
+            if (toDrop.Count > 0)
+            {
+                foreach (ClientConnection clientConnection in toDrop)
+                {
+                    // Tell the handler it's disconnected.
+                    _mainloop.QueueMainWorkItem(_mainloopWork_ClientConnectionHandlerDisconnected, clientConnection);
+                }
+
+                toDrop.Clear();
+            }
+        }
+
         private bool IsCancellationRequested()
         {
             return _stopToken.IsCancellationRequested;
@@ -2964,6 +3064,10 @@ namespace SS.Core.Modules
                 Span<byte> disconnectSpan = [0x00, 0x07];
                 SendRaw(playerConnection, disconnectSpan);
             }
+
+            // Stop the send thread that owns this connection from looking at it again.
+            // GetSendShard is stable for a given player, so this always targets the shard it was added to.
+            _sendShards[GetSendShard(player)].TryRemove(player.Id, out _);
 
             // Cleanup encryptor.
             if (playerConnection.Encryptor is not null)
@@ -4108,6 +4212,11 @@ namespace SS.Core.Modules
 
         private void MainloopWork_CallPacketHandlers(SubspaceBuffer buffer)
         {
+            // Every game packet handler in the server is dispatched from here, so asserting once covers
+            // all of them. Handlers are written assuming they are on the mainloop and would be unsafe
+            // anywhere else.
+            ThreadingAssert.OnMainloop(_mainloop);
+
             if (buffer is null)
                 return;
 
@@ -4592,15 +4701,14 @@ namespace SS.Core.Modules
             // Check some conditions that should be true and would normally be caught when developing in debug mode.
             //
 
-            // TODO: If OutLock is already being held, then the lock to read connection status must already be held too.
-            //Debug.Assert(
-            //    !Monitor.IsEntered(conn.OutLock)
-            //    || (Monitor.IsEntered(conn.OutLock)
-            //        && ((playerConnection is not null && (_playerData.IsReadLockHeld || _playerData.IsWriteLockHeld || _playerData.IsUpgradeableReadLockHeld))
-            //            || (clientConnection is not null && (_clientConnectionsLock.IsReadLockHeld || _clientConnectionsLock.IsWriteLockHeld || _clientConnectionsLock.IsUpgradeableReadLockHeld))
-            //        )
-            //    )
-            //);
+            // If OutLock is already held, the lock that guards connection status must already be held
+            // too. That ordering is what stops this from deadlocking against the send thread, which
+            // takes them in that order, and it was previously only written down in a comment.
+            Debug.Assert(
+                !conn.OutLock.IsHeldByCurrentThread
+                || (playerConnection is not null && (_playerData.IsReadLockHeld || _playerData.IsWriteLockHeld || _playerData.IsUpgradeableReadLockHeld))
+                || (clientConnection is not null && (_clientConnectionsLock.IsReadLockHeld || _clientConnectionsLock.IsWriteLockHeld || _clientConnectionsLock.IsUpgradeableReadLockHeld)),
+                "OutLock is held without the connection status lock, which is the wrong lock order.");
 
             // data has to be able to fit (a reliable packet has an additional header, so account for that too)
             Debug.Assert((isReliable && len <= Constants.MaxPacket - ReliableHeader.Length) || (!isReliable && len <= Constants.MaxPacket));

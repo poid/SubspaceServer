@@ -925,13 +925,26 @@ namespace SS.Core.Modules
 
             try
             {
-                foreach (Player p in _playerData.Players)
+                // A null arena means the whole zone, so that case still has to walk every player.
+                // Otherwise only the arena's own.
+                if (arena is null)
                 {
-                    if (p.Status == PlayerState.Playing &&
-                        (p.Arena == arena || arena is null) &&
-                        p != except)
+                    foreach (Player p in _playerData.Players)
                     {
-                        set.Add(p);
+                        if (p.Status == PlayerState.Playing && p != except)
+                        {
+                            set.Add(p);
+                        }
+                    }
+                }
+                else
+                {
+                    foreach (Player p in arena.Players)
+                    {
+                        if (p.Status == PlayerState.Playing && p != except)
+                        {
+                            set.Add(p);
+                        }
                     }
                 }
             }
