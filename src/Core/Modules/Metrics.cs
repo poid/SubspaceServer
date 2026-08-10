@@ -434,6 +434,9 @@ namespace SS.Core.Modules
                 sb.Append($"  mainloop work: {Read(ServerMetric.MainloopWorkItemsProcessed) / seconds:F0}/s processed, {Read(ServerMetric.MainloopWorkItemsDropped)} dropped, {Read(ServerMetric.MainloopDrainLimitHits)} drain-limit hits");
                 Emit(sb, player);
 
+                sb.Append($"  arena work: {Read(ServerMetric.ArenaLoopWorkItemsProcessed) / seconds:F0}/s processed, {Read(ServerMetric.ArenaLoopWorkItemsDropped)} dropped");
+                Emit(sb, player);
+
                 // Candidates scanned per packet is the headline cost metric, and mean in-view is reported
                 // beside it because the two only mean anything together. See IServerMetrics.
                 sb.Append($"  position: {positionPackets / seconds:F0} pkt/s, {candidatesScanned / seconds:F0} scanned/s, {PerPacket(candidatesScanned, positionPackets):F1} scanned/pkt, {PerPacket(recipientsInView, positionPackets):F1} in-view/pkt");
