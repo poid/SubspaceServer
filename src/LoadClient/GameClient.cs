@@ -241,7 +241,20 @@ namespace SS.LoadClient
                     Interlocked.Increment(ref PacketsReceived);
                     Interlocked.Add(ref BytesReceived, received);
 
-                    await ProcessAsync(buffer.AsMemory(0, received), cancellationToken);
+                    // Parsed here rather than in a helper, and only awaited when there is actually an ack
+                    // to send. Nearly every packet is a position update needing no reply, and calling an
+                    // async method for each one cost a state machine and a continuation per packet. With
+                    // thousands of clients each receiving hundreds a second, that was enough to make the
+                    // load generator, rather than the server, the thing that could not keep up.
+                    //
+                    // The span does not cross an await, which is what makes it legal here.
+                    _pendingAcks.Clear();
+                    Parse(buffer.AsSpan(0, received), _pendingAcks);
+
+                    for (int i = 0; i < _pendingAcks.Count; i++)
+                    {
+                        await SendAckAsync(_pendingAcks[i], cancellationToken);
+                    }
                 }
             }
             catch (OperationCanceledException)
@@ -251,19 +264,6 @@ namespace SS.LoadClient
             catch (Exception ex)
             {
                 FailureReason ??= $"receive: {ex.Message}";
-            }
-        }
-
-        private async Task ProcessAsync(ReadOnlyMemory<byte> data, CancellationToken cancellationToken)
-        {
-            // Parsing is done without awaiting, so that spans into the buffer never have to survive one,
-            // then the acks the parse decided on are sent.
-            _pendingAcks.Clear();
-            Parse(data.Span, _pendingAcks);
-
-            foreach (int sequenceNumber in _pendingAcks)
-            {
-                await SendAckAsync(sequenceNumber, cancellationToken);
             }
         }
 
