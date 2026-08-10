@@ -313,6 +313,50 @@ unreliable traffic alone, because only acks raise it. Any zone running large are
 `Net:LimitInitial` and `Net:LimitMinimum` raised regardless of anything in this document — it is
 independent of the threading work and predates all of it.
 
+## What the player id width actually costs, measured
+
+The plan predicted that once player ids pass 1023 the server has to fall back to the 21 byte weapons
+packet for every position update, roughly doubling the bandwidth of the dominant traffic class. That
+is now measured rather than derived.
+
+Bytes on the wire per position update, taken from what the clients actually received, with the
+bandwidth limiter raised so it is not the thing being measured:
+
+| player ids | packet the server picks | Continuum-style client | plain VIE client |
+|---|---|---|---|
+| ≤ 255 | 10 B batched small (0x39) | **11.3 B** | 17.5 B (16 B, 0x28) |
+| 256 – 1023 | 11 B batched large (0x3A) | **12.6 B** | 21.1 B (21 B, 0x05) |
+| > 1023 | 21 B weapons (0x05) | **16.8 B** (mixed) | 22.0 B |
+
+The Continuum figures sit just above the packet sizes themselves, the difference being the grouping
+byte amortised over each merged batch. The 16.8 B row is a mix, because that run had ids either side
+of 1023.
+
+**So at ten thousand concurrent players every id is over 1023 and every position update costs 21 bytes
+instead of 11.** That is the 1.9× the plan estimated, confirmed. Arena-local ids would put every
+player back under 256 and halve the outbound bandwidth of the thing the server spends most of its
+bandwidth on.
+
+That matters more now than when the plan was written, because the bandwidth limiter section above
+shows bandwidth is the binding per-connection constraint, not processor time.
+
+## Two things the load client was getting wrong
+
+Both were found chasing figures that did not add up, and both were making the server look better than
+it is.
+
+**It claimed no client features**, so the server never used the compact batched forms on it and sent
+16 or 21 bytes where a real Continuum client would get 10 or 11. Every byte figure measured before
+this overstated what the server pushes. The server takes a VIE client's feature flags from the login
+packet verbatim, so claiming batched positions is enough without having to speak Continuum's
+encryption. `--no-batch-positions` keeps the old behaviour, which is what a plain VIE client does.
+
+**It counted a batched packet as one update.** The send thread merges consecutive batched position
+packets for the same recipient into one packet holding many position items, so counting packets
+undercounted updates by about five times — and the bytes per update that came out of it were wrong by
+the same factor in the other direction. After the fix the client's count agrees with the server's own
+`SendToOne` counter to within noise, which is the check that says both are now right.
+
 ## What to watch next
 
 - **The receive thread**, at 20% of a core at six thousand and climbing faster than anything else.
