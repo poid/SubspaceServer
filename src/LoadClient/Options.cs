@@ -96,6 +96,21 @@
         public int ConnectDelayMs { get; private set; }
 
         /// <summary>
+        /// Whether the clients claim to support batched position packets, as Continuum does.
+        /// </summary>
+        /// <remarks>
+        /// This decides which of the four shapes of position packet the server sends, and so how much
+        /// data it pushes. A client claiming it gets the 10 byte form while its player id is below 256
+        /// and the 11 byte form below 1024; a client not claiming it gets the 16 byte form below 256.
+        /// Above those the server falls back to the 21 byte weapons packet either way.
+        /// <para>
+        /// On by default because that is what a real Continuum client does, and measuring against a
+        /// client that does not claim it overstates the bytes the server sends.
+        /// </para>
+        /// </remarks>
+        public bool BatchPositions { get; private set; } = true;
+
+        /// <summary>
         /// Commands to issue once the clients are in, without the leading '?'.
         /// </summary>
         public List<string> Commands { get; } = [];
@@ -181,6 +196,10 @@
                         i++;
                         break;
 
+                    case "--no-batch-positions":
+                        options.BatchPositions = false;
+                        break;
+
                     case "--view" when next is not null:
                         string[] parts = next.Split('x', StringSplitOptions.TrimEntries);
                         if (parts.Length != 2 || !short.TryParse(parts[0], out short width) || !short.TryParse(parts[1], out short height))
@@ -234,6 +253,11 @@
                   --spread <pixels>        How far apart to place clients in an arena. This decides
                                            how many end up within view of each other, which is what
                                            the fan out cost scales with. Default 4096
+                  --no-batch-positions     Do not claim support for batched position packets. Clients
+                                           claim it by default, as Continuum does, which is what makes
+                                           the server send the compact 10 and 11 byte forms rather
+                                           than the 16 byte one. Above player id 1023 neither is
+                                           available and the server sends 21 bytes regardless.
                   --view <width>x<height>  Screen size the clients claim, which the server uses as
                                            their view range. Default 1920x1080
                   --weapons <percent>      Percentage of position packets carrying weapon fire.

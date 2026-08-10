@@ -71,7 +71,7 @@ namespace SS.LoadClient
             for (int i = 0; i < options.ClientCount; i++)
             {
                 int index = i;
-                GameClient client = new($"{options.NamePrefix}{index:D4}", options.Password);
+                GameClient client = new($"{options.NamePrefix}{index:D4}", options.Password, options.BatchPositions);
                 clients[index] = client;
 
                 setupTasks[index] = SetupAsync(client, index);

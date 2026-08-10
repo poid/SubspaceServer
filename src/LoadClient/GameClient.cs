@@ -23,7 +23,7 @@ namespace SS.LoadClient
     /// the EncryptionNull module loaded, so that no encryption is negotiated.
     /// </para>
     /// </remarks>
-    internal sealed class GameClient(string name, string password) : IDisposable
+    internal sealed class GameClient(string name, string password, bool batchPositions = true) : IDisposable
     {
         private const byte ClientTypeVIE = 0x01;
 
@@ -147,7 +147,12 @@ namespace SS.LoadClient
             login.ConnectionType = 0;
             login.TimeZoneBias = 0;
             login.CVersion = 134;
-            login.ClientFeatures = ClientFeatures.None;
+
+            // The server takes a VIE client's features from this field verbatim, so claiming batched
+            // positions here is enough to be sent the compact forms without pretending to be Continuum
+            // and having to speak its encryption. Only this one is claimed: the others would have the
+            // server sending things this client has no way to handle.
+            login.ClientFeatures = batchPositions ? ClientFeatures.BatchPositions : ClientFeatures.None;
             login.D2 = 0;
 
             ReadOnlySpan<byte> bytes = MemoryMarshal.AsBytes(MemoryMarshal.CreateReadOnlySpan(ref login, 1))[..LoginPacket.VIELength];
