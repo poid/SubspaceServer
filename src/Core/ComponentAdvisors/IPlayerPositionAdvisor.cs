@@ -21,6 +21,22 @@ namespace SS.Core.ComponentAdvisors
         /// <summary>
         /// Modifies a player's position packet before it is sent to a specific player.
         /// </summary>
+        /// <remarks>
+        /// Unlike <see cref="EditPositionPacket"/>, this is not called on the mainloop thread. It is
+        /// called once per recipient, which is the busiest loop in the server, so that loop runs on the
+        /// thread that owns the arena rather than on the mainloop.
+        /// <para>
+        /// An implementation must therefore be safe to call from a thread other than the mainloop, and
+        /// safe to call for two arenas at once. In practice that means reading player and arena state
+        /// rather than changing it, and changing nothing beyond the packet it is given. The lock over
+        /// player data is held for the duration, so players will not be freed underneath it, but nothing
+        /// else is guaranteed.
+        /// </para>
+        /// <para>
+        /// It is also called for every recipient of every position packet, tens of thousands of times a
+        /// second on a busy zone, so it should do as little as possible and must not block.
+        /// </para>
+        /// </remarks>
         /// <param name="player">The player that the position packet belongs to.</param>
         /// <param name="toPlayer">The player that the position packet will be sent to.</param>
         /// <param name="positionPacket">The position packet.</param>
