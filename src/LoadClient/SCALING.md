@@ -279,6 +279,40 @@ only about 4,900 of the 6,000 ever connected. It shares the machine with the ser
 So these numbers are a floor on what the server can do, not a ceiling. Finding the real one needs the
 load generated from other machines.
 
+## The bandwidth limiter was quietly capping every measurement
+
+Chasing why the load client seemed to be losing three quarters of its packets turned up something
+that changes how every number above should be read.
+
+`BandwidthDefault` gives each connection `Net:LimitInitial` bytes per second — **5,000** — and raises
+it only in `AdjustForAck`, when an acknowledgement arrives. There is no growth with time. Load clients
+generate almost no reliable traffic, so they almost never ack, so they sat at close to the initial
+limit for the whole run. The server was therefore discarding most position packets at the limiter
+rather than sending them, which is exactly what it is designed to do.
+
+Nothing was lost and nothing was broken. But it means the *send* side of every measurement above was
+doing a fraction of the work real clients would ask of it. Raising the limit to 64 KB/s, at the same
+2,000 clients over 20 arenas:
+
+| | default limiter | realistic bandwidth |
+|---|---|---|
+| position updates each client received | 166/s | **771/s** |
+| total sent to clients | 7,129 KB/s | **30,598 KB/s** |
+| send threads (grown automatically) | 2 | **5** |
+| total cores | 2.45 | 3.84 |
+| send overruns | 0 | 47 |
+
+Four and a half times the actual data, and the send threads grew from two to five on their own to
+carry it. The arena workers barely moved, at 33% against 35% — the fan-out scan happens before the
+limiter, so that half of the work was always being measured honestly. It is the send side that was
+understated.
+
+**This matters beyond the harness.** The plan's arena cap analysis assumes a player in a full arena
+receives around 25 KB/s. A connection cannot reach that from a 5,000 B/s starting limit on
+unreliable traffic alone, because only acks raise it. Any zone running large arenas will want
+`Net:LimitInitial` and `Net:LimitMinimum` raised regardless of anything in this document — it is
+independent of the threading work and predates all of it.
+
 ## What to watch next
 
 - **The receive thread**, at 20% of a core at six thousand and climbing faster than anything else.
