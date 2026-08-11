@@ -448,7 +448,7 @@ namespace SS.Core.Modules
                 sb.Append($"  send threads: {Read(ServerMetric.SendThreadsActive)} running, busiest {Read(ServerMetric.SendThreadBusiestPercent)}% of its interval");
                 Emit(sb, player);
 
-                sb.Append($"  player lock: {Read(ServerMetric.PlayerDataReadLocks) / seconds:F0} read/s, {Read(ServerMetric.PlayerDataWriteLocks) / seconds:F0} write/s, write held {TotalMilliseconds(Read(ServerMetric.PlayerDataWriteLockHeldTicks)):F1}ms");
+                sb.Append($"  player lock: {Read(ServerMetric.PlayerDataReadLocks) / seconds:F0} read/s, {Read(ServerMetric.PlayerDataWriteLocks) / seconds:F0} write/s, write held {TotalMilliseconds(Read(ServerMetric.PlayerDataWriteLockHeldTicks)):F1}ms, write waited {TotalMilliseconds(Read(ServerMetric.PlayerDataWriteLockWaitTicks)):F1}ms");
                 Emit(sb, player);
 
                 // Sustained allocation here means the object pools have stopped keeping up, since the

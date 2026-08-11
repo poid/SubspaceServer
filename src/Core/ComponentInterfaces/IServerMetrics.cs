@@ -84,6 +84,13 @@ namespace SS.Core.ComponentInterfaces
 
         /// <summary>Counter. Stopwatch ticks the global player data write lock was held for.</summary>
         PlayerDataWriteLockHeldTicks,
+
+        /// <summary>
+        /// Counter. Stopwatch ticks spent waiting to acquire the global player data write lock.
+        /// Separate from how long it is then held, because only this one grows with the number of
+        /// threads taking the read lock: a writer waits for every reader to finish.
+        /// </summary>
+        PlayerDataWriteLockWaitTicks,
     }
 
     /// <summary>

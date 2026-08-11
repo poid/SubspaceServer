@@ -257,16 +257,30 @@ namespace SS.Core.Modules
 
         public void WriteLock()
         {
+            IServerMetrics? serverMetrics = _serverMetrics;
+
+            // Timed separately from how long the lock is then held, because they answer different
+            // questions and only one of them grows with the number of readers. A writer waits for every
+            // reader to finish, so moving work onto more threads that take the read lock makes acquiring
+            // it slower without the lock being held any longer.
+            long waitStart = serverMetrics is not null && serverMetrics.IsEnabled && !_rwLock.IsWriteLockHeld
+                ? Stopwatch.GetTimestamp()
+                : 0;
+
             _rwLock.EnterWriteLock();
 
-            IServerMetrics? serverMetrics = _serverMetrics;
             if (serverMetrics is not null && serverMetrics.IsEnabled)
             {
                 serverMetrics.Increment(ServerMetric.PlayerDataWriteLocks);
 
                 // The lock is recursive, so only time the outermost acquisition.
                 if (_rwLock.RecursiveWriteCount == 1)
+                {
+                    if (waitStart != 0)
+                        serverMetrics.Add(ServerMetric.PlayerDataWriteLockWaitTicks, Stopwatch.GetTimestamp() - waitStart);
+
                     t_writeLockTimestamp = Stopwatch.GetTimestamp();
+                }
             }
         }
 
