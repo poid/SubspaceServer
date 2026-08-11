@@ -128,6 +128,17 @@ namespace SS.Core.Modules
         private ConcurrentDictionary<int, Player>[] _sendShards = [];
 
         /// <summary>
+        /// For handling a settled player's packets on their arena's thread instead of the mainloop.
+        /// </summary>
+        /// <remarks>Optional, and only used when Net:HandlePacketsOnArenaThread is on.</remarks>
+        private IArenaLoop? _arenaLoop;
+
+        /// <summary>
+        /// Whether packets from players settled in an arena are handled on that arena's thread.
+        /// </summary>
+        private bool _handlePacketsOnArenaThread;
+
+        /// <summary>
         /// How many players are in each shard, so that a new connection can be given to the emptiest one
         /// without asking a <see cref="ConcurrentDictionary{TKey, TValue}"/> for its count, which takes
         /// all of its locks.
@@ -374,6 +385,15 @@ namespace SS.Core.Modules
         // Cached delegates
         private readonly Action<BigPacketWork> _mainloopWork_CallBigPacketHandlers;
         private readonly Action<SubspaceBuffer> _mainloopWork_CallPacketHandlers;
+
+        /// <summary>
+        /// The same work, queued to an arena's thread rather than the mainloop.
+        /// </summary>
+        /// <remarks>
+        /// Deliberately the same method. A packet handler does not care which of the two it is on, only
+        /// that it is on whichever one owns the player, which is what the assertion in it checks.
+        /// </remarks>
+        private readonly Action<SubspaceBuffer> _arenaWork_CallPacketHandlers;
         private readonly ReliableConnectionCallbackInvoker.ReliableConnectionCallback _sizedSendChunkCompleted;
         private readonly Func<bool> _isCancellationRequested;
         private readonly Action<ClientConnection> _mainloopWork_ClientConnectionHandlerDisconnected;
@@ -413,6 +433,7 @@ namespace SS.Core.Modules
             // Allocate callback delegates once rather than each time they're used.
             _mainloopWork_CallBigPacketHandlers = MainloopWork_CallBigPacketHandlers;
             _mainloopWork_CallPacketHandlers = MainloopWork_CallPacketHandlers;
+            _arenaWork_CallPacketHandlers = MainloopWork_CallPacketHandlers;
             _sizedSendChunkCompleted = SizedSendChunkCompleted;
             _isCancellationRequested = IsCancellationRequested;
             _mainloopWork_ClientConnectionHandlerDisconnected = MainloopWork_ClientConnectionHandlerDisconnected;
@@ -445,6 +466,18 @@ namespace SS.Core.Modules
 
         #region Module Members
 
+        [ConfigHelp<bool>("Net", "HandlePacketsOnArenaThread", ConfigScope.Global, Default = false,
+            Description = """
+                Whether packets from a player who is settled in an arena are handled on that arena's
+                thread rather than on the mainloop.
+                This is what stops the mainloop being where every packet in the zone is processed, which
+                is its remaining cost at scale: roughly six percent of a core per thousand players, and
+                independent of how the players are spread over arenas.
+                Every packet handler in the server was written assuming the mainloop, so this is off by
+                default and should be turned on only with a debug build first, where the threading
+                assertions will point at anything that is not safe to run there.
+                Requires the SS.Core.Modules.ArenaLoop module.
+                """)]
         [ConfigHelp<int>("Net", "SendThreads", ConfigScope.Global, Default = 1, Min = 1,
             Description = """
                 How many threads to start for sending outgoing data.
@@ -467,6 +500,16 @@ namespace SS.Core.Modules
             _connKey = _playerData.AllocatePlayerData(new PlayerConnectionPooledObjectPolicy(_config.PlayerReliableReceiveWindowSize));
 
             _serverMetrics = broker.GetInterface<IServerMetrics>();
+            _arenaLoop = broker.GetInterface<IArenaLoop>();
+
+            _handlePacketsOnArenaThread =
+                _arenaLoop is not null
+                && _configManager.GetBool(_configManager.Global, "Net", "HandlePacketsOnArenaThread", ConfigHelp.Constants.Global.Net.HandlePacketsOnArenaThread.Default);
+
+            if (_handlePacketsOnArenaThread)
+            {
+                _logManager.LogM(LogLevel.Info, nameof(Network), "Packets from players in an arena are handled on that arena's thread. See Net:HandlePacketsOnArenaThread.");
+            }
 
             PlayerActionCallback.Register(broker, Callback_PlayerAction);
 
@@ -737,6 +780,11 @@ namespace SS.Core.Modules
             if (_serverMetrics is not null)
             {
                 broker.ReleaseInterface(ref _serverMetrics);
+            }
+
+            if (_arenaLoop is not null)
+            {
+                broker.ReleaseInterface(ref _arenaLoop);
             }
 
             // Normally, all threads are already stopped and all connections disconnected by this point because PreUnload should have ran.
@@ -4609,10 +4657,35 @@ namespace SS.Core.Modules
 
                 Interlocked.Increment(ref conn.ProcessingHolds);
 
-                // Sheddable: an incoming game packet is the one thing worth dropping when the mainloop
-                // is too far behind, since the client will send another shortly and this path already
-                // releases the buffer when refused.
-                if (!_mainloop.QueueSheddableMainWorkItem(_mainloopWork_CallPacketHandlers, buffer)) // The workitem disposes the buffer.
+                // Sheddable either way: an incoming game packet is the one thing worth dropping when the
+                // consumer is too far behind, since the client will send another shortly and this path
+                // already releases the buffer when refused.
+                bool queued;
+
+                // A packet for a player settled in an arena can be handled by that arena's thread, which
+                // is the whole point of having them: the mainloop stops being where every packet in the
+                // zone is processed. Anything else - logging in, changing arena, a chat client - stays on
+                // the mainloop, because it is not any one arena's business.
+                //
+                // Only while Playing. The states either side of it are where the player is being handed
+                // between the mainloop and the arena, and a packet handled during the handover could be
+                // running against either owner.
+                Arena? arena = _handlePacketsOnArenaThread && conn is PlayerConnection pc && pc.Player is Player p && p.Status == PlayerState.Playing
+                    ? p.Arena
+                    : null;
+
+                IArenaLoop? arenaLoop = _arenaLoop;
+
+                if (arena is not null && arenaLoop is not null)
+                {
+                    queued = arenaLoop.QueueSheddableArenaWorkItem(arena, _arenaWork_CallPacketHandlers, buffer);
+                }
+                else
+                {
+                    queued = _mainloop.QueueSheddableMainWorkItem(_mainloopWork_CallPacketHandlers, buffer);
+                }
+
+                if (!queued) // Whichever ran disposes the buffer; this is the refused path.
                 {
                     Interlocked.Decrement(ref conn.ProcessingHolds);
                     buffer.Dispose();
@@ -4633,10 +4706,13 @@ namespace SS.Core.Modules
 
         private void MainloopWork_CallPacketHandlers(SubspaceBuffer buffer)
         {
-            // Every game packet handler in the server is dispatched from here, so asserting once covers
-            // all of them. Handlers are written assuming they are on the mainloop and would be unsafe
-            // anywhere else.
-            ThreadingAssert.OnMainloop(_mainloop);
+            // Every game packet handler in the server is dispatched from here or from its arena-thread
+            // twin, so asserting here covers all of them. Either thread is allowed, because which one a
+            // packet arrives on depends on whether its sender is settled in an arena.
+            ThreadingAssert.OwnsPlayerState(
+                _mainloop,
+                _arenaLoop,
+                (buffer?.Conn as PlayerConnection)?.Player?.Arena);
 
             if (buffer is null)
                 return;
