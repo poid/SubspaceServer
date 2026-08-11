@@ -130,6 +130,7 @@ namespace SS.LoadClient
             double seconds = Stopwatch.GetElapsedTime(measureStart).TotalSeconds;
 
             long positionUpdates = 0;
+            long positionUpdatesSent = 0;
             long bytes = 0;
             long kills = 0;
             int stillUp = 0;
@@ -137,6 +138,7 @@ namespace SS.LoadClient
             foreach (GameClient client in startedClients)
             {
                 positionUpdates += Interlocked.Read(ref client.PositionUpdatesReceived);
+                positionUpdatesSent += Interlocked.Read(ref client.PositionUpdatesSent);
                 bytes += Interlocked.Read(ref client.BytesReceived);
                 kills += Interlocked.Read(ref client.KillsSeen);
 
@@ -146,6 +148,11 @@ namespace SS.LoadClient
 
             Console.WriteLine($"Finished. {stillUp}/{connected} client(s) survived.");
             Console.WriteLine($"Server sent {positionUpdates / seconds:F0} position updates/s and {bytes / seconds / 1024d:F0} KB/s to these clients ({positionUpdates / (double)Math.Max(connected, 1) / seconds:F1} updates/s each).");
+
+            // Reported so that a shortfall in what the server received can be told apart from a shortfall
+            // in what was sent to it. Compare this against the server's own position packet rate: if they
+            // agree, this generator is the thing falling short, not the server.
+            Console.WriteLine($"These clients sent {positionUpdatesSent / seconds:F0} position updates/s ({positionUpdatesSent / (double)Math.Max(stillUp, 1) / seconds:F1} each, against a nominal 10.0).");
 
             if (options.DeathsPerMinute > 0)
                 Console.WriteLine($"Kill notifications seen: {kills / seconds:F0}/s, which confirms deaths were processed rather than rejected.");

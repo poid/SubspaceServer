@@ -79,6 +79,16 @@ namespace SS.LoadClient
         /// </remarks>
         public long PositionUpdatesReceived;
 
+        /// <summary>
+        /// Position updates this client handed to its socket.
+        /// </summary>
+        /// <remarks>
+        /// Without this there is no way to tell a server that dropped a packet from a client that never
+        /// sent one. Both look identical from the server's counters, and the difference decides whether
+        /// a shortfall is the thing being measured or the thing doing the measuring.
+        /// </remarks>
+        public long PositionUpdatesSent;
+
         public long PacketsReceived;
         public long BytesReceived;
 
@@ -218,6 +228,8 @@ namespace SS.LoadClient
         /// </param>
         public Task SendPositionAsync(short x, short y, short xSpeed, short ySpeed, sbyte rotation, WeaponCodes weapon, CancellationToken cancellationToken)
         {
+            Interlocked.Increment(ref PositionUpdatesSent);
+
             C2S_PositionPacket position = new()
             {
                 Rotation = rotation,
