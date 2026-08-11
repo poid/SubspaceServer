@@ -99,6 +99,15 @@ namespace SS.Core.ComponentInterfaces
         void KickPlayer(Player player);
 
         /// <summary>
+        /// The most players allowed in one arena, or 0 when there is no limit.
+        /// </summary>
+        /// <remarks>
+        /// Only limited when Net:UseArenaLocalPlayerIds is on, where the arena has a fixed number of
+        /// slots to hand out and a player without one cannot be seen by anyone. See General:MaxPlayers.
+        /// </remarks>
+        int MaxArenaPlayers { get; }
+
+        /// <summary>
         /// Finds the player with the given pid.
         /// </summary>
         /// <remarks>
