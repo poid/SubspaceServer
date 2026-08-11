@@ -143,7 +143,7 @@ namespace SS.Core.Modules
 
                 if (arena is not null)
                 {
-                    S2C_PlayerLeaving packet = new((short)player.Id);
+                    S2C_PlayerLeaving packet = new(player.ArenaSlot);
                     _network?.SendToArena(arena, player, ref packet, NetSendFlags.Reliable);
                     _chatNetwork?.SendToArena(arena, player, $"LEAVING:{player.Name}");
                 }

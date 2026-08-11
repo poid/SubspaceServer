@@ -645,7 +645,7 @@ namespace SS.Core.Modules
             if (arena is null)
                 return;
 
-            S2C_TurretKickoff packet = new((short)player.Id);
+            S2C_TurretKickoff packet = new(player.ArenaSlot);
             _network.SendToArena(arena, null, ref packet, NetSendFlags.Reliable);
 
             TurretKickoffCallback.Fire(arena, player);
@@ -1633,7 +1633,7 @@ namespace SS.Core.Modules
                             if (dist <= range
                                 || sendToAll
                                 || otherPlayerData.Speccing == player // always send to spectators of the player
-                                || otherPlayer.Attached == player.Id // always send to turreters
+                                || otherPlayer.Attached == player.ArenaSlot // always send to turreters
                                 || (pos.Weapon.Type == WeaponCodes.Null
                                     && dist < arenaData.PositionPixels
                                     && randnum > ((double)dist / (double)arenaData.PositionPixels * Constants.RandMax + 1d)) // send some radar packets
@@ -1706,7 +1706,7 @@ namespace SS.Core.Modules
                                         && !sendBounty
                                         && posCopy.Status == 0
                                         && extraLength == 0 // no energy or extra data
-                                        && ((uint)player.Id & 0xFFFF_FF00) == 0 // PlayerId [0-255]
+                                        && ((uint)player.ArenaSlot & 0xFFFF_FF00) == 0 // PlayerId [0-255]
                                         && posCopy.XSpeed >= -8192 && posCopy.XSpeed <= 8191
                                         && posCopy.YSpeed >= -8192 && posCopy.YSpeed <= 8191
                                         && posCopy.X >= 0 && posCopy.X <= 16383
@@ -1716,7 +1716,7 @@ namespace SS.Core.Modules
                                         if (smallDirty || modified)
                                         {
                                             ref SmallPosition small = ref smallSingle.Position;
-                                            small.PlayerId = (byte)player.Id;
+                                            small.PlayerId = (byte)player.ArenaSlot;
                                             small.Rotation = posCopy.Rotation;
                                             small.Time = (ushort)(gtc - (uint)latency);
                                             small.X = posCopy.X;
@@ -1734,7 +1734,7 @@ namespace SS.Core.Modules
                                         && !sendBounty
                                         && ((int)posCopy.Status & 0b11000000) == 0 // only the 6 lower bits
                                         && extraLength == 0 // no energy or extra data
-                                        && ((uint)player.Id & 0xFFFF_FC00) == 0 // PlayerId [0-1023]
+                                        && ((uint)player.ArenaSlot & 0xFFFF_FC00) == 0 // PlayerId [0-1023]
                                         && posCopy.XSpeed >= -8192 && posCopy.XSpeed <= 8191
                                         && posCopy.YSpeed >= -8192 && posCopy.YSpeed <= 8191
                                         && posCopy.X >= 0 && posCopy.X <= 16383
@@ -1745,7 +1745,7 @@ namespace SS.Core.Modules
                                         {
                                             ref LargePosition large = ref largeSingle.Position;
                                             large.Status = posCopy.Status;
-                                            large.PlayerId = (ushort)player.Id;
+                                            large.PlayerId = (ushort)player.ArenaSlot;
                                             large.Rotation = posCopy.Rotation;
                                             large.Time = (ushort)(gtc - (uint)latency);
                                             large.X = posCopy.X;
@@ -1760,7 +1760,7 @@ namespace SS.Core.Modules
                                     }
                                     else if (posCopy.Weapon.Type > 0 // has weapon fire
                                         || (posCopy.Bounty & 0xFF00) != 0 // bounty over 255
-                                        || ((uint)player.Id & 0xFFFF_FF00) != 0) // PlayerId over 255
+                                        || ((uint)player.ArenaSlot & 0xFFFF_FF00) != 0) // PlayerId over 255
                                     {
                                         // 0x05 Weapon
                                         if (wpnDirty || modified)
@@ -1770,7 +1770,7 @@ namespace SS.Core.Modules
                                             wpn.Time = (ushort)(gtc & 0xFFFF);
                                             wpn.X = posCopy.X;
                                             wpn.YSpeed = posCopy.YSpeed;
-                                            wpn.PlayerId = (ushort)player.Id;
+                                            wpn.PlayerId = (ushort)player.ArenaSlot;
                                             wpn.XSpeed = posCopy.XSpeed;
                                             wpn.Checksum = 0;
                                             wpn.Status = posCopy.Status;
@@ -1811,7 +1811,7 @@ namespace SS.Core.Modules
                                             sendPos.X = posCopy.X;
                                             sendPos.C2SLatency = (byte)latency;
                                             sendPos.Bounty = (byte)posCopy.Bounty;
-                                            sendPos.PlayerId = (byte)player.Id;
+                                            sendPos.PlayerId = (byte)player.ArenaSlot;
                                             sendPos.Status = posCopy.Status;
                                             sendPos.YSpeed = posCopy.YSpeed;
                                             sendPos.Y = posCopy.Y;
@@ -1912,11 +1912,12 @@ namespace SS.Core.Modules
             lock (_specLock)
             {
                 Player? targetPlayer = null;
-                if (targetPlayerId >= 0)
+                Arena? playerArena = player.Arena;
+                if (targetPlayerId >= 0 && playerArena is not null)
                 {
-                    targetPlayer = _playerData.PidToPlayer(targetPlayerId);
+                    targetPlayer = _playerData.PidToPlayer(playerArena, targetPlayerId);
                     if (targetPlayer is not null
-                        && (targetPlayer.Status != PlayerState.Playing || targetPlayer.Ship == ShipType.Spec || targetPlayer.Arena != player.Arena))
+                        && (targetPlayer.Status != PlayerState.Playing || targetPlayer.Ship == ShipType.Spec))
                     {
                         targetPlayer = null;
                     }
@@ -2154,7 +2155,7 @@ namespace SS.Core.Modules
                 }
             }
 
-            S2C_ShipChange packet = new((sbyte)ship, (short)player.Id, freq);
+            S2C_ShipChange packet = new((sbyte)ship, player.ArenaSlot, freq);
             ReadOnlySpan<byte> data = MemoryMarshal.AsBytes(MemoryMarshal.CreateReadOnlySpan(ref packet, 1));
 
             if (player.IsStandard)
@@ -2228,7 +2229,7 @@ namespace SS.Core.Modules
                 player.Freq = freq;
             }
 
-            S2C_FreqChange packet = new((short)player.Id, freq);
+            S2C_FreqChange packet = new(player.ArenaSlot, freq);
             ReadOnlySpan<byte> data = MemoryMarshal.AsBytes(MemoryMarshal.CreateReadOnlySpan(ref packet, 1));
 
             // him with callback
@@ -2304,8 +2305,8 @@ namespace SS.Core.Modules
             ref readonly C2S_Die packet = ref MemoryMarshal.AsRef<C2S_Die>(data[..C2S_Die.Length]);
             short bounty = packet.Bounty;
 
-            Player? killer = _playerData.PidToPlayer(packet.Killer);
-            if (killer is null || killer.Status != PlayerState.Playing || killer.Arena != arena)
+            Player? killer = _playerData.PidToPlayer(arena, packet.Killer);
+            if (killer is null || killer.Status != PlayerState.Playing)
             {
                 _logManager.LogP(LogLevel.Malicious, nameof(Game), player, $"Reported kill by bad pid {packet.Killer}.");
                 return;
@@ -2537,7 +2538,7 @@ namespace SS.Core.Modules
                 && !(prize == Prize.Burst && (ad.PersonalGreen & PersonalGreen.Burst) == PersonalGreen.Burst)
                 && !(prize == Prize.Brick && (ad.PersonalGreen & PersonalGreen.Brick) == PersonalGreen.Brick))
             {
-                S2C_Green s2c = new(in c2s, (short)player.Id);
+                S2C_Green s2c = new(in c2s, player.ArenaSlot);
                 _network.SendToArena(arena, player, ref s2c, NetSendFlags.Unreliable);
             }
 
@@ -2561,13 +2562,15 @@ namespace SS.Core.Modules
             if (player is null)
                 return;
 
-            short toPlayerId = (short)(to is not null ? to.Id : -1);
+            // Both of these are ids as the clients in this arena know them, because Attached is stored
+            // as it is sent and is compared against other client-facing ids.
+            short toPlayerId = to is not null ? to.ArenaSlot : (short)-1;
 
             // only if state has changed
             if (player.Attached != toPlayerId)
             {
                 // Send the packet
-                S2C_Turret packet = new((short)player.Id, toPlayerId);
+                S2C_Turret packet = new(player.ArenaSlot, toPlayerId);
                 _network.SendToArena(player.Arena, null, ref packet, NetSendFlags.Reliable);
 
                 // Update the state
@@ -2623,12 +2626,11 @@ namespace SS.Core.Modules
             // -1 means detaching
             if (pid2 != -1)
             {
-                to = _playerData.PidToPlayer(pid2);
+                to = _playerData.PidToPlayer(arena, pid2);
 
                 if (to is null
                     || to == player
                     || to.Status != PlayerState.Playing
-                    || player.Arena != to.Arena
                     || player.Freq != to.Freq)
                 {
                     _logManager.LogP(LogLevel.Malicious, nameof(Game), player, $"Tried to attach to bad pid {pid2}.");

@@ -310,7 +310,7 @@ namespace SS.Core.Modules.Scoring
 
                             // Send the update to the arena.
                             S2C_ScoreUpdate packet = new(
-                                (short)player.Id,
+                                player.ArenaSlot,
                                 killPoints,
                                 flagPoints,
                                 kills,
@@ -439,7 +439,7 @@ namespace SS.Core.Modules.Scoring
                             return;
 
                         // Tell all clients in the arena to reset scores (kill points, flag points, kills, deaths) of the player.
-                        S2C_ScoreReset scoreReset = new((short)player.Id);
+                        S2C_ScoreReset scoreReset = new(player.ArenaSlot);
                         _network.SendToArena(arena, null, ref scoreReset, NetSendFlags.Reliable);
                     }
                 }
