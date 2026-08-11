@@ -81,6 +81,40 @@ namespace SS.Core
         }
 
         /// <summary>
+        /// Asserts that the caller is on the thread that owns a player's game state.
+        /// </summary>
+        /// <remarks>
+        /// That is the mainloop, or the thread that owns the player's arena when arena threads are
+        /// handling packets. Which of the two it is depends on configuration and on whether the player
+        /// is in an arena, so anything that runs in both places has to accept either.
+        /// <para>
+        /// This is weaker than <see cref="OnMainloop"/> and deliberately so: it still catches the thing
+        /// that matters, which is arena game state being touched from a network thread, a thread pool
+        /// thread, or the worker for a different arena.
+        /// </para>
+        /// </remarks>
+        /// <param name="mainloop">The mainloop service.</param>
+        /// <param name="arenaLoop">The arena loop service, or <see langword="null"/> if not in use.</param>
+        /// <param name="arena">The player's arena, or <see langword="null"/> if they are not in one.</param>
+        /// <param name="caller">Filled in by the compiler, to name what ran on the wrong thread.</param>
+        [Conditional("DEBUG")]
+        public static void OwnsPlayerState(IMainloop? mainloop, IArenaLoop? arenaLoop, Arena? arena, [CallerMemberName] string? caller = null)
+        {
+            if (mainloop is null || !HasMainloopStarted(mainloop))
+                return;
+
+            if (mainloop.IsMainloop)
+                return;
+
+            if (arena is not null && arenaLoop is not null && arenaLoop.IsArenaThread(arena))
+                return;
+
+            Debug.Assert(
+                false,
+                $"{caller} must run on the mainloop or on the thread owning arena '{arena?.Name ?? "(none)"}', but ran on '{Thread.CurrentThread.Name ?? "unnamed"}'.");
+        }
+
+        /// <summary>
         /// Asserts that the caller holds the global player lock, in any of its forms.
         /// </summary>
         /// <param name="playerData">The player data service.</param>
