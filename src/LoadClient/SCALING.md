@@ -340,6 +340,56 @@ bandwidth on.
 That matters more now than when the plan was written, because the bandwidth limiter section above
 shows bandwidth is the binding per-connection constraint, not processor time.
 
+## Arena-local player ids, measured
+
+Implemented behind `Net:UseArenaLocalPlayerIds`, off by default. `Player.Id` stays the zone-wide
+identity used by the billing server, persistence and logging; `Player.ArenaSlot` is what clients are
+told and is a slot within the arena, so it stays small however many are online.
+
+2,000 clients over 20 arenas, so 100 per arena and every arena-local id below 256:
+
+| | zone-wide ids | arena-local ids |
+|---|---|---|
+| bytes per position update | 16.7 | **11.5** |
+| total sent to clients | 24,220 KB/s | **17,670 KB/s** |
+| position updates delivered | 1,488,692/s | **1,575,026/s** |
+| send thread overruns | 6 | **0** |
+
+**A third less bandwidth, while delivering more updates.** The compact packet is smaller, so more of
+it fits through, which is why the update count went up rather than staying level.
+
+The 1.45× here is smaller than the 1.9× the earlier table predicts, and that is expected: with 2,000
+players about half the zone-wide ids are still under 1023 and get the 11 byte batched form anyway. At
+ten thousand every id is above it, and the comparison becomes the full 21 against 11.3.
+
+### What it cost to get right
+
+The slot is taken and given up inside `SetPlayerArena`, together with membership of the arena's player
+list, so the two cannot disagree. Two places needed more than a rename:
+
+**`Player.Attached`** holds a client-visible id and was compared against a zone-wide one. Both sides
+now use the slot.
+
+**Chat stamped one packet with one id for a whole set of recipients**, and mod chat goes to staff
+across the zone. A recipient in another arena would have resolved that id to one of *their* arena's
+players and attributed the message to them. Recipients outside the sender's arena are now sent -1.
+
+The debug auditor earned its keep twice here. It caught that a player let into a full arena ends up
+with no slot and therefore invisible — now refused at the authorization step instead, under the write
+lock so two players cannot take the last place at once. Fake players still bypass that, so they can
+exceed the cap; that is reported where it happens and the auditor no longer requires every player to
+hold a slot, only that a slot held points back at its holder.
+
+Verified under 600 clients with weapons and deaths at a deliberately small cap of 64, so slots were
+being recycled constantly: no assertion failures.
+
+### Still unverified
+
+**No real Continuum client has been tested against this.** The specific risk is that a client may keep
+its player table across an arena change rather than rebuilding it from the entering list. If so,
+problems appear only when switching arenas, not at login — so a smoke test that logs in and flies
+around will pass while the feature is broken. That is why it is off by default.
+
 ## Two things the load client was getting wrong
 
 Both were found chasing figures that did not add up, and both were making the server look better than
