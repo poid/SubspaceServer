@@ -15,9 +15,43 @@ namespace SS.Core.Modules
     public sealed class PlayerData : IModule, IModuleLoaderAware, IPlayerData
     {
         internal readonly IComponentBroker Broker;
+        private readonly IConfigManager _configManager;
         private readonly ILogManager _logManager;
         private readonly IMainloop _mainloop;
         private InterfaceRegistrationToken<IPlayerData>? _iPlayerDataToken;
+
+        /// <summary>
+        /// Whether the ids clients see are per arena rather than zone-wide.
+        /// </summary>
+        private bool _useArenaLocalPlayerIds;
+
+        /// <summary>
+        /// The most slots an arena may hand out, which is the highest arena-local id plus one.
+        /// </summary>
+        private int _maxArenaSlots;
+
+        /// <summary>
+        /// The hard ceiling on arena slots.
+        /// </summary>
+        /// <remarks>
+        /// Set by the wire formats rather than chosen. The compact position packet carries the id in a
+        /// single byte, so an id above 255 costs a packet that is twice the size, which is the entire
+        /// reason for having arena-local ids at all. Allowing a cap above this would defeat it.
+        /// </remarks>
+        public const int MaxArenaSlotCeiling = 256;
+
+        /// <summary>
+        /// How long a freed arena slot is left alone before it can be given to someone else.
+        /// </summary>
+        /// <remarks>
+        /// Position packets are unreliable and one can still be in flight when its sender leaves. Handing
+        /// their slot straight to the next arrival would have that packet arrive naming someone else, and
+        /// a stray ship appear for a frame. Two seconds is far longer than any packet survives.
+        /// <para>
+        /// Related to <see cref="PlayerReuseDelay"/>, which does the same for zone-wide ids.
+        /// </para>
+        /// </remarks>
+        private static readonly TimeSpan ArenaSlotQuarantine = TimeSpan.FromSeconds(2);
 
         // Optional dependencies
         private IServerMetrics? _serverMetrics;
@@ -77,10 +111,12 @@ namespace SS.Core.Modules
 
         public PlayerData(
             IComponentBroker broker,
+            IConfigManager configManager,
             ILogManager logManager,
             IMainloop mainloop)
         {
             Broker = broker ?? throw new ArgumentNullException(nameof(broker));
+            _configManager = configManager ?? throw new ArgumentNullException(nameof(configManager));
             _logManager = logManager ?? throw new ArgumentNullException(nameof(logManager));
 
             _mainloop = mainloop ?? throw new ArgumentNullException(nameof(mainloop));
@@ -91,9 +127,38 @@ namespace SS.Core.Modules
 
         #region Module Members
 
+        [ConfigHelp<bool>("Net", "UseArenaLocalPlayerIds", ConfigScope.Global, Default = false,
+            Description = """
+                Whether the player ids sent to clients are per arena rather than zone-wide.
+                Zone-wide ids are what this server has always sent and what ASSS sends. They cost
+                bandwidth once a zone gets large: the compact position packet carries the id in one byte
+                and the batched one in ten bits, so above 1023 players online every position update falls
+                back to a packet roughly twice the size. Per arena ids keep every id small no matter how
+                many are online, which measured at roughly half the outbound bandwidth.
+                This changes what clients are told, so it is off by default. Turn it on only after
+                checking a real client against it. See General:MaxPlayers for the cap it needs.
+                """)]
+        [ConfigHelp<int>("General", "MaxPlayers", ConfigScope.Global, Default = 240, Min = 1, Max = MaxArenaSlotCeiling,
+            Description = """
+                The most players allowed in one arena when Net:UseArenaLocalPlayerIds is on.
+                It cannot exceed 256, because that is where the compact position packet's one byte id
+                runs out and the saving disappears. The default leaves a gap below that so a slot freed
+                by someone leaving can be left alone briefly before being reused, which stops a position
+                packet still in flight from arriving named after whoever took the slot next.
+                """)]
         bool IModule.Load(IComponentBroker broker)
         {
             _serverMetrics = broker.GetInterface<IServerMetrics>();
+
+            _useArenaLocalPlayerIds = _configManager.GetBool(_configManager.Global, "Net", "UseArenaLocalPlayerIds", ConfigHelp.Constants.Global.Net.UseArenaLocalPlayerIds.Default);
+
+            _maxArenaSlots = _configManager.GetInt(_configManager.Global, "General", "MaxPlayers", ConfigHelp.Constants.Global.General.MaxPlayers.Default);
+            _maxArenaSlots = Math.Clamp(_maxArenaSlots, 1, MaxArenaSlotCeiling);
+
+            if (_useArenaLocalPlayerIds)
+            {
+                _logManager.LogM(LogLevel.Info, nameof(PlayerData), $"Player ids sent to clients are per arena, capped at {_maxArenaSlots} per arena. See Net:UseArenaLocalPlayerIds.");
+            }
 
             _iPlayerDataToken = broker.RegisterInterface<IPlayerData>(this);
             return true;
@@ -283,6 +348,21 @@ namespace SS.Core.Modules
                     {
                         Debug.Assert(ReferenceEquals(player.Arena, arena), $"Arena '{arena.Name}' lists player '{player.Name}', which is not in it.");
                         Debug.Assert(_playerDictionary.ContainsKey(player.Id), $"Arena '{arena.Name}' lists player '{player.Name}', which has been freed.");
+
+                        // The slot table is a second structure keyed the same way as the player list, so
+                        // it is exactly the kind of thing that drifts. What must hold is that a slot
+                        // points back at the player claiming it: if it does not, two players share an id
+                        // and clients see one of them as the other.
+                        //
+                        // Not asserted: that a player has a slot at all. Real players are turned away
+                        // when an arena is full, but fake players are put into an arena directly and can
+                        // exceed the cap. That is reported as an error where it happens, and leaves the
+                        // fake player unseen rather than impersonating anyone.
+                        if (_useArenaLocalPlayerIds && player.ArenaSlot >= 0)
+                        {
+                            Debug.Assert(ReferenceEquals(arena.PlayerFromSlot(player.ArenaSlot), player), $"Arena '{arena.Name}' slot {player.ArenaSlot} does not hold '{player.Name}', which claims it.");
+                            Debug.Assert(player.Packet.PlayerId == player.ArenaSlot, $"Player '{player.Name}' has slot {player.ArenaSlot} but its entering packet says {player.Packet.PlayerId}.");
+                        }
                     }
                 }
             }
@@ -300,9 +380,44 @@ namespace SS.Core.Modules
             if (current == arena)
                 return;
 
-            current?.RemovePlayer(player);
+            // The slot is given up and taken here, with the arena membership, so that the two cannot
+            // disagree: a player is in an arena's player list exactly when they hold a slot in it. That
+            // is one invariant for the auditor to check rather than two that could drift apart.
+            if (current is not null)
+            {
+                current.ReleaseSlot(player);
+                current.RemovePlayer(player);
+            }
+
             player.SetArena(arena);
-            arena?.AddPlayer(player);
+
+            if (arena is not null)
+            {
+                arena.AddPlayer(player);
+
+                if (_useArenaLocalPlayerIds)
+                {
+                    short slot = arena.AllocateSlot(player, _maxArenaSlots, ArenaSlotQuarantine);
+
+                    if (slot < 0)
+                    {
+                        // Every slot taken. The arena is over its cap, which the entry path is supposed
+                        // to have stopped, so say so rather than letting the player be invisible.
+                        _logManager.LogP(LogLevel.Error, nameof(PlayerData), player,
+                            $"No arena slot free in '{arena.Name}' (cap {_maxArenaSlots}); the player will not be visible to others.");
+                    }
+
+                    player.SetArenaSlot(slot);
+                }
+                else
+                {
+                    player.SetArenaSlot((short)player.Id);
+                }
+            }
+            else
+            {
+                player.SetArenaSlot(-1);
+            }
         }
 
         #endregion
@@ -508,6 +623,8 @@ namespace SS.Core.Modules
             }
         }
 
+        int IPlayerData.MaxArenaPlayers => _useArenaLocalPlayerIds ? _maxArenaSlots : 0;
+
         Player? IPlayerData.PidToPlayer(int pid)
         {
             Lock();
@@ -516,6 +633,29 @@ namespace SS.Core.Modules
             {
                 _playerDictionary.TryGetValue(pid, out Player? player);
                 return player;
+            }
+            finally
+            {
+                Unlock();
+            }
+        }
+
+        Player? IPlayerData.PidToPlayer(Arena arena, int pid)
+        {
+            ArgumentNullException.ThrowIfNull(arena);
+
+            Lock();
+
+            try
+            {
+                if (_useArenaLocalPlayerIds)
+                    return arena.PlayerFromSlot(pid);
+
+                // Zone-wide ids, so the pid names anyone in the zone. Callers want a player in this
+                // arena, and every one of them checked that for itself before this overload existed,
+                // so the check belongs here now rather than repeated at each of them.
+                _playerDictionary.TryGetValue(pid, out Player? player);
+                return player is not null && player.Arena == arena ? player : null;
             }
             finally
             {

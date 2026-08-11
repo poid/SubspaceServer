@@ -998,8 +998,8 @@ namespace SS.Core.Modules
             }
             else
             {
-                Player? toPlayer = _playerData.PidToPlayer(toPlayerId);
-                if (toPlayer is not null && toPlayer.Status == PlayerState.Playing && player.Arena == toPlayer.Arena)
+                Player? toPlayer = _playerData.PidToPlayer(arena, toPlayerId);
+                if (toPlayer is not null && toPlayer.Status == PlayerState.Playing)
                 {
                     _network.SendToOne(toPlayer, data[4..], NetSendFlags.Reliable);
                 }

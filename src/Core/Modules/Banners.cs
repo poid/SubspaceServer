@@ -305,7 +305,7 @@ namespace SS.Core.Modules
                     || pd.Status == BannerStatus.PendingClear)
                 {
                     // Send the change to everyone.
-                    S2C_Banner packet = new((short)player.Id, ref pd.Banner);
+                    S2C_Banner packet = new(player.ArenaSlot, ref pd.Banner);
                     _network.SendToArena(arena, null, ref packet, NetSendFlags.Reliable | NetSendFlags.PriorityN1);
 
                     if (pd.Status == BannerStatus.Pending)

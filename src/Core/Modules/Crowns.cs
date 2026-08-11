@@ -98,7 +98,7 @@ namespace SS.Core.Modules
             player.Packet.HasCrown = true;
             CrownToggledCallback.Fire(arena, player, true);
 
-            S2C_Crown onPacket = new(CrownAction.On, duration, (short)player.Id);
+            S2C_Crown onPacket = new(CrownAction.On, duration, player.ArenaSlot);
             _network.SendToArena(arena, null, ref onPacket, NetSendFlags.Reliable);
         }
 
@@ -173,7 +173,7 @@ namespace SS.Core.Modules
             {
                 player.Packet.HasCrown = false;
 
-                S2C_Crown offPacket = new(CrownAction.Off, TimeSpan.Zero, (short)player.Id);
+                S2C_Crown offPacket = new(CrownAction.Off, TimeSpan.Zero, player.ArenaSlot);
                 _network.SendToArena(arena, null, ref offPacket, NetSendFlags.Reliable);
             }
 

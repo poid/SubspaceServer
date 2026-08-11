@@ -3,7 +3,6 @@ using SS.Core.Modules;
 using SS.Packets.Game;
 using SS.Utilities;
 using System;
-using System.Collections.Concurrent;
 using System.Collections.Specialized;
 using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
@@ -339,6 +338,28 @@ namespace SS.Core
         /// </summary>
         public readonly int Id;
 
+        /// <summary>
+        /// The id the clients in this player's arena know them by, or -1 when not in an arena.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// This is the id that goes on the wire, and the only one a client ever sees. <see cref="Id"/> is
+        /// the zone-wide identity used for the billing server, persistence, logging and anything else
+        /// that has to mean the same thing across arenas, and never leaves the server.
+        /// </para>
+        /// <para>
+        /// When Net:UseArenaLocalPlayerIds is off this is simply <see cref="Id"/>, so the wire is exactly
+        /// as it was. When it is on this is a slot within the arena, which keeps it small: the position
+        /// packet formats carry the id in a byte or in ten bits, and a zone with more than 1023 players
+        /// online otherwise has to use a packet twice the size for every position update.
+        /// </para>
+        /// <para>
+        /// Valid only while <see cref="Arena"/> is not null. Assigned and cleared together with arena
+        /// membership, under the player write lock, so the two can never disagree.
+        /// </para>
+        /// </remarks>
+        public short ArenaSlot { get; internal set; } = -1;
+
         internal readonly PlayerData Manager;
 
         /// <summary>
@@ -628,26 +649,44 @@ namespace SS.Core
         /// </summary>
         public ServerTick NextRespawn { get; internal set; }
 
+        /// <summary>
+        /// Extra flags about a player that don't have a better place to go.
+        /// </summary>
+        /// <remarks>
+        /// The flags are held in two words rather than one, split by which thread writes them.
+        /// <para>
+        /// Setting a bit is a read-modify-write of the whole word, so two threads setting different bits
+        /// of the same word can lose one of the writes. Every one of these is written on the mainloop
+        /// today, so the split changes nothing now. It matters once arena game logic runs on arena
+        /// threads: the gameplay flags move with it while the life-cycle flags stay on the mainloop, and
+        /// sharing a word would make every ship change able to silently clear <see cref="Authenticated"/>.
+        /// </para>
+        /// <para>
+        /// A flag that is written from both sides therefore belongs in the gameplay word, and the two
+        /// writers must be kept apart by the player's life-cycle state rather than by this split.
+        /// <see cref="SentPositionPacket"/> and <see cref="SentWeaponPacket"/> are the two of those: the
+        /// game logic sets them, and the life cycle clears them on arena entry.
+        /// </para>
+        /// </remarks>
         public class PlayerFlags
         {
-            private BitVector32 flagVector = new(0);
+            /// <summary>
+            /// Flags written by the player and arena life cycle, which runs on the mainloop.
+            /// </summary>
+            private BitVector32 lifeCycleFlagVector = new(0);
+
+            /// <summary>
+            /// Flags written by arena game logic, which runs on the thread that owns the arena.
+            /// </summary>
+            private BitVector32 gameplayFlagVector = new(0);
 
             /// <summary>
             /// if the player has been authenticated by either a billing server or a password file
             /// </summary>
             public bool Authenticated
             {
-                get { return flagVector[BitVector32Masks.GetMask(0)]; }
-                internal set { flagVector[BitVector32Masks.GetMask(0)] = value; }
-            }
-
-            /// <summary>
-            /// This is set when the player has changed freqs or ships, but before he has acknowledged it.
-            /// </summary>
-            public bool DuringChange
-            {
-                get { return flagVector[BitVector32Masks.GetMask(1)]; }
-                internal set { flagVector[BitVector32Masks.GetMask(1)] = value; }
+                get { return lifeCycleFlagVector[BitVector32Masks.GetMask(0)]; }
+                internal set { lifeCycleFlagVector[BitVector32Masks.GetMask(0)] = value; }
             }
 
             /// <summary>
@@ -655,8 +694,8 @@ namespace SS.Core
             /// </summary>
             public bool WantAllLvz
             {
-                get { return flagVector[BitVector32Masks.GetMask(2)]; }
-                internal set { flagVector[BitVector32Masks.GetMask(2)] = value; }
+                get { return lifeCycleFlagVector[BitVector32Masks.GetMask(1)]; }
+                internal set { lifeCycleFlagVector[BitVector32Masks.GetMask(1)] = value; }
             }
 
             /// <summary>
@@ -664,62 +703,8 @@ namespace SS.Core
             /// </summary>
             public bool DuringQuery
             {
-                get { return flagVector[BitVector32Masks.GetMask(3)]; }
-                internal set { flagVector[BitVector32Masks.GetMask(3)] = value; }
-            }
-
-            /// <summary>
-            /// if the player's lag is too high to let him be in a ship
-            /// </summary>
-            public bool NoShip
-            {
-                get { return flagVector[BitVector32Masks.GetMask(4)]; }
-                internal set { flagVector[BitVector32Masks.GetMask(4)] = value; }
-            }
-
-            /// <summary>
-            /// if the player's lag is too high to let him have flags or balls
-            /// </summary>
-            public bool NoFlagsBalls
-            {
-                get { return flagVector[BitVector32Masks.GetMask(5)]; }
-                internal set { flagVector[BitVector32Masks.GetMask(5)] = value; }
-            }
-
-            /// <summary>
-            /// if the player has sent a position packet since entering the arena
-            /// </summary>
-            public bool SentPositionPacket
-            {
-                get { return flagVector[BitVector32Masks.GetMask(6)]; }
-                internal set { flagVector[BitVector32Masks.GetMask(6)] = value; }
-            }
-
-            /// <summary>
-            /// if the player has sent a position packet with a weapon since this flag was reset
-            /// </summary>
-            public bool SentWeaponPacket
-            {
-                get { return flagVector[BitVector32Masks.GetMask(7)]; }
-                internal set { flagVector[BitVector32Masks.GetMask(7)] = value; }
-            }
-
-            /// <summary>
-            /// if the player is a bot who wants all position packets
-            /// </summary>
-            public bool SeeAllPositionPackets
-            {
-                get { return flagVector[BitVector32Masks.GetMask(8)]; }
-                internal set { flagVector[BitVector32Masks.GetMask(8)] = value; }
-            }
-
-            /// <summary>
-            /// if the player is a bot who wants his own position packets
-            /// </summary>
-            public bool SeeOwnPosition
-            {
-                get { return flagVector[BitVector32Masks.GetMask(9)]; }
-                internal set { flagVector[BitVector32Masks.GetMask(9)] = value; }
+                get { return lifeCycleFlagVector[BitVector32Masks.GetMask(2)]; }
+                internal set { lifeCycleFlagVector[BitVector32Masks.GetMask(2)] = value; }
             }
 
             /// <summary>
@@ -727,8 +712,8 @@ namespace SS.Core
             /// </summary>
             public bool LeaveArenaWhenDoneWaiting
             {
-                get { return flagVector[BitVector32Masks.GetMask(10)]; }
-                internal set { flagVector[BitVector32Masks.GetMask(10)] = value; }
+                get { return lifeCycleFlagVector[BitVector32Masks.GetMask(3)]; }
+                internal set { lifeCycleFlagVector[BitVector32Masks.GetMask(3)] = value; }
             }
 
             /// <summary>
@@ -736,8 +721,71 @@ namespace SS.Core
             /// </summary>
             public bool ObscenityFilter
             {
-                get { return flagVector[BitVector32Masks.GetMask(11)]; }
-                internal set { flagVector[BitVector32Masks.GetMask(11)] = value; }
+                get { return lifeCycleFlagVector[BitVector32Masks.GetMask(4)]; }
+                internal set { lifeCycleFlagVector[BitVector32Masks.GetMask(4)] = value; }
+            }
+
+            /// <summary>
+            /// This is set when the player has changed freqs or ships, but before he has acknowledged it.
+            /// </summary>
+            public bool DuringChange
+            {
+                get { return gameplayFlagVector[BitVector32Masks.GetMask(0)]; }
+                internal set { gameplayFlagVector[BitVector32Masks.GetMask(0)] = value; }
+            }
+
+            /// <summary>
+            /// if the player's lag is too high to let him be in a ship
+            /// </summary>
+            public bool NoShip
+            {
+                get { return gameplayFlagVector[BitVector32Masks.GetMask(1)]; }
+                internal set { gameplayFlagVector[BitVector32Masks.GetMask(1)] = value; }
+            }
+
+            /// <summary>
+            /// if the player's lag is too high to let him have flags or balls
+            /// </summary>
+            public bool NoFlagsBalls
+            {
+                get { return gameplayFlagVector[BitVector32Masks.GetMask(2)]; }
+                internal set { gameplayFlagVector[BitVector32Masks.GetMask(2)] = value; }
+            }
+
+            /// <summary>
+            /// if the player has sent a position packet since entering the arena
+            /// </summary>
+            public bool SentPositionPacket
+            {
+                get { return gameplayFlagVector[BitVector32Masks.GetMask(3)]; }
+                internal set { gameplayFlagVector[BitVector32Masks.GetMask(3)] = value; }
+            }
+
+            /// <summary>
+            /// if the player has sent a position packet with a weapon since this flag was reset
+            /// </summary>
+            public bool SentWeaponPacket
+            {
+                get { return gameplayFlagVector[BitVector32Masks.GetMask(4)]; }
+                internal set { gameplayFlagVector[BitVector32Masks.GetMask(4)] = value; }
+            }
+
+            /// <summary>
+            /// if the player is a bot who wants all position packets
+            /// </summary>
+            public bool SeeAllPositionPackets
+            {
+                get { return gameplayFlagVector[BitVector32Masks.GetMask(5)]; }
+                internal set { gameplayFlagVector[BitVector32Masks.GetMask(5)] = value; }
+            }
+
+            /// <summary>
+            /// if the player is a bot who wants his own position packets
+            /// </summary>
+            public bool SeeOwnPosition
+            {
+                get { return gameplayFlagVector[BitVector32Masks.GetMask(6)]; }
+                internal set { gameplayFlagVector[BitVector32Masks.GetMask(6)] = value; }
             }
 
             /// <summary>
@@ -745,13 +793,14 @@ namespace SS.Core
             /// </summary>
             public bool IsDead
             {
-                get { return flagVector[BitVector32Masks.GetMask(12)]; }
-                internal set { flagVector[BitVector32Masks.GetMask(12)] = value; }
+                get { return gameplayFlagVector[BitVector32Masks.GetMask(7)]; }
+                internal set { gameplayFlagVector[BitVector32Masks.GetMask(7)] = value; }
             }
 
             internal void Initialize()
             {
-                flagVector = new(0);
+                lifeCycleFlagVector = new(0);
+                gameplayFlagVector = new(0);
             }
         }
 
@@ -781,8 +830,25 @@ namespace SS.Core
             Initialize();
         }
 
+        /// <summary>
+        /// Sets the id this player appears as to clients, and stamps it into the entering packet.
+        /// </summary>
+        /// <remarks>
+        /// The entering packet carries the id, and it is what the arena's jumbo player list is built
+        /// from, so it has to be re-stamped every time the slot changes rather than once when the player
+        /// is created. Miss this and the list handed to an entering client names everyone by whatever id
+        /// they had in some previous arena, which is silent and completely wrong.
+        /// </remarks>
+        /// <param name="arenaSlot">The id, or -1 when leaving an arena.</param>
+        internal void SetArenaSlot(short arenaSlot)
+        {
+            ArenaSlot = arenaSlot;
+            _packet.PlayerId = arenaSlot >= 0 ? arenaSlot : (short)Id;
+        }
+
         internal void Initialize()
         {
+            ArenaSlot = -1;
             _packet = new() { Type = (byte)S2CPacketType.PlayerEntering, PlayerId = (short)Id };
             Ship = ShipType.Spec;
             Freq = -1;
@@ -818,7 +884,7 @@ namespace SS.Core
             LastDeath = 0;
             NextRespawn = 0;
             Flags.Initialize();
-            _extraData.Clear();
+            Array.Clear(_extraData);
         }
 
         /// <summary>
@@ -839,12 +905,23 @@ namespace SS.Core
         #region Extra Data (Per-Player Data)
 
         /// <summary>
-        /// Used to store Per Player Data (PPD). 
+        /// Used to store Per Player Data (PPD), indexed by the key id.
         /// </summary>
         /// <remarks>
-        /// Using ConcurrentDictionary to allow multiple readers and 1 writer (the PlayerData module).
+        /// The keys are dense, sequential ints handed out by <see cref="Modules.PlayerData"/>, so this is
+        /// an array rather than a dictionary. That matters because it is read in the position fan-out's
+        /// inner loop, which at two thousand players is around two million lookups a second, and at ten
+        /// thousand would be far more. An array index is a great deal cheaper than a hash probe.
+        /// <para>
+        /// There are many readers on several threads and one writer, the <see cref="Modules.PlayerData"/>
+        /// module, which is serialized with itself by its own write lock. Readers are safe without any
+        /// lock because reference reads and writes are atomic, and because growing the array replaces it
+        /// rather than resizing it in place: a reader holding the previous array sees the values it
+        /// already had, and a key too new to be in it simply reads as absent, which is what a dictionary
+        /// would have done as well.
+        /// </para>
         /// </remarks>
-        private readonly ConcurrentDictionary<int, object> _extraData = new(-1, Constants.TargetPlayerExtraDataCount);
+        private object?[] _extraData = new object?[Constants.TargetPlayerExtraDataCount];
 
         /// <summary>
         /// Attempts to get extra data with the specified key.
@@ -855,8 +932,13 @@ namespace SS.Core
         /// <returns>True if the data was found and was of type <typeparamref name="T"/>. Otherwise, false.</returns>
         public bool TryGetExtraData<T>(PlayerDataKey<T> key, [MaybeNullWhen(false)] out T data) where T : class
         {
-            if (_extraData.TryGetValue(key.Id, out object? obj)
-                && obj is T tData)
+            // Read the reference once. It can be replaced by a concurrent grow, and every later use has
+            // to be of the same array as the bounds check.
+            object?[] extraData = Volatile.Read(ref _extraData);
+
+            int keyId = key.Id;
+            if ((uint)keyId < (uint)extraData.Length
+                && extraData[keyId] is T tData)
             {
                 data = tData;
                 return true;
@@ -869,25 +951,55 @@ namespace SS.Core
         /// <summary>
         /// Sets extra data.
         /// </summary>
-        /// <remarks>Only to be used by the <see cref="PlayerData"/> module.</remarks>
+        /// <remarks>Only to be used by the <see cref="PlayerData"/> module, which serializes calls to this
+        /// with its own write lock.</remarks>
         /// <param name="keyId">Id of the data to set.</param>
         /// <param name="data">The data to set.</param>
         /// <exception cref="ArgumentNullException"><paramref name="data"/> was null.</exception>
         internal void SetExtraData(int keyId, object data)
         {
-            _extraData[keyId] = data ?? throw new ArgumentNullException(nameof(data));
+            ArgumentNullException.ThrowIfNull(data);
+
+            object?[] extraData = _extraData;
+
+            if ((uint)keyId >= (uint)extraData.Length)
+            {
+                // Grow by replacing rather than resizing in place, so that a reader either sees the whole
+                // old array or the whole new one. Publishing the reference last is what makes the copied
+                // contents visible to a reader that picks up the new array.
+                object?[] grown = new object?[Math.Max(keyId + 1, extraData.Length * 2)];
+                Array.Copy(extraData, grown, extraData.Length);
+                grown[keyId] = data;
+
+                Volatile.Write(ref _extraData, grown);
+                return;
+            }
+
+            extraData[keyId] = data;
         }
 
         /// <summary>
         /// Removes extra data.
         /// </summary>
-        /// <remarks>Only to be used by the <see cref="PlayerData"/> module.</remarks>
+        /// <remarks>Only to be used by the <see cref="PlayerData"/> module, which serializes calls to this
+        /// with its own write lock.</remarks>
         /// <param name="keyId">Id of the data to remove.</param>
         /// <param name="data">The data removed, or the default value if nothing was removed.</param>
         /// <returns><see langword="true"/> if the data was removed; otherwise <see langword="false"/>.</returns>
         internal bool TryRemoveExtraData(int keyId, [MaybeNullWhen(false)] out object data)
         {
-            return _extraData.TryRemove(keyId, out data);
+            object?[] extraData = _extraData;
+
+            if ((uint)keyId < (uint)extraData.Length
+                && extraData[keyId] is object existing)
+            {
+                extraData[keyId] = null;
+                data = existing;
+                return true;
+            }
+
+            data = default;
+            return false;
         }
 
         #endregion

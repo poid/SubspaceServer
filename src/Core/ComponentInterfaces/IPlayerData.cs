@@ -99,11 +99,42 @@ namespace SS.Core.ComponentInterfaces
         void KickPlayer(Player player);
 
         /// <summary>
+        /// The most players allowed in one arena, or 0 when there is no limit.
+        /// </summary>
+        /// <remarks>
+        /// Only limited when Net:UseArenaLocalPlayerIds is on, where the arena has a fixed number of
+        /// slots to hand out and a player without one cannot be seen by anyone. See General:MaxPlayers.
+        /// </remarks>
+        int MaxArenaPlayers { get; }
+
+        /// <summary>
         /// Finds the player with the given pid.
         /// </summary>
+        /// <remarks>
+        /// This is the zone-wide id, which is what the billing server, persistence and logging use. For
+        /// a pid that came from a client, use <see cref="PidToPlayer(Arena, int)"/> instead: the two are
+        /// the same today but differ when Net:UseArenaLocalPlayerIds is on.
+        /// </remarks>
         /// <param name="pid">the pid to find</param>
         /// <returns>the player with the given pid, or null if not found</returns>
         Player? PidToPlayer(int pid);
+
+        /// <summary>
+        /// Finds the player that a client in a given arena means by a pid.
+        /// </summary>
+        /// <remarks>
+        /// For pids that arrived from a client, which name a player as that client knows them. That is
+        /// the zone-wide id normally, and a slot within the arena when Net:UseArenaLocalPlayerIds is on.
+        /// <para>
+        /// The result is always a player in <paramref name="arena"/>, or <see langword="null"/>. Callers
+        /// that used to check the result was in the same arena no longer need to, though doing so is
+        /// harmless.
+        /// </para>
+        /// </remarks>
+        /// <param name="arena">The arena the client that sent the pid is in.</param>
+        /// <param name="pid">The pid, as it appeared on the wire.</param>
+        /// <returns>The player, or <see langword="null"/> if there is no such player in that arena.</returns>
+        Player? PidToPlayer(Arena arena, int pid);
 
         /// <summary>
         /// Finds the player with the given name.

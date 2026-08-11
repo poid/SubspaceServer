@@ -61,6 +61,24 @@ namespace SS.Core.Modules
         private IPersist? _persist;
         private IServerMetrics? _serverMetrics;
 
+        /// <summary>
+        /// For running the position broadcast on the arena's own thread rather than the mainloop.
+        /// </summary>
+        /// <remarks>
+        /// Optional. When it is not available the broadcast is done inline, exactly as it always was.
+        /// </remarks>
+        private IArenaLoop? _arenaLoop;
+
+        /// <summary>
+        /// Cached so that queuing a broadcast does not allocate a delegate for each one, of which there
+        /// are tens of thousands a second.
+        /// </summary>
+        /// <remarks>
+        /// Assigned in <see cref="IAsyncModule.LoadAsync"/> rather than initialized with the field,
+        /// because a field initializer cannot bind a delegate to an instance method.
+        /// </remarks>
+        private Action<PositionBroadcast>? _arenaWork_BroadcastPosition;
+
         private InterfaceRegistrationToken<IGame>? _iGameToken;
 
         private PlayerDataKey<PlayerData> _pdKey;
@@ -84,6 +102,9 @@ namespace SS.Core.Modules
             _commandManager = broker.GetInterface<ICommandManager>();
             _persist = broker.GetInterface<IPersist>();
             _serverMetrics = broker.GetInterface<IServerMetrics>();
+            _arenaLoop = broker.GetInterface<IArenaLoop>();
+
+            _arenaWork_BroadcastPosition = BroadcastPosition;
 
             _adKey = _arenaManager.AllocateArenaData<ArenaData>();
             _pdKey = _playerData.AllocatePlayerData<PlayerData>();
@@ -206,6 +227,11 @@ namespace SS.Core.Modules
             if (_serverMetrics is not null)
             {
                 broker.ReleaseInterface(ref _serverMetrics);
+            }
+
+            if (_arenaLoop is not null)
+            {
+                broker.ReleaseInterface(ref _arenaLoop);
             }
 
             if (_persist is not null)
@@ -619,7 +645,7 @@ namespace SS.Core.Modules
             if (arena is null)
                 return;
 
-            S2C_TurretKickoff packet = new((short)player.Id);
+            S2C_TurretKickoff packet = new(player.ArenaSlot);
             _network.SendToArena(arena, null, ref packet, NetSendFlags.Reliable);
 
             TurretKickoffCallback.Fire(arena, player);
@@ -1432,6 +1458,124 @@ namespace SS.Core.Modules
                     sendFlags = NetSendFlags.Reliable;
                 }
 
+                _playerData.Lock();
+
+                try
+                {
+                    // have to do this check inside pd->Lock();
+                    // ignore packets from the first 500ms of death, and accept packets up to 500ms
+                    // before their expected respawn.
+                    if (player.Flags.IsDead && gtc - player.LastDeath >= 50 && player.NextRespawn - gtc <= 50)
+                    {
+                        player.Flags.IsDead = false;
+                        DoSpawnCallback(player, SpawnCallback.SpawnReason.AfterDeath);
+                    }
+                }
+                finally
+                {
+                    _playerData.Unlock();
+                }
+
+                // Everything above changed this player's state and has to be on the mainloop. What is
+                // left is sending the position to everyone who can see it, which is the expensive part
+                // and does not change anything shared, so it can be done on the arena's own thread.
+                PositionBroadcast broadcast = _objectPoolManager.GetPool<PositionBroadcast>().Get();
+                broadcast.Set(arena, player, in pos, in extra, hasExtra, x1, y1, latency, randnum, gtc, sendToAll, sendBounty, sendFlags, arenaData, advisors);
+
+                IArenaLoop? arenaLoop = _arenaLoop;
+                Action<PositionBroadcast>? arenaWork = _arenaWork_BroadcastPosition;
+
+                if (arenaLoop is null || arenaWork is null || !arenaLoop.QueueSheddableArenaWorkItem(arena, arenaWork, broadcast))
+                {
+                    // Either arena threads are not in use, or the arena's queue is too far behind to take
+                    // it. Doing it here costs the mainloop the time it was meant to save, which is still
+                    // better than the player not being seen.
+                    BroadcastPosition(broadcast);
+                }
+
+                PlayerPositionPacketCallback.Fire(arena, player, ref pos, ref extra, hasExtra);
+            }
+
+            playerData.LastPositionPacketShip = player.Ship;
+
+            if (sendBounty)
+            {
+                playerData.BountyLastSent = gtc;
+            }
+
+            // local function that checks if a player is carrying a ball
+            bool IsCarryingBall(Player player, Arena arena)
+            {
+                IBalls? balls = _broker.GetInterface<IBalls>();
+                if (balls is null)
+                    return false;
+
+                try
+                {
+                    if (!balls.TryGetBallSettings(arena, out BallSettings ballSettings))
+                        return false;
+
+                    int ballCount = ballSettings.BallCount;
+                    for (int ballId = 0; ballId < ballCount; ballId++)
+                    {
+                        if (!balls.TryGetBallData(arena, ballId, out BallData ballData))
+                            continue;
+
+                        if (ballData.State == BallState.Carried && ballData.Carrier == player)
+                            return true;
+                    }
+
+                    return false;
+                }
+                finally
+                {
+                    _broker.ReleaseInterface(ref balls);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Sends a player's position to everyone in the arena who can see it.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// This is the single most expensive thing the server does. It runs once per position packet per
+        /// player, and at two thousand players it was walking around a hundred candidates and issuing
+        /// 1.7 million individual sends a second, all on the mainloop.
+        /// </para>
+        /// <para>
+        /// It is safe away from the mainloop because it changes nothing that is shared. The packet it
+        /// builds lives on this thread's stack, and its only two effects on anything else are
+        /// <see cref="INetwork.SendToOne"/> and <see cref="ILagCollect.IncrementWeaponSentCount"/>, both
+        /// of which are safe to call from any thread. Everything it reads on other players it only reads,
+        /// under a lock that several threads already hold at once.
+        /// </para>
+        /// <para>
+        /// The sending player's own state is taken as a copy rather than read here, because the mainloop
+        /// is free to carry on and handle their next packet while this runs.
+        /// </para>
+        /// </remarks>
+        /// <param name="broadcast">What to send and to which arena. Returned to its pool before returning.</param>
+        private void BroadcastPosition(PositionBroadcast broadcast)
+        {
+            using (broadcast)
+            {
+                Arena arena = broadcast.Arena!;
+                Player player = broadcast.Player!;
+                ArenaData arenaData = broadcast.ArenaData!;
+                ImmutableArray<IPlayerPositionAdvisor> advisors = broadcast.Advisors;
+                C2S_PositionPacket pos = broadcast.Position;
+                ExtraPositionData extra = broadcast.Extra;
+                bool hasExtra = broadcast.HasExtra;
+                int x1 = broadcast.X;
+                int y1 = broadcast.Y;
+                int latency = broadcast.Latency;
+                int randnum = broadcast.RandomNumber;
+                ServerTick gtc = broadcast.Timestamp;
+                bool sendToAll = broadcast.SendToAll;
+                bool sendBounty = broadcast.SendBounty;
+                NetSendFlags sendFlags = broadcast.SendFlags;
+
                 C2S_PositionPacket posCopy = new();
                 ExtraPositionData extraCopy = new();
                 S2C_BatchedSmallPositionSingle smallSingle = new();
@@ -1455,14 +1599,12 @@ namespace SS.Core.Modules
 
                 try
                 {
-                    // have to do this check inside pd->Lock();
-                    // ignore packets from the first 500ms of death, and accept packets up to 500ms
-                    // before their expected respawn.
-                    if (player.Flags.IsDead && gtc - player.LastDeath >= 50 && player.NextRespawn - gtc <= 50)
-                    {
-                        player.Flags.IsDead = false;
-                        DoSpawnCallback(player, SpawnCallback.SpawnReason.AfterDeath);
-                    }
+                    // The sender can have left, or left the arena, between the packet being handled and
+                    // this running. Checking once here rather than trusting the snapshot costs nothing
+                    // against the loop below, and holding the read lock keeps it true for the rest of it,
+                    // since a player is only freed and their data recycled under the write lock.
+                    if (player.Status != PlayerState.Playing || player.Arena != arena)
+                        return;
 
                     // The arena's own players rather than the zone's, filtered by arena. This runs once
                     // per position packet per player, so scanning the whole zone made the cost of every
@@ -1491,7 +1633,7 @@ namespace SS.Core.Modules
                             if (dist <= range
                                 || sendToAll
                                 || otherPlayerData.Speccing == player // always send to spectators of the player
-                                || otherPlayer.Attached == player.Id // always send to turreters
+                                || otherPlayer.Attached == player.ArenaSlot // always send to turreters
                                 || (pos.Weapon.Type == WeaponCodes.Null
                                     && dist < arenaData.PositionPixels
                                     && randnum > ((double)dist / (double)arenaData.PositionPixels * Constants.RandMax + 1d)) // send some radar packets
@@ -1564,7 +1706,7 @@ namespace SS.Core.Modules
                                         && !sendBounty
                                         && posCopy.Status == 0
                                         && extraLength == 0 // no energy or extra data
-                                        && ((uint)player.Id & 0xFFFF_FF00) == 0 // PlayerId [0-255]
+                                        && ((uint)player.ArenaSlot & 0xFFFF_FF00) == 0 // PlayerId [0-255]
                                         && posCopy.XSpeed >= -8192 && posCopy.XSpeed <= 8191
                                         && posCopy.YSpeed >= -8192 && posCopy.YSpeed <= 8191
                                         && posCopy.X >= 0 && posCopy.X <= 16383
@@ -1574,7 +1716,7 @@ namespace SS.Core.Modules
                                         if (smallDirty || modified)
                                         {
                                             ref SmallPosition small = ref smallSingle.Position;
-                                            small.PlayerId = (byte)player.Id;
+                                            small.PlayerId = (byte)player.ArenaSlot;
                                             small.Rotation = posCopy.Rotation;
                                             small.Time = (ushort)(gtc - (uint)latency);
                                             small.X = posCopy.X;
@@ -1592,7 +1734,7 @@ namespace SS.Core.Modules
                                         && !sendBounty
                                         && ((int)posCopy.Status & 0b11000000) == 0 // only the 6 lower bits
                                         && extraLength == 0 // no energy or extra data
-                                        && ((uint)player.Id & 0xFFFF_FC00) == 0 // PlayerId [0-1023]
+                                        && ((uint)player.ArenaSlot & 0xFFFF_FC00) == 0 // PlayerId [0-1023]
                                         && posCopy.XSpeed >= -8192 && posCopy.XSpeed <= 8191
                                         && posCopy.YSpeed >= -8192 && posCopy.YSpeed <= 8191
                                         && posCopy.X >= 0 && posCopy.X <= 16383
@@ -1603,7 +1745,7 @@ namespace SS.Core.Modules
                                         {
                                             ref LargePosition large = ref largeSingle.Position;
                                             large.Status = posCopy.Status;
-                                            large.PlayerId = (ushort)player.Id;
+                                            large.PlayerId = (ushort)player.ArenaSlot;
                                             large.Rotation = posCopy.Rotation;
                                             large.Time = (ushort)(gtc - (uint)latency);
                                             large.X = posCopy.X;
@@ -1618,7 +1760,7 @@ namespace SS.Core.Modules
                                     }
                                     else if (posCopy.Weapon.Type > 0 // has weapon fire
                                         || (posCopy.Bounty & 0xFF00) != 0 // bounty over 255
-                                        || ((uint)player.Id & 0xFFFF_FF00) != 0) // PlayerId over 255
+                                        || ((uint)player.ArenaSlot & 0xFFFF_FF00) != 0) // PlayerId over 255
                                     {
                                         // 0x05 Weapon
                                         if (wpnDirty || modified)
@@ -1628,7 +1770,7 @@ namespace SS.Core.Modules
                                             wpn.Time = (ushort)(gtc & 0xFFFF);
                                             wpn.X = posCopy.X;
                                             wpn.YSpeed = posCopy.YSpeed;
-                                            wpn.PlayerId = (ushort)player.Id;
+                                            wpn.PlayerId = (ushort)player.ArenaSlot;
                                             wpn.XSpeed = posCopy.XSpeed;
                                             wpn.Checksum = 0;
                                             wpn.Status = posCopy.Status;
@@ -1669,7 +1811,7 @@ namespace SS.Core.Modules
                                             sendPos.X = posCopy.X;
                                             sendPos.C2SLatency = (byte)latency;
                                             sendPos.Bounty = (byte)posCopy.Bounty;
-                                            sendPos.PlayerId = (byte)player.Id;
+                                            sendPos.PlayerId = (byte)player.ArenaSlot;
                                             sendPos.Status = posCopy.Status;
                                             sendPos.YSpeed = posCopy.YSpeed;
                                             sendPos.Y = posCopy.Y;
@@ -1704,45 +1846,6 @@ namespace SS.Core.Modules
                     _serverMetrics.Increment(ServerMetric.PositionPacketsHandled);
                     _serverMetrics.Add(ServerMetric.PositionCandidatesScanned, candidatesScanned);
                     _serverMetrics.Add(ServerMetric.PositionRecipientsInView, recipientsInView);
-                }
-
-                PlayerPositionPacketCallback.Fire(arena, player, ref pos, ref extra, hasExtra);
-            }
-
-            playerData.LastPositionPacketShip = player.Ship;
-
-            if (sendBounty)
-            {
-                playerData.BountyLastSent = gtc;
-            }
-
-            // local function that checks if a player is carrying a ball
-            bool IsCarryingBall(Player player, Arena arena)
-            {
-                IBalls? balls = _broker.GetInterface<IBalls>();
-                if (balls is null)
-                    return false;
-
-                try
-                {
-                    if (!balls.TryGetBallSettings(arena, out BallSettings ballSettings))
-                        return false;
-
-                    int ballCount = ballSettings.BallCount;
-                    for (int ballId = 0; ballId < ballCount; ballId++)
-                    {
-                        if (!balls.TryGetBallData(arena, ballId, out BallData ballData))
-                            continue;
-
-                        if (ballData.State == BallState.Carried && ballData.Carrier == player)
-                            return true;
-                    }
-
-                    return false;
-                }
-                finally
-                {
-                    _broker.ReleaseInterface(ref balls);
                 }
             }
         }
@@ -1809,11 +1912,12 @@ namespace SS.Core.Modules
             lock (_specLock)
             {
                 Player? targetPlayer = null;
-                if (targetPlayerId >= 0)
+                Arena? playerArena = player.Arena;
+                if (targetPlayerId >= 0 && playerArena is not null)
                 {
-                    targetPlayer = _playerData.PidToPlayer(targetPlayerId);
+                    targetPlayer = _playerData.PidToPlayer(playerArena, targetPlayerId);
                     if (targetPlayer is not null
-                        && (targetPlayer.Status != PlayerState.Playing || targetPlayer.Ship == ShipType.Spec || targetPlayer.Arena != player.Arena))
+                        && (targetPlayer.Status != PlayerState.Playing || targetPlayer.Ship == ShipType.Spec))
                     {
                         targetPlayer = null;
                     }
@@ -2051,7 +2155,7 @@ namespace SS.Core.Modules
                 }
             }
 
-            S2C_ShipChange packet = new((sbyte)ship, (short)player.Id, freq);
+            S2C_ShipChange packet = new((sbyte)ship, player.ArenaSlot, freq);
             ReadOnlySpan<byte> data = MemoryMarshal.AsBytes(MemoryMarshal.CreateReadOnlySpan(ref packet, 1));
 
             if (player.IsStandard)
@@ -2125,7 +2229,7 @@ namespace SS.Core.Modules
                 player.Freq = freq;
             }
 
-            S2C_FreqChange packet = new((short)player.Id, freq);
+            S2C_FreqChange packet = new(player.ArenaSlot, freq);
             ReadOnlySpan<byte> data = MemoryMarshal.AsBytes(MemoryMarshal.CreateReadOnlySpan(ref packet, 1));
 
             // him with callback
@@ -2201,8 +2305,8 @@ namespace SS.Core.Modules
             ref readonly C2S_Die packet = ref MemoryMarshal.AsRef<C2S_Die>(data[..C2S_Die.Length]);
             short bounty = packet.Bounty;
 
-            Player? killer = _playerData.PidToPlayer(packet.Killer);
-            if (killer is null || killer.Status != PlayerState.Playing || killer.Arena != arena)
+            Player? killer = _playerData.PidToPlayer(arena, packet.Killer);
+            if (killer is null || killer.Status != PlayerState.Playing)
             {
                 _logManager.LogP(LogLevel.Malicious, nameof(Game), player, $"Reported kill by bad pid {packet.Killer}.");
                 return;
@@ -2434,7 +2538,7 @@ namespace SS.Core.Modules
                 && !(prize == Prize.Burst && (ad.PersonalGreen & PersonalGreen.Burst) == PersonalGreen.Burst)
                 && !(prize == Prize.Brick && (ad.PersonalGreen & PersonalGreen.Brick) == PersonalGreen.Brick))
             {
-                S2C_Green s2c = new(in c2s, (short)player.Id);
+                S2C_Green s2c = new(in c2s, player.ArenaSlot);
                 _network.SendToArena(arena, player, ref s2c, NetSendFlags.Unreliable);
             }
 
@@ -2458,13 +2562,15 @@ namespace SS.Core.Modules
             if (player is null)
                 return;
 
-            short toPlayerId = (short)(to is not null ? to.Id : -1);
+            // Both of these are ids as the clients in this arena know them, because Attached is stored
+            // as it is sent and is compared against other client-facing ids.
+            short toPlayerId = to is not null ? to.ArenaSlot : (short)-1;
 
             // only if state has changed
             if (player.Attached != toPlayerId)
             {
                 // Send the packet
-                S2C_Turret packet = new((short)player.Id, toPlayerId);
+                S2C_Turret packet = new(player.ArenaSlot, toPlayerId);
                 _network.SendToArena(player.Arena, null, ref packet, NetSendFlags.Reliable);
 
                 // Update the state
@@ -2520,12 +2626,11 @@ namespace SS.Core.Modules
             // -1 means detaching
             if (pid2 != -1)
             {
-                to = _playerData.PidToPlayer(pid2);
+                to = _playerData.PidToPlayer(arena, pid2);
 
                 if (to is null
                     || to == player
                     || to.Status != PlayerState.Playing
-                    || player.Arena != to.Arena
                     || player.Freq != to.Freq)
                 {
                     _logManager.LogP(LogLevel.Malicious, nameof(Game), player, $"Tried to attach to bad pid {pid2}.");
@@ -2841,6 +2946,94 @@ namespace SS.Core.Modules
             /// Kick fastbombing player off
             /// </summary>
             Kick = 4,
+        }
+
+        /// <summary>
+        /// One player's position, and everything needed to send it on, taken as a copy so that the
+        /// sending can be done away from the thread that handled the packet.
+        /// </summary>
+        /// <remarks>
+        /// The sending player's state is copied rather than read later, because by the time this runs the
+        /// mainloop may already have handled their next packet. Everything here is therefore either a
+        /// value, or a reference to something that does not change for the life of the broadcast: the
+        /// arena, its settings, and the advisor list, which is an immutable snapshot.
+        /// <para>
+        /// Pooled, since there is one of these per position packet and there are tens of thousands a
+        /// second.
+        /// </para>
+        /// </remarks>
+        private sealed class PositionBroadcast : PooledObject
+        {
+            public Arena? Arena;
+            public Player? Player;
+            public ArenaData? ArenaData;
+            public ImmutableArray<IPlayerPositionAdvisor> Advisors;
+            public C2S_PositionPacket Position;
+            public ExtraPositionData Extra;
+            public bool HasExtra;
+
+            /// <summary>The position the distance checks are measured from, taken before the advisors could edit it.</summary>
+            public int X;
+            public int Y;
+
+            public int Latency;
+
+            /// <summary>Drawn once so that every recipient of one packet makes the same radar decision.</summary>
+            public int RandomNumber;
+
+            public ServerTick Timestamp;
+            public bool SendToAll;
+            public bool SendBounty;
+            public NetSendFlags SendFlags;
+
+            public void Set(
+                Arena arena,
+                Player player,
+                ref readonly C2S_PositionPacket position,
+                ref readonly ExtraPositionData extra,
+                bool hasExtra,
+                int x,
+                int y,
+                int latency,
+                int randomNumber,
+                ServerTick timestamp,
+                bool sendToAll,
+                bool sendBounty,
+                NetSendFlags sendFlags,
+                ArenaData arenaData,
+                ImmutableArray<IPlayerPositionAdvisor> advisors)
+            {
+                Arena = arena;
+                Player = player;
+                Position = position;
+                Extra = extra;
+                HasExtra = hasExtra;
+                X = x;
+                Y = y;
+                Latency = latency;
+                RandomNumber = randomNumber;
+                Timestamp = timestamp;
+                SendToAll = sendToAll;
+                SendBounty = sendBounty;
+                SendFlags = sendFlags;
+                ArenaData = arenaData;
+                Advisors = advisors;
+            }
+
+            protected override void Dispose(bool isDisposing)
+            {
+                if (isDisposing)
+                {
+                    // Only the references need clearing. Leaving them set would keep a player, an arena
+                    // and every position advisor alive for as long as this sits in its pool.
+                    Arena = null;
+                    Player = null;
+                    ArenaData = null;
+                    Advisors = default;
+                }
+
+                base.Dispose(isDisposing);
+            }
         }
 
         private class PlayerData : IResettable

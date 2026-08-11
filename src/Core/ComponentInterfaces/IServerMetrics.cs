@@ -35,6 +35,15 @@ namespace SS.Core.ComponentInterfaces
         /// <summary>Gauge. Work items waiting in the mainloop queue.</summary>
         MainloopQueueDepth,
 
+        /// <summary>Counter. Work items processed by the arena workers, across all of them.</summary>
+        ArenaLoopWorkItemsProcessed,
+
+        /// <summary>
+        /// Counter. Work items rejected because an arena worker's queue was full.
+        /// Any non-zero value means the server is shedding work and the numbers around it are suspect.
+        /// </summary>
+        ArenaLoopWorkItemsDropped,
+
         /// <summary>Counter. Position packets put through the fan-out.</summary>
         PositionPacketsHandled,
 
@@ -60,6 +69,12 @@ namespace SS.Core.ComponentInterfaces
 
         /// <summary>Counter. Send thread iterations that overran their interval, meaning the send thread is falling behind.</summary>
         SendThreadOverruns,
+
+        /// <summary>Gauge. Send threads currently running, which grows with load up to Net:MaxSendThreads.</summary>
+        SendThreadsActive,
+
+        /// <summary>Gauge. What fraction of its interval the busiest send thread spent working, as a percentage.</summary>
+        SendThreadBusiestPercent,
 
         /// <summary>Counter. Read locks taken on the global player data lock.</summary>
         PlayerDataReadLocks,

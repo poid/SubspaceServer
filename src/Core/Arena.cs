@@ -1,6 +1,7 @@
 using CommunityToolkit.HighPerformance.Buffers;
 using SS.Core.ComponentInterfaces;
 using SS.Core.Modules;
+using SS.Utilities;
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
@@ -308,6 +309,124 @@ namespace SS.Core
             ThreadingAssert.PlayerWriteLockHeld(Manager.PlayerData);
 
             _players.Remove(player);
+        }
+
+        /// <summary>
+        /// The player occupying each arena slot, indexed by slot.
+        /// </summary>
+        /// <remarks>
+        /// Only used when arena-local player ids are enabled, in which case a player's slot is the id
+        /// the clients in this arena know them by. Guarded by the same lock as <see cref="_players"/>.
+        /// <para>
+        /// A plain array rather than a dictionary because it is read once per inbound packet that names
+        /// another player, and it is at most a few hundred entries.
+        /// </para>
+        /// <para>
+        /// There is no ASSS equivalent. ASSS uses one zone-wide id space, as this server does when the
+        /// setting is off.
+        /// </para>
+        /// </remarks>
+        private Player?[] _playersBySlot = [];
+
+        /// <summary>
+        /// When each slot was last freed, so that a slot is not handed straight back out.
+        /// </summary>
+        /// <remarks>
+        /// A position packet is unreliable and can still be in flight when its sender leaves. If the slot
+        /// were reused immediately, that packet would arrive naming a player who is now someone else, and
+        /// the recipient would see a stray ship. Leaving a slot alone for a short while makes that
+        /// vanishingly unlikely without needing to track anything in flight.
+        /// </remarks>
+        private ServerTick[] _slotFreedAt = [];
+
+        /// <summary>
+        /// Where to start looking for a free slot, so that allocation walks forward rather than reusing
+        /// the slot just freed.
+        /// </summary>
+        private int _nextSlotHint;
+
+        /// <summary>
+        /// Gets the player occupying a slot in this arena.
+        /// </summary>
+        /// <remarks>
+        /// The caller must hold the global player lock. Only meaningful when arena-local player ids are
+        /// enabled; otherwise the ids on the wire are zone-wide and
+        /// <see cref="ComponentInterfaces.IPlayerData.PidToPlayer(int)"/> resolves them.
+        /// </remarks>
+        /// <param name="slot">The slot, as it appeared on the wire.</param>
+        /// <returns>The player, or <see langword="null"/> if the slot is empty or out of range.</returns>
+        public Player? PlayerFromSlot(int slot)
+        {
+            ThreadingAssert.PlayerLockHeld(Manager.PlayerData);
+
+            Player?[] playersBySlot = _playersBySlot;
+            return (uint)slot < (uint)playersBySlot.Length ? playersBySlot[slot] : null;
+        }
+
+        /// <summary>
+        /// Gives a player a slot in this arena.
+        /// </summary>
+        /// <remarks>Only <see cref="Modules.PlayerData"/> may call this, under the player write lock.</remarks>
+        /// <param name="player">The player to give a slot to.</param>
+        /// <param name="maxSlots">The most slots this arena may hand out.</param>
+        /// <param name="quarantine">How long a freed slot is left alone before being reused.</param>
+        /// <returns>The slot, or -1 when the arena is full.</returns>
+        internal short AllocateSlot(Player player, int maxSlots, TimeSpan quarantine)
+        {
+            ThreadingAssert.PlayerWriteLockHeld(Manager.PlayerData);
+
+            if (_playersBySlot.Length < maxSlots)
+            {
+                Array.Resize(ref _playersBySlot, maxSlots);
+                Array.Resize(ref _slotFreedAt, maxSlots);
+            }
+
+            ServerTick now = ServerTick.Now;
+            uint quarantineTicks = (uint)(quarantine.TotalMilliseconds / 10);
+
+            // Two passes: the first respects the quarantine, the second ignores it. An arena full enough
+            // that every free slot is still cooling down is better served by reusing one than by refusing
+            // entry, which is why the default cap leaves a gap below the hard ceiling.
+            for (int pass = 0; pass < 2; pass++)
+            {
+                for (int i = 0; i < maxSlots; i++)
+                {
+                    int slot = (_nextSlotHint + i) % maxSlots;
+
+                    if (_playersBySlot[slot] is not null)
+                        continue;
+
+                    if (pass == 0 && _slotFreedAt[slot] != 0 && now - _slotFreedAt[slot] < quarantineTicks)
+                        continue;
+
+                    _playersBySlot[slot] = player;
+                    _nextSlotHint = slot + 1;
+                    return (short)slot;
+                }
+            }
+
+            return -1;
+        }
+
+        /// <summary>
+        /// Takes back a player's slot in this arena.
+        /// </summary>
+        /// <remarks>Only <see cref="Modules.PlayerData"/> may call this, under the player write lock.</remarks>
+        /// <param name="player">The player whose slot to take back.</param>
+        internal void ReleaseSlot(Player player)
+        {
+            ThreadingAssert.PlayerWriteLockHeld(Manager.PlayerData);
+
+            int slot = player.ArenaSlot;
+            if ((uint)slot >= (uint)_playersBySlot.Length)
+                return;
+
+            // Only if it is still theirs. Releasing on a stale slot would evict whoever holds it now.
+            if (_playersBySlot[slot] != player)
+                return;
+
+            _playersBySlot[slot] = null;
+            _slotFreedAt[slot] = ServerTick.Now;
         }
 
         /// <summary>

@@ -434,12 +434,18 @@ namespace SS.Core.Modules
                 sb.Append($"  mainloop work: {Read(ServerMetric.MainloopWorkItemsProcessed) / seconds:F0}/s processed, {Read(ServerMetric.MainloopWorkItemsDropped)} dropped, {Read(ServerMetric.MainloopDrainLimitHits)} drain-limit hits");
                 Emit(sb, player);
 
+                sb.Append($"  arena work: {Read(ServerMetric.ArenaLoopWorkItemsProcessed) / seconds:F0}/s processed, {Read(ServerMetric.ArenaLoopWorkItemsDropped)} dropped");
+                Emit(sb, player);
+
                 // Candidates scanned per packet is the headline cost metric, and mean in-view is reported
                 // beside it because the two only mean anything together. See IServerMetrics.
                 sb.Append($"  position: {positionPackets / seconds:F0} pkt/s, {candidatesScanned / seconds:F0} scanned/s, {PerPacket(candidatesScanned, positionPackets):F1} scanned/pkt, {PerPacket(recipientsInView, positionPackets):F1} in-view/pkt");
                 Emit(sb, player);
 
                 sb.Append($"  network: {Read(ServerMetric.NetworkSendToOne) / seconds:F0} SendToOne/s, send thread {Read(ServerMetric.SendThreadIterations) / seconds:F0} iter/s, {Read(ServerMetric.SendThreadOverruns)} overruns");
+                Emit(sb, player);
+
+                sb.Append($"  send threads: {Read(ServerMetric.SendThreadsActive)} running, busiest {Read(ServerMetric.SendThreadBusiestPercent)}% of its interval");
                 Emit(sb, player);
 
                 sb.Append($"  player lock: {Read(ServerMetric.PlayerDataReadLocks) / seconds:F0} read/s, {Read(ServerMetric.PlayerDataWriteLocks) / seconds:F0} write/s, write held {TotalMilliseconds(Read(ServerMetric.PlayerDataWriteLockHeldTicks)):F1}ms");

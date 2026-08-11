@@ -577,7 +577,7 @@ namespace SS.Core.Modules.FlagGame
             if (player.Packet.FlagsCarried == 0)
                 return;
 
-            S2C_FlagDrop flagDropPacket = new((short)player.Id);
+            S2C_FlagDrop flagDropPacket = new(player.ArenaSlot);
             _network.SendToArena(arena, null, ref flagDropPacket, NetSendFlags.Reliable);
 
             AdjustCarriedFlags(
