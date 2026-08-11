@@ -383,12 +383,35 @@ hold a slot, only that a slot held points back at its holder.
 Verified under 600 clients with weapons and deaths at a deliberately small cap of 64, so slots were
 being recycled constantly: no assertion failures.
 
+### Checked against a real Continuum 0.40 client
+
+The risk this was gated on — a client keeping its player table across an arena change rather than
+rebuilding it from the entering list — did not materialise. The test was better than planned, because
+the slot allocator walks forward: re-entering the same arena gave ids 0, then 4, then 5, while the
+bots kept 1 to 3. So the client was repeatedly told it was a different player, which is the hardest
+version of the case.
+
+Working: arena entry, repeated arena switching with the id changing underneath, the player list,
+position updates, spectating, private messages, turret attach, kills, and flag pickup and drop. No
+malicious packets, no errors, no assertion failures across the whole session.
+
+**But it found a bug the automated tests could not, and the way it failed is the lesson.** Dying
+produced no kill message at all — not on screen, not in chat. `S2C_Kill` was still carrying zone-wide
+ids, so the client could not match either id to anyone it knew and silently rendered nothing. There
+was no error on either side: the server sent a well-formed packet, and a client that cannot resolve an
+id has nothing to report. Only a person looking at a screen would ever have caught it.
+
+The first sweep had looked for the id being cast off a variable named `player`. These sites cast off
+`killer`, `killed`, `other` and `carrier`. A sweep for *any* variable's `Id` being narrowed to a wire
+width found six: the kill packet, the banner packet sent for another player, and four flag pickup and
+drop packets.
+
 ### Still unverified
 
-**No real Continuum client has been tested against this.** The specific risk is that a client may keep
-its player table across an arena change rather than rebuilding it from the entering list. If so,
-problems appear only when switching arenas, not at login — so a smoke test that logs in and flies
-around will pass while the feature is broken. That is why it is off by default.
+Anything that needs a **second real client** to observe. Banners, crowns, greens and score updates all
+carry ids, and fake players cannot confirm them because they never receive packets. Given that a wrong
+id shows up as nothing happening rather than as an error, their silence during testing proves nothing.
+That is why this stays off by default.
 
 ## Two things the load client was getting wrong
 

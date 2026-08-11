@@ -136,7 +136,9 @@ namespace SS.Core.Modules
                 back to a packet roughly twice the size. Per arena ids keep every id small no matter how
                 many are online, which measured at roughly half the outbound bandwidth.
                 This changes what clients are told, so it is off by default. Turn it on only after
-                checking a real client against it. See General:MaxPlayers for the cap it needs.
+                checking a real client against it. The common paths have been checked against Continuum
+                0.40 by hand; what has not is anything needing a second real client to see, such as
+                banners and crowns. See General:MaxPlayers for the cap it needs.
                 """)]
         [ConfigHelp<int>("General", "MaxPlayers", ConfigScope.Global, Default = 240, Min = 1, Max = MaxArenaSlotCeiling,
             Description = """
