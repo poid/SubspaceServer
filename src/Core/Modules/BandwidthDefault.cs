@@ -287,11 +287,15 @@ namespace SS.Core.Modules
                 if (_limit >= _settings.LimitHigh)
                     return;
 
-                // Not while the limit is being hit: that means data is already queuing up, and giving a
-                // connection more when it cannot use what it has says nothing about the link.
-                if (_hitLimit)
-                    return;
-
+                // Deliberately regardless of whether the limit is being hit. Hitting it means the server
+                // has more to send than the limit allows, which is evidence the limit is too low, not
+                // that the link is in trouble - AdjustForAck says the same thing by growing four times
+                // faster in that case. The signal that the link cannot take more is a retry, and
+                // AdjustForRetry halves the limit on one.
+                //
+                // Guarding on it, as this first did, is precisely backwards: a connection starved by too
+                // low a limit is hitting it constantly, so it could never grow out of the state the
+                // growth exists to fix.
                 _growthSlices += slices;
                 if (_growthSlices < Granularity)
                     return;
