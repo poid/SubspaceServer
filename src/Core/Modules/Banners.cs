@@ -175,7 +175,7 @@ namespace SS.Core.Modules
                             {
                                 if (opd.Status == BannerStatus.Good)
                                 {
-                                    S2C_Banner packet = new((short)other.Id, ref opd.Banner);
+                                    S2C_Banner packet = new(other.ArenaSlot, ref opd.Banner);
                                     _network.SendToOne(player, ref packet, NetSendFlags.Reliable | NetSendFlags.PriorityP1);
                                 }
                             }

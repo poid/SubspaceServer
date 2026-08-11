@@ -2475,7 +2475,7 @@ namespace SS.Core.Modules
             if (arena is null)
                 return;
 
-            S2C_Kill packet = new(green, (short)killer.Id, (short)killed.Id, pts, flagCount);
+            S2C_Kill packet = new(green, killer.ArenaSlot, killed.ArenaSlot, pts, flagCount);
 
             var killAdvisors = arena.GetAdvisors<IKillAdvisor>();
             if (!killAdvisors.IsEmpty)

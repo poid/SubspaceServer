@@ -329,7 +329,7 @@ namespace SS.Core.Modules.FlagGame
                 // hacky drop/re-pickup
                 Player carrier = flagInfo.Carrier;
 
-                S2C_FlagDrop flagDropPacket = new((short)carrier.Id);
+                S2C_FlagDrop flagDropPacket = new(carrier.ArenaSlot);
                 _network.SendToArena(arena, null, ref flagDropPacket, NetSendFlags.Reliable);
 
                 carrier.Packet.FlagsCarried = 0;
@@ -345,7 +345,7 @@ namespace SS.Core.Modules.FlagGame
                     if (otherFlag.State == FlagState.Carried
                         && otherFlag.Carrier == carrier)
                     {
-                        S2C_FlagPickup flagPickupPacket = new(otherFlagId, (short)carrier.Id);
+                        S2C_FlagPickup flagPickupPacket = new(otherFlagId, carrier.ArenaSlot);
                         _network.SendToArena(arena, null, ref flagPickupPacket, NetSendFlags.Reliable);
 
                         carrier.Packet.FlagsCarried++;
@@ -437,7 +437,7 @@ namespace SS.Core.Modules.FlagGame
             {
                 if (reason != FlagPickupReason.Kill) // for kills, the S2C Kill packet is all that's needed
                 {
-                    S2C_FlagPickup flagPickupPacket = new(flagId, (short)carrier.Id);
+                    S2C_FlagPickup flagPickupPacket = new(flagId, carrier.ArenaSlot);
                     _network.SendToArena(arena, null, ref flagPickupPacket, NetSendFlags.Reliable);
                 }
 
@@ -454,7 +454,7 @@ namespace SS.Core.Modules.FlagGame
             {
                 if (reason != FlagPickupReason.Kill) // for kills, the S2C Kill packet is all that's needed
                 {
-                    S2C_FlagPickup flagPickupPacket = new(flagId, (short)carrier.Id);
+                    S2C_FlagPickup flagPickupPacket = new(flagId, carrier.ArenaSlot);
                     _network.SendToArena(arena, null, ref flagPickupPacket, NetSendFlags.Reliable);
                 }
 
