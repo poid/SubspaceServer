@@ -297,7 +297,7 @@ namespace SS.Core.Modules
                             // send whoami packet so the clients leave the arena
                             if (player.IsStandard)
                             {
-                                S2C_WhoAmI whoAmI = new((short)player.Id);
+                                S2C_WhoAmI whoAmI = new(player.ArenaSlot);
                                 _network?.SendToOne(player, ref whoAmI, NetSendFlags.Reliable);
                             }
                             else if (player.IsChat)
@@ -652,7 +652,7 @@ namespace SS.Core.Modules
             if (player.IsStandard)
             {
                 // send whoami packet
-                S2C_WhoAmI whoAmI = new((short)player.Id);
+                S2C_WhoAmI whoAmI = new(player.ArenaSlot);
                 _network?.SendToOne(player, ref whoAmI, NetSendFlags.Reliable);
 
                 // send settings
@@ -1907,7 +1907,7 @@ namespace SS.Core.Modules
 
             if (notify)
             {
-                S2C_PlayerLeaving packet = new((short)player.Id);
+                S2C_PlayerLeaving packet = new(player.ArenaSlot);
                 _network?.SendToArena(arena, player, ref packet, NetSendFlags.Reliable);
                 _chatNetwork?.SendToArena(arena, player, $"LEAVING:{player.Name}");
 

@@ -338,6 +338,28 @@ namespace SS.Core
         /// </summary>
         public readonly int Id;
 
+        /// <summary>
+        /// The id the clients in this player's arena know them by, or -1 when not in an arena.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// This is the id that goes on the wire, and the only one a client ever sees. <see cref="Id"/> is
+        /// the zone-wide identity used for the billing server, persistence, logging and anything else
+        /// that has to mean the same thing across arenas, and never leaves the server.
+        /// </para>
+        /// <para>
+        /// When Net:UseArenaLocalPlayerIds is off this is simply <see cref="Id"/>, so the wire is exactly
+        /// as it was. When it is on this is a slot within the arena, which keeps it small: the position
+        /// packet formats carry the id in a byte or in ten bits, and a zone with more than 1023 players
+        /// online otherwise has to use a packet twice the size for every position update.
+        /// </para>
+        /// <para>
+        /// Valid only while <see cref="Arena"/> is not null. Assigned and cleared together with arena
+        /// membership, under the player write lock, so the two can never disagree.
+        /// </para>
+        /// </remarks>
+        public short ArenaSlot { get; internal set; } = -1;
+
         internal readonly PlayerData Manager;
 
         /// <summary>
@@ -808,8 +830,25 @@ namespace SS.Core
             Initialize();
         }
 
+        /// <summary>
+        /// Sets the id this player appears as to clients, and stamps it into the entering packet.
+        /// </summary>
+        /// <remarks>
+        /// The entering packet carries the id, and it is what the arena's jumbo player list is built
+        /// from, so it has to be re-stamped every time the slot changes rather than once when the player
+        /// is created. Miss this and the list handed to an entering client names everyone by whatever id
+        /// they had in some previous arena, which is silent and completely wrong.
+        /// </remarks>
+        /// <param name="arenaSlot">The id, or -1 when leaving an arena.</param>
+        internal void SetArenaSlot(short arenaSlot)
+        {
+            ArenaSlot = arenaSlot;
+            _packet.PlayerId = arenaSlot >= 0 ? arenaSlot : (short)Id;
+        }
+
         internal void Initialize()
         {
+            ArenaSlot = -1;
             _packet = new() { Type = (byte)S2CPacketType.PlayerEntering, PlayerId = (short)Id };
             Ship = ShipType.Spec;
             Freq = -1;

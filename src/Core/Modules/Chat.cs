@@ -818,14 +818,16 @@ namespace SS.Core.Modules
                     break;
 
                 case ChatMessageType.EnemyFreq:
-                    target = _playerData.PidToPlayer(from.PlayerId);
+                    // The pid is one this client was told, so it names someone in its own arena. The
+                    // lookup is scoped to that arena, which is what used to be checked afterwards.
+                    target = _playerData.PidToPlayer(arena, from.PlayerId);
                     if (target is null)
+                    {
+                        _logManager.LogP(LogLevel.Malicious, nameof(Chat), player, "Received enemy freq chat message for a player not in this arena.");
                         break;
+                    }
 
-                    if (target.Arena == arena)
-                        HandleFreq(player, target.Freq, text, sound);
-                    else
-                        _logManager.LogP(LogLevel.Malicious, nameof(Chat), player, "Received cross-arena enemy freq chat message.");
+                    HandleFreq(player, target.Freq, text, sound);
                     break;
 
                 case ChatMessageType.Freq:
@@ -833,14 +835,14 @@ namespace SS.Core.Modules
                     break;
 
                 case ChatMessageType.Private:
-                    target = _playerData.PidToPlayer(from.PlayerId);
+                    target = _playerData.PidToPlayer(arena, from.PlayerId);
                     if (target is null)
+                    {
+                        _logManager.LogP(LogLevel.Malicious, nameof(Chat), player, "Received private chat message for a player not in this arena.");
                         break;
+                    }
 
-                    if (target.Arena == arena)
-                        HandlePrivate(player, target, text, false, sound);
-                    else
-                        _logManager.LogP(LogLevel.Malicious, nameof(Chat), player, "Received cross-arena private chat message.");
+                    HandlePrivate(player, target, text, false, sound);
                     break;
 
                 case ChatMessageType.RemotePrivate:
@@ -1033,10 +1035,51 @@ namespace SS.Core.Modules
                 chatPacket.Type = (byte)S2CPacketType.Chat;
                 chatPacket.ChatType = (byte)type;
                 chatPacket.Sound = (byte)sound;
-                chatPacket.PlayerId = from is not null ? (short)from.Id : (short)-1;
                 int length = ChatPacket.SetMessage(chatBytes, message);
 
-                _network.SendToSet(set, chatBytes[..length], NetSendFlags.Reliable);
+                Arena? fromArena = from?.Arena;
+
+                // The id names the sender to the client, and it only means the sender to a client in the
+                // same arena. Mod chat goes to staff across the whole zone, so one packet stamped with
+                // one id would have everyone elsewhere attribute the message to whichever of their own
+                // arena's players happens to hold that slot.
+                //
+                // Recipients outside the sender's arena get -1, which is what the client shows as having
+                // no player behind it, and is already what this sends when there is no sender at all.
+                HashSet<Player> elsewhere = _objectPoolManager.PlayerSetPool.Get();
+
+                try
+                {
+                    if (from is not null)
+                    {
+                        foreach (Player recipient in set)
+                        {
+                            if (recipient.Arena != fromArena)
+                                elsewhere.Add(recipient);
+                        }
+
+                        set.ExceptWith(elsewhere);
+                    }
+
+                    if (set.Count > 0)
+                    {
+                        chatPacket.PlayerId = from is not null ? from.ArenaSlot : (short)-1;
+                        _network.SendToSet(set, chatBytes[..length], NetSendFlags.Reliable);
+                    }
+
+                    if (elsewhere.Count > 0)
+                    {
+                        chatPacket.PlayerId = -1;
+                        _network.SendToSet(elsewhere, chatBytes[..length], NetSendFlags.Reliable);
+
+                        // Put them back, since the caller still owns the set and the code below uses it.
+                        set.UnionWith(elsewhere);
+                    }
+                }
+                finally
+                {
+                    _objectPoolManager.PlayerSetPool.Return(elsewhere);
+                }
             }
 
             string? ctype = GetChatType(type);
@@ -1172,7 +1215,7 @@ namespace SS.Core.Modules
                 try
                 {
                     set.Add(targetPlayer);
-                    SendReply(set, ChatMessageType.Private, sound, player, player.Id, text, 0);
+                    SendReply(set, ChatMessageType.Private, sound, player, player.ArenaSlot, text, 0);
                 }
                 finally
                 {
@@ -1234,7 +1277,7 @@ namespace SS.Core.Modules
 
                         if (set.Count > 0)
                         {
-                            SendReply(set, type, sound, player, player.Id, text, 0);
+                            SendReply(set, type, sound, player, player.ArenaSlot, text, 0);
                         }
                     }
                     finally
@@ -1283,7 +1326,7 @@ namespace SS.Core.Modules
                             return;
                         }
 
-                        SendReply(set, ChatMessageType.ModChat, sound, player, player.Id, messageToSend, player.Name.Length + 2);
+                        SendReply(set, ChatMessageType.ModChat, sound, player, -1, messageToSend, player.Name.Length + 2);
                     }
                 }
                 finally
@@ -1332,7 +1375,7 @@ namespace SS.Core.Modules
 
                         if (set.Count > 0)
                         {
-                            SendReply(set, type, sound, player, player.Id, msg, 0);
+                            SendReply(set, type, sound, player, player.ArenaSlot, msg, 0);
                         }
                     }
                     finally

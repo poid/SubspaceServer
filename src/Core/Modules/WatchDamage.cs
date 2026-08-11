@@ -221,7 +221,7 @@ namespace SS.Core.Modules
                 Span<byte> s2cPacket = stackalloc byte[S2C_WatchDamageHeader.Length + c2sDamageSpan.Length * DamageData.Length];
                 ref S2C_WatchDamageHeader s2cHeader = ref MemoryMarshal.AsRef<S2C_WatchDamageHeader>(s2cPacket);
                 Span<DamageData> s2cDamageSpan = MemoryMarshal.Cast<byte, DamageData>(s2cPacket[S2C_WatchDamageHeader.Length..]);
-                s2cHeader = new((short)player.Id, c2sHeader.Timestamp);
+                s2cHeader = new(player.ArenaSlot, c2sHeader.Timestamp);
                 c2sDamageSpan.CopyTo(s2cDamageSpan);
 
                 _network.SendToSet(pd.PlayersWatching, s2cPacket, NetSendFlags.Reliable | NetSendFlags.PriorityN1);
