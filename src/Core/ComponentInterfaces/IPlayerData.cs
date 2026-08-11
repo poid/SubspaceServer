@@ -1,6 +1,7 @@
 ﻿using Microsoft.Extensions.ObjectPool;
 using System;
 using System.Collections.Generic;
+using System.Runtime.CompilerServices;
 
 namespace SS.Core.ComponentInterfaces
 {
@@ -21,7 +22,11 @@ namespace SS.Core.ComponentInterfaces
         /// Locks the global player lock for writing.
         /// </summary>
         /// <remarks><see cref="WriteUnlock"/> must be called when done.</remarks>
-        void WriteLock();
+        /// <param name="caller">
+        /// Filled in by the compiler. Used only to name whoever waited a long time for the lock, which
+        /// is otherwise impossible to tell apart from any other caller.
+        /// </param>
+        void WriteLock([CallerMemberName] string? caller = null);
 
         /// <summary>
         /// Unlocks the global player lock for writing.

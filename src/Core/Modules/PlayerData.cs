@@ -4,6 +4,7 @@ using SS.Core.ComponentInterfaces;
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Runtime.CompilerServices;
 using System.Threading;
 
 namespace SS.Core.Modules
@@ -52,6 +53,17 @@ namespace SS.Core.Modules
         /// </para>
         /// </remarks>
         private static readonly TimeSpan ArenaSlotQuarantine = TimeSpan.FromSeconds(2);
+
+        /// <summary>
+        /// How long a wait for the write lock has to be before it is worth naming.
+        /// </summary>
+        private static readonly TimeSpan SlowWriteLockWait = TimeSpan.FromMilliseconds(2);
+
+        /// <summary>
+        /// When the last slow write lock wait was logged, so that a burst produces one line rather than
+        /// thousands.
+        /// </summary>
+        private long _lastSlowWriteLockLogTimestamp;
 
         // Optional dependencies
         private IServerMetrics? _serverMetrics;
@@ -255,7 +267,7 @@ namespace SS.Core.Modules
             _rwLock.ExitReadLock();
         }
 
-        public void WriteLock()
+        public void WriteLock([CallerMemberName] string? caller = null)
         {
             IServerMetrics? serverMetrics = _serverMetrics;
 
@@ -277,7 +289,27 @@ namespace SS.Core.Modules
                 if (_rwLock.RecursiveWriteCount == 1)
                 {
                     if (waitStart != 0)
-                        serverMetrics.Add(ServerMetric.PlayerDataWriteLockWaitTicks, Stopwatch.GetTimestamp() - waitStart);
+                    {
+                        long waitTicks = Stopwatch.GetTimestamp() - waitStart;
+                        serverMetrics.Add(ServerMetric.PlayerDataWriteLockWaitTicks, waitTicks);
+
+                        // Naming the slow ones, because the total says the lock is expensive to acquire
+                        // without saying who is paying for it or what they are waiting behind. Rate
+                        // limited to one a second: under load these come in bursts and the point is to
+                        // know which callers appear, not to count them.
+                        if (Stopwatch.GetElapsedTime(0, waitTicks) > SlowWriteLockWait)
+                        {
+                            long now = Stopwatch.GetTimestamp();
+                            long previous = Interlocked.Read(ref _lastSlowWriteLockLogTimestamp);
+
+                            if (Stopwatch.GetElapsedTime(previous, now) > TimeSpan.FromSeconds(1)
+                                && Interlocked.CompareExchange(ref _lastSlowWriteLockLogTimestamp, now, previous) == previous)
+                            {
+                                _logManager.LogM(LogLevel.Drivel, nameof(PlayerData),
+                                    $"Waited {Stopwatch.GetElapsedTime(0, waitTicks).TotalMilliseconds:F1}ms for the player write lock in {caller}, on '{Thread.CurrentThread.Name ?? "unnamed"}'.");
+                            }
+                        }
+                    }
 
                     t_writeLockTimestamp = Stopwatch.GetTimestamp();
                 }

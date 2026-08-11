@@ -248,9 +248,83 @@ namespace SS.Core.Modules
         /// </summary>
         private readonly List<PlayerStateChange> _actionsList = new(Constants.TargetPlayerCount);
 
+        /// <summary>
+        /// Whether <see cref="MainloopTimer_ProcessPlayerStates"/> would do anything for a player.
+        /// </summary>
+        /// <remarks>
+        /// Must agree with the switch below: saying no for a player that needs moving on leaves them
+        /// stuck in that state forever. Anything unrecognised says yes, so a state added later is picked
+        /// up rather than quietly ignored.
+        /// </remarks>
+        private static bool NeedsStateProcessing(Player player)
+        {
+            switch (player.Status)
+            {
+                // Waiting on something other than this loop.
+                case PlayerState.Uninitialized:
+                case PlayerState.WaitAuth:
+                case PlayerState.WaitGlobalSync1:
+                case PlayerState.WaitGlobalSync2:
+                case PlayerState.WaitArenaSync1:
+                case PlayerState.WaitArenaSync2:
+                case PlayerState.Playing:
+                case PlayerState.TimeWait:
+                    return false;
+
+                // These do something only when the player has an arena to be taken out of, one to be put
+                // into, or a state to move to once logged in.
+                case PlayerState.Connected:
+                case PlayerState.LoggedIn:
+                    return player.Arena is not null
+                        || player.NewArena is not null
+                        || player.WhenLoggedIn != PlayerState.Uninitialized;
+
+                // And these only once whatever asked to hold them has let go.
+                case PlayerState.WaitConnectHolds:
+                case PlayerState.WaitEnterArenaHolds:
+                case PlayerState.WaitLeaveArenaHolds:
+                case PlayerState.WaitDisconnectHolds:
+                    return player.Holds == 0;
+
+                default:
+                    return true;
+            }
+        }
+
         private bool MainloopTimer_ProcessPlayerStates()
         {
             Span<char> arenaName = stackalloc char[Constants.MaxArenaNameLength];
+
+            // Look first under the read lock, which readers do not block each other for, and take the
+            // write lock only if there is actually something to do.
+            //
+            // Ten times a second this used to take the write lock to discover that every player was in a
+            // state it does nothing for, which is the steady state of a busy zone. A writer waits for
+            // every current reader to finish, and the readers here are position fan outs holding the
+            // lock for a whole arena. Measured at two thousand players, this was the single biggest
+            // waiter on that lock, waiting up to 11.6 ms at a time.
+            bool anyPending = false;
+
+            _playerData.Lock();
+
+            try
+            {
+                foreach (Player player in _playerData.Players)
+                {
+                    if (NeedsStateProcessing(player))
+                    {
+                        anyPending = true;
+                        break;
+                    }
+                }
+            }
+            finally
+            {
+                _playerData.Unlock();
+            }
+
+            if (!anyPending)
+                return true;
 
             _playerData.WriteLock();
 
