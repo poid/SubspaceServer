@@ -114,6 +114,23 @@ namespace SS.LoadClient
 
             long measureStart = Stopwatch.GetTimestamp();
 
+            // Counters are taken as deltas across the hold, not as totals. Clients that connected early
+            // have been sending and receiving throughout the connect ramp, which for thousands of them
+            // takes longer than a minute. Dividing their whole life's counters by the hold alone made
+            // every per second figure here too high, in proportion to how long the ramp was.
+            long[] sentBaseline = new long[startedClients.Length];
+            long[] receivedBaseline = new long[startedClients.Length];
+            long[] bytesBaseline = new long[startedClients.Length];
+            long[] killsBaseline = new long[startedClients.Length];
+
+            for (int i = 0; i < startedClients.Length; i++)
+            {
+                sentBaseline[i] = Interlocked.Read(ref startedClients[i].PositionUpdatesSent);
+                receivedBaseline[i] = Interlocked.Read(ref startedClients[i].PositionUpdatesReceived);
+                bytesBaseline[i] = Interlocked.Read(ref startedClients[i].BytesReceived);
+                killsBaseline[i] = Interlocked.Read(ref startedClients[i].KillsSeen);
+            }
+
             Console.WriteLine(options.Duration > TimeSpan.Zero
                 ? $"Holding for {options.Duration.TotalSeconds:F0}s at 10Hz. Read the server's ?metrics output now."
                 : "Holding until interrupted (Ctrl+C) at 10Hz. Read the server's ?metrics output now.");
@@ -135,12 +152,14 @@ namespace SS.LoadClient
             long kills = 0;
             int stillUp = 0;
 
-            foreach (GameClient client in startedClients)
+            for (int i = 0; i < startedClients.Length; i++)
             {
-                positionUpdates += Interlocked.Read(ref client.PositionUpdatesReceived);
-                positionUpdatesSent += Interlocked.Read(ref client.PositionUpdatesSent);
-                bytes += Interlocked.Read(ref client.BytesReceived);
-                kills += Interlocked.Read(ref client.KillsSeen);
+                GameClient client = startedClients[i];
+
+                positionUpdates += Interlocked.Read(ref client.PositionUpdatesReceived) - receivedBaseline[i];
+                positionUpdatesSent += Interlocked.Read(ref client.PositionUpdatesSent) - sentBaseline[i];
+                bytes += Interlocked.Read(ref client.BytesReceived) - bytesBaseline[i];
+                kills += Interlocked.Read(ref client.KillsSeen) - killsBaseline[i];
 
                 if (client.IsConnected && client.FailureReason is null)
                     stillUp++;
