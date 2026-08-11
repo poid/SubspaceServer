@@ -584,8 +584,21 @@ namespace SS.Core.Modules
             return true;
 
             // local function that wraps calling the IArenaAuthorizationAdvisor
-            static bool IsPlayerAuthorizedToEnterArena(Player player, Arena arena, StringBuilder? errorMessage)
+            bool IsPlayerAuthorizedToEnterArena(Player player, Arena arena, StringBuilder? errorMessage)
             {
+                // Turned away rather than let in without a slot. With arena-local ids an arena has a
+                // fixed number of ids to hand out, and a player who gets none is in the arena but
+                // invisible to everyone in it, which is worse than being told it is full.
+                //
+                // This runs under the player write lock, which is what makes reading the count safe and
+                // what stops two players being let into the last place at once.
+                int maxArenaPlayers = _playerData.MaxArenaPlayers;
+                if (maxArenaPlayers > 0 && arena.Players.Length >= maxArenaPlayers)
+                {
+                    errorMessage?.Append($"The arena is full ({maxArenaPlayers} players).");
+                    return false;
+                }
+
                 var advisors = arena.GetAdvisors<IArenaAuthorizationAdvisor>();
                 if (!advisors.IsEmpty)
                 {

@@ -350,12 +350,16 @@ namespace SS.Core.Modules
                         Debug.Assert(_playerDictionary.ContainsKey(player.Id), $"Arena '{arena.Name}' lists player '{player.Name}', which has been freed.");
 
                         // The slot table is a second structure keyed the same way as the player list, so
-                        // it is exactly the kind of thing that drifts. Every player in the arena must
-                        // hold a slot, and that slot must point back at them: if it does not, two players
-                        // share an id and the clients see one of them as the other.
-                        if (_useArenaLocalPlayerIds)
+                        // it is exactly the kind of thing that drifts. What must hold is that a slot
+                        // points back at the player claiming it: if it does not, two players share an id
+                        // and clients see one of them as the other.
+                        //
+                        // Not asserted: that a player has a slot at all. Real players are turned away
+                        // when an arena is full, but fake players are put into an arena directly and can
+                        // exceed the cap. That is reported as an error where it happens, and leaves the
+                        // fake player unseen rather than impersonating anyone.
+                        if (_useArenaLocalPlayerIds && player.ArenaSlot >= 0)
                         {
-                            Debug.Assert(player.ArenaSlot >= 0, $"Arena '{arena.Name}' lists player '{player.Name}', which has no slot.");
                             Debug.Assert(ReferenceEquals(arena.PlayerFromSlot(player.ArenaSlot), player), $"Arena '{arena.Name}' slot {player.ArenaSlot} does not hold '{player.Name}', which claims it.");
                             Debug.Assert(player.Packet.PlayerId == player.ArenaSlot, $"Player '{player.Name}' has slot {player.ArenaSlot} but its entering packet says {player.Packet.PlayerId}.");
                         }
@@ -618,6 +622,8 @@ namespace SS.Core.Modules
                 WriteUnlock();
             }
         }
+
+        int IPlayerData.MaxArenaPlayers => _useArenaLocalPlayerIds ? _maxArenaSlots : 0;
 
         Player? IPlayerData.PidToPlayer(int pid)
         {
