@@ -189,6 +189,22 @@ namespace SS.Core.Modules
             private bool _hitLimit;
             private long _sinceTime;
 
+            /// <summary>
+            /// Slices counted toward the next time-based growth of the limit.
+            /// </summary>
+            private int _growthSlices;
+
+            /// <summary>
+            /// The limit grows by one part in this per second while nothing is going wrong.
+            /// </summary>
+            /// <remarks>
+            /// A twentieth, so a connection starting at the default 5000 bytes a second reaches the
+            /// default ceiling of 102400 in about a minute. Fast enough that a player is not held down
+            /// for a noticeable part of their session, slow enough that a link which cannot take it
+            /// signals so, through a retry, long before the limit is far wrong.
+            /// </remarks>
+            private const int GrowthDivisor = 20;
+
             private const int Granularity = 8;
             private static readonly TimeSpan s_sliceTimeSpan = TimeSpan.FromMilliseconds(1000 / Granularity);
             private static readonly long s_sliceFrequency = Stopwatch.Frequency / Granularity;
@@ -204,6 +220,7 @@ namespace SS.Core.Modules
             {
                 _limit = _settings.LimitInitial;
                 _hitLimit = false;
+                _growthSlices = 0;
                 _sinceTime = Stopwatch.GetTimestamp();
 
                 // Rather than start with 0, start as if one iteration had already gone by.
@@ -231,6 +248,8 @@ namespace SS.Core.Modules
                 {
                     _sinceTime += s_sliceFrequency * slices;
 
+                    GrowIfIdleOfTrouble(slices);
+
                     for (int pri = 0; pri < _avail.Length; pri++)
                     {
                         _avail[pri] += slices * (_limit * _settings.PriorityLimits[pri] / 100) / Granularity;
@@ -238,6 +257,58 @@ namespace SS.Core.Modules
                             _avail[pri] = _settings.MaxAvail;
                     }
                 }
+            }
+
+            /// <summary>
+            /// Raises the limit while the connection shows no sign of trouble.
+            /// </summary>
+            /// <remarks>
+            /// <para>
+            /// The limit otherwise rises only in <see cref="AdjustForAck"/>, on receiving an
+            /// acknowledgement. That works for a connection carrying reliable data, and not at all for
+            /// one carrying position updates, which are unreliable and never acknowledged. Such a
+            /// connection stays near Net:LimitInitial for as long as it lives however good the link is.
+            /// </para>
+            /// <para>
+            /// That is not a theoretical case: it is the normal one. A player standing in a busy arena
+            /// receives almost nothing but position updates. Measured, clients doing exactly that were
+            /// held to about a fifth of the data the server had for them, and the server was discarding
+            /// the rest at this limiter.
+            /// </para>
+            /// <para>
+            /// So the limit also creeps up with time, and <see cref="AdjustForRetry"/> still halves it
+            /// the moment anything has to be resent. Additive increase, multiplicative decrease, which is
+            /// what the pair already was; this only adds a way to increase without acknowledgements.
+            /// </para>
+            /// </remarks>
+            /// <param name="slices">How many slices of time have passed.</param>
+            private void GrowIfIdleOfTrouble(int slices)
+            {
+                if (_limit >= _settings.LimitHigh)
+                    return;
+
+                // Not while the limit is being hit: that means data is already queuing up, and giving a
+                // connection more when it cannot use what it has says nothing about the link.
+                if (_hitLimit)
+                    return;
+
+                _growthSlices += slices;
+                if (_growthSlices < Granularity)
+                    return;
+
+                int seconds = _growthSlices / Granularity;
+                _growthSlices -= seconds * Granularity;
+
+                // A few percent a second, so a connection reaches a modern link's worth in about a
+                // minute rather than immediately. Being wrong upwards costs a burst of loss before the
+                // retry halves it again, and being wrong slowly costs nothing.
+                for (int i = 0; i < seconds && _limit < _settings.LimitHigh; i++)
+                {
+                    _limit += Math.Max(1, _limit / GrowthDivisor);
+                }
+
+                if (_limit > _settings.LimitHigh)
+                    _limit = _settings.LimitHigh;
             }
 
             public bool Check(int bytes, BandwidthPriority priority, bool modify)

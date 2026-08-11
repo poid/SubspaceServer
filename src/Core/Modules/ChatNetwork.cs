@@ -449,7 +449,17 @@ namespace SS.Core.Modules
 
                 // client sockets
                 playerSocketDictionary.Clear();
-                _playerData.WriteLock();
+
+                // The read lock, not the write lock. This walks the player list to build a socket list,
+                // which is a read; the only thing it writes is this module's own per-player data, and
+                // this thread is the only one that writes that. Freeing a player, which does need the
+                // write lock, is done after the lock is released and always was.
+                //
+                // It ran ten times a second and took the write lock every time, whether or not the zone
+                // had any chat clients at all. Measured at two thousand game clients and no chat clients,
+                // that made it the largest remaining waiter on the lock, behind position fan outs holding
+                // the read lock for a whole arena.
+                _playerData.Lock();
 
                 try
                 {
@@ -485,7 +495,7 @@ namespace SS.Core.Modules
                 }
                 finally
                 {
-                    _playerData.WriteUnlock();
+                    _playerData.Unlock();
                 }
 
                 foreach (Player player in playersToRemove)
