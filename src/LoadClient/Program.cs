@@ -168,16 +168,54 @@ namespace SS.LoadClient
 
                 await client.LoginAsync(cancellationToken);
 
-                // Give the server its state machine ticks to get the login through before asking to
-                // enter an arena, or the request arrives too early and is ignored.
-                await Task.Delay(1500, cancellationToken);
+                // Wait for the server to actually answer the login before asking for an arena, rather
+                // than guessing how long it will take. A request that arrives first is thrown away,
+                // and the client is then connected and logged in but never in an arena, which is
+                // invisible from this end and quietly understates every measurement.
+                //
+                // This was a fixed 1.5 second wait, which was fine for hundreds of clients and not for
+                // thousands: the server advances logins on a ten hertz state machine, so the busier it
+                // is the longer a login takes, exactly when the measurement matters most.
+                if (!await WaitUntilAsync(() => client.IsLoggedIn, TimeSpan.FromSeconds(60), cancellationToken))
+                    return;
 
                 string arena = options.Arenas[index % options.Arenas.Length];
                 await client.GoToArenaAsync(arena, options.ViewWidth, options.ViewHeight, cancellationToken);
 
-                await Task.Delay(1500, cancellationToken);
+                // Likewise, positions sent before the arena is entered are discarded.
+                if (!await WaitUntilAsync(() => client.IsInArena, TimeSpan.FromSeconds(60), cancellationToken))
+                    return;
 
                 positionTasks[index] = PositionLoopAsync(client, index, cancellationToken);
+            }
+
+            /// <summary>
+            /// Waits for something to become true, or gives up.
+            /// </summary>
+            /// <remarks>
+            /// Polled rather than signalled because the states being waited on are set while parsing a
+            /// received packet, and that path is hot enough that it should not be publishing events.
+            /// </remarks>
+            static async Task<bool> WaitUntilAsync(Func<bool> condition, TimeSpan timeout, CancellationToken token)
+            {
+                long deadline = Environment.TickCount64 + (long)timeout.TotalMilliseconds;
+
+                while (!condition())
+                {
+                    if (Environment.TickCount64 >= deadline || token.IsCancellationRequested)
+                        return false;
+
+                    try
+                    {
+                        await Task.Delay(50, token);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        return false;
+                    }
+                }
+
+                return true;
             }
 
             async Task PositionLoopAsync(GameClient client, int index, CancellationToken token)

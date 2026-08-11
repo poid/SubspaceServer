@@ -46,6 +46,28 @@ namespace SS.LoadClient
 
         public bool IsConnected { get; private set; }
 
+        /// <summary>
+        /// Whether the server has answered the login.
+        /// </summary>
+        /// <remarks>
+        /// Asking to enter an arena before this is set gets the request thrown away, because the player
+        /// is not yet in a state the server will accept one from. Waiting a fixed time instead is what
+        /// this used to do, and it silently stopped working under load: the server advances logins on a
+        /// ten hertz state machine, so with thousands of clients arriving at once a login takes far
+        /// longer than any delay worth hard coding, and the clients that timed out never reached an
+        /// arena at all. That understated every measurement taken with this tool.
+        /// </remarks>
+        public bool IsLoggedIn { get; private set; }
+
+        /// <summary>
+        /// Whether the server has put this client into an arena.
+        /// </summary>
+        /// <remarks>
+        /// True once the server has said who this client is, which it does on arena entry. Positions
+        /// sent before that are discarded, so there is no point starting to send them earlier.
+        /// </remarks>
+        public bool IsInArena => Volatile.Read(ref _ownPlayerId) >= 0;
+
         public string? FailureReason { get; private set; }
 
         /// <summary>
@@ -286,7 +308,9 @@ namespace SS.LoadClient
             {
                 CountIfPosition(span);
 
-                if (span[0] == (byte)S2CPacketType.PlayerEntering)
+                if (span[0] == (byte)S2CPacketType.LoginResponse)
+                    IsLoggedIn = true;
+                else if (span[0] == (byte)S2CPacketType.PlayerEntering)
                     NotePlayerEntering(span);
                 else if (span[0] == (byte)S2CPacketType.WhoAmI && span.Length >= 3)
                     _ownPlayerId = LittleEndianConverter.Convert(MemoryMarshal.Read<short>(span.Slice(1, 2)));
