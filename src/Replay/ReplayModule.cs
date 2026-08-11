@@ -293,7 +293,6 @@ namespace SS.Replay
 
         private void Callback_PlayerAction(Player player, PlayerAction action, Arena? arena)
         {
-            Debug.Assert(_mainloop.IsMainloop);
 
             if (arena is null || !arena.TryGetExtraData(_adKey, out ArenaData? ad))
                 return;
@@ -304,7 +303,8 @@ namespace SS.Replay
                 ref Enter enter = ref MemoryMarshal.AsRef<Enter>(buffer.AsSpan(0, Enter.Length));
                 enter = new(ServerTick.Now, (short)player.Id, player.Name, player.Squad, player.Ship, player.Freq);
 
-                ad.RecorderQueue!.Add(new RecordBuffer(buffer, Enter.Length));
+                if (!ad.TryEnqueue(new RecordBuffer(buffer, Enter.Length)))
+                    _recordBufferPool.Return(buffer);
             }
             else if (action == PlayerAction.LeaveArena)
             {
@@ -312,13 +312,13 @@ namespace SS.Replay
                 ref Leave leave = ref MemoryMarshal.AsRef<Leave>(buffer.AsSpan(0, Leave.Length));
                 leave = new(ServerTick.Now, (short)player.Id);
 
-                ad.RecorderQueue!.Add(new RecordBuffer(buffer, Leave.Length));
+                if (!ad.TryEnqueue(new RecordBuffer(buffer, Leave.Length)))
+                    _recordBufferPool.Return(buffer);
             }
         }
 
         private void Callback_ShipFreqChange(Player player, ShipType newShip, ShipType oldShip, short newFreq, short oldFreq)
         {
-            Debug.Assert(_mainloop.IsMainloop);
 
             Arena? arena = player.Arena;
             if (arena is null || !arena.TryGetExtraData(_adKey, out ArenaData? ad))
@@ -330,7 +330,8 @@ namespace SS.Replay
                 ref FreqChange freqChange = ref MemoryMarshal.AsRef<FreqChange>(buffer.AsSpan(0, FreqChange.Length));
                 freqChange = new(ServerTick.Now, (short)player.Id, newFreq);
 
-                ad.RecorderQueue!.Add(new RecordBuffer(buffer, FreqChange.Length));
+                if (!ad.TryEnqueue(new RecordBuffer(buffer, FreqChange.Length)))
+                    _recordBufferPool.Return(buffer);
             }
             else
             {
@@ -338,13 +339,13 @@ namespace SS.Replay
                 ref ShipChange shipChange = ref MemoryMarshal.AsRef<ShipChange>(buffer.AsSpan(0, ShipChange.Length));
                 shipChange = new(ServerTick.Now, (short)player.Id, newShip, newFreq);
 
-                ad.RecorderQueue!.Add(new RecordBuffer(buffer, ShipChange.Length));
+                if (!ad.TryEnqueue(new RecordBuffer(buffer, ShipChange.Length)))
+                    _recordBufferPool.Return(buffer);
             }
         }
 
         private void Callback_Kill(Arena arena, Player killer, Player killed, short bounty, short flagCount, short points, Prize green)
         {
-            Debug.Assert(_mainloop.IsMainloop);
 
             if (arena is null || !arena.TryGetExtraData(_adKey, out ArenaData? ad))
                 return;
@@ -353,12 +354,12 @@ namespace SS.Replay
             ref Kill kill = ref MemoryMarshal.AsRef<Kill>(buffer.AsSpan(0, Kill.Length));
             kill = new(ServerTick.Now, (short)killer.Id, (short)killed.Id, points, flagCount);
 
-            ad.RecorderQueue!.Add(new RecordBuffer(buffer, Kill.Length));
+            if (!ad.TryEnqueue(new RecordBuffer(buffer, Kill.Length)))
+                    _recordBufferPool.Return(buffer);
         }
 
         private void Callback_ChatMessage(Arena? arena, Player? player, ChatMessageType type, ChatSound sound, Player? toPlayer, short freq, ReadOnlySpan<char> message)
         {
-            Debug.Assert(_mainloop.IsMainloop);
 
             if (arena is null || !arena.TryGetExtraData(_adKey, out ArenaData? ad))
                 return;
@@ -376,13 +377,13 @@ namespace SS.Replay
                 Span<byte> messageBytes = buffer.AsSpan(Chat.Length, messageByteCount);
                 messageBytes.WriteNullTerminatedString(message);
 
-                ad.RecorderQueue!.Add(new RecordBuffer(buffer, Chat.Length + messageByteCount));
+                if (!ad.TryEnqueue(new RecordBuffer(buffer, Chat.Length + messageByteCount)))
+                    _recordBufferPool.Return(buffer);
             }
         }
 
         private void Callback_BricksPlaced(Arena arena, Player? player, IReadOnlyList<BrickData> bricks)
         {
-            Debug.Assert(_mainloop.IsMainloop);
 
             if (arena is null || !arena.TryGetExtraData(_adKey, out ArenaData? ad))
                 return;
@@ -396,13 +397,13 @@ namespace SS.Replay
                 ref Brick brick = ref MemoryMarshal.AsRef<Brick>(buffer.AsSpan(0, Brick.Length));
                 brick = new(ServerTick.Now, in brickData);
 
-                ad.RecorderQueue!.Add(new(buffer, Brick.Length));
+                if (!ad.TryEnqueue(new(buffer, Brick.Length)))
+                    _recordBufferPool.Return(buffer);
             }
         }
 
         private void Callback_BallPacketSent(Arena arena, ref readonly BallPacket ballPacket)
         {
-            Debug.Assert(_mainloop.IsMainloop);
 
             if (arena is null || !arena.TryGetExtraData(_adKey, out ArenaData? ad))
                 return;
@@ -411,12 +412,12 @@ namespace SS.Replay
             ref BallPacketWrapper ballPacketWrapper = ref MemoryMarshal.AsRef<BallPacketWrapper>(buffer.AsSpan(0, BallPacketWrapper.Length));
             ballPacketWrapper = new(ServerTick.Now, in ballPacket);
 
-            ad.RecorderQueue!.Add(new(buffer, BallPacketWrapper.Length));
+            if (!ad.TryEnqueue(new(buffer, BallPacketWrapper.Length)))
+                    _recordBufferPool.Return(buffer);
         }
 
         private void Callback_CrownToggled(Player player, bool on)
         {
-            Debug.Assert(_mainloop.IsMainloop);
 
             Arena? arena = player.Arena;
             if (arena is null || !arena.TryGetExtraData(_adKey, out ArenaData? ad))
@@ -426,12 +427,12 @@ namespace SS.Replay
             ref CrownToggle crownToggle = ref MemoryMarshal.AsRef<CrownToggle>(buffer.AsSpan(0, CrownToggle.Length));
             crownToggle = new(ServerTick.Now, on, (short)player.Id);
 
-            ad.RecorderQueue!.Add(new RecordBuffer(buffer, CrownToggle.Length));
+            if (!ad.TryEnqueue(new RecordBuffer(buffer, CrownToggle.Length)))
+                    _recordBufferPool.Return(buffer);
         }
 
         private void Callback_SecuritySeedChanged(uint greenSeed, uint doorSeed, ServerTick timestamp)
         {
-            Debug.Assert(_mainloop.IsMainloop);
 
             _arenaManager.Lock();
 
@@ -448,7 +449,8 @@ namespace SS.Replay
                         ref SecuritySeedChange seedChange = ref MemoryMarshal.AsRef<SecuritySeedChange>(buffer.AsSpan(0, SecuritySeedChange.Length));
                         seedChange = new(timestamp, greenSeed, doorSeed, 0);
 
-                        ad.RecorderQueue.Add(new RecordBuffer(buffer, SecuritySeedChange.Length));
+                        if (!ad.TryEnqueue(new RecordBuffer(buffer, SecuritySeedChange.Length)))
+                    _recordBufferPool.Return(buffer);
                     }
                 }
             }
@@ -460,7 +462,6 @@ namespace SS.Replay
 
         private void Callback_FlagGameReset(Arena arena, short winnerFreq, int points)
         {
-            Debug.Assert(_mainloop.IsMainloop);
 
             if (arena is null || !arena.TryGetExtraData(_adKey, out ArenaData? ad))
                 return;
@@ -478,7 +479,8 @@ namespace SS.Replay
                 byte[] buffer = _recordBufferPool.Rent(CarryFlagGameReset.Length);
                 ref CarryFlagGameReset gameReset = ref MemoryMarshal.AsRef<CarryFlagGameReset>(buffer.AsSpan(0, CarryFlagGameReset.Length));
                 gameReset = new(ServerTick.Now, winnerFreq, points);
-                ad.RecorderQueue!.Add(new RecordBuffer(buffer, CarryFlagGameReset.Length));
+                if (!ad.TryEnqueue(new RecordBuffer(buffer, CarryFlagGameReset.Length)))
+                    _recordBufferPool.Return(buffer);
                 return;
             }
 
@@ -487,7 +489,6 @@ namespace SS.Replay
 
         private void Callback_StaticFlagClaimed(Arena arena, Player player, short flagId, short oldFreq, short newFreq)
         {
-            Debug.Assert(_mainloop.IsMainloop);
 
             if (arena is null || !arena.TryGetExtraData(_adKey, out ArenaData? ad))
                 return;
@@ -495,12 +496,12 @@ namespace SS.Replay
             byte[] buffer = _recordBufferPool.Rent(StaticFlagClaimed.Length);
             ref StaticFlagClaimed claimed = ref MemoryMarshal.AsRef<StaticFlagClaimed>(buffer.AsSpan(0, StaticFlagClaimed.Length));
             claimed = new(ServerTick.Now, flagId, (short)player.Id);
-            ad.RecorderQueue!.Add(new RecordBuffer(buffer, StaticFlagClaimed.Length));
+            if (!ad.TryEnqueue(new RecordBuffer(buffer, StaticFlagClaimed.Length)))
+                    _recordBufferPool.Return(buffer);
         }
 
         private void Callback_CarryFlagOnMap(Arena arena, short flagId, TileCoordinates coordinates, short freq)
         {
-            Debug.Assert(_mainloop.IsMainloop);
 
             if (arena is null || !arena.TryGetExtraData(_adKey, out ArenaData? ad))
                 return;
@@ -510,7 +511,6 @@ namespace SS.Replay
 
         private void Callback_CarryFlagPickup(Arena arena, Player player, short flagId, FlagPickupReason reason)
         {
-            Debug.Assert(_mainloop.IsMainloop);
 
             if (arena is null || !arena.TryGetExtraData(_adKey, out ArenaData? ad))
                 return;
@@ -520,7 +520,6 @@ namespace SS.Replay
 
         private void Callback_CarryFlagDrop(Arena arena, Player player, short flagId, FlagLostReason reason)
         {
-            Debug.Assert(_mainloop.IsMainloop);
 
             if (arena is null || !arena.TryGetExtraData(_adKey, out ArenaData? ad))
                 return;
@@ -528,12 +527,12 @@ namespace SS.Replay
             byte[] buffer = _recordBufferPool.Rent(CarryFlagDrop.Length);
             ref CarryFlagDrop drop = ref MemoryMarshal.AsRef<CarryFlagDrop>(buffer.AsSpan(0, CarryFlagDrop.Length));
             drop = new(ServerTick.Now, (short)player.Id);
-            ad.RecorderQueue!.Add(new RecordBuffer(buffer, CarryFlagDrop.Length));
+            if (!ad.TryEnqueue(new RecordBuffer(buffer, CarryFlagDrop.Length)))
+                    _recordBufferPool.Return(buffer);
         }
 
         private void Callback_Attach(Player player, Player? to)
         {
-            Debug.Assert(_mainloop.IsMainloop);
 
             Arena? arena = player.Arena;
             if (arena is null || !arena.TryGetExtraData(_adKey, out ArenaData? ad))
@@ -545,12 +544,12 @@ namespace SS.Replay
             byte[] buffer = _recordBufferPool.Rent(AttachChange.Length);
             ref AttachChange attachChange = ref MemoryMarshal.AsRef<AttachChange>(buffer.AsSpan(0, AttachChange.Length));
             attachChange = new(ServerTick.Now, (short)player.Id, to is null ? (short)-1 : (short)to.Id);
-            ad.RecorderQueue!.Add(new RecordBuffer(buffer, AttachChange.Length));
+            if (!ad.TryEnqueue(new RecordBuffer(buffer, AttachChange.Length)))
+                    _recordBufferPool.Return(buffer);
         }
 
         private void Callback_TurretKickoff(Player player)
         {
-            Debug.Assert(_mainloop.IsMainloop);
 
             Arena? arena = player.Arena;
             if (arena is null || !arena.TryGetExtraData(_adKey, out ArenaData? ad))
@@ -559,14 +558,14 @@ namespace SS.Replay
             byte[] buffer = _recordBufferPool.Rent(TurretKickoff.Length);
             ref TurretKickoff turretKickoff = ref MemoryMarshal.AsRef<TurretKickoff>(buffer.AsSpan(0, TurretKickoff.Length));
             turretKickoff = new(ServerTick.Now, (short)player.Id);
-            ad.RecorderQueue!.Add(new RecordBuffer(buffer, TurretKickoff.Length));
+            if (!ad.TryEnqueue(new RecordBuffer(buffer, TurretKickoff.Length)))
+                    _recordBufferPool.Return(buffer);
         }
 
         #endregion
 
         private void Packet_Position(Player player, ReadOnlySpan<byte> data, NetReceiveFlags flags)
         {
-            Debug.Assert(_mainloop.IsMainloop);
 
             int length = data.Length;
             if (length != C2S_PositionPacket.Length && length != C2S_PositionPacket.LengthWithExtra)
@@ -582,7 +581,9 @@ namespace SS.Replay
                     return;
             }
 
-            if (ad.RecorderQueue!.IsAddingCompleted) // only the mainloop thread changes this, so it can't happen between here the Add method call since this is the mainloop
+            // A cheap early out only. Recording can stop between here and the enqueue, which is why the
+            // enqueue checks again under the arena's lock rather than trusting this.
+            if (ad.RecorderQueue!.IsAddingCompleted)
                 return;
 
             ref readonly C2S_PositionPacket c2sPosition = ref MemoryMarshal.AsRef<C2S_PositionPacket>(data);
@@ -593,7 +594,8 @@ namespace SS.Replay
                 byte[] buffer = _recordBufferPool.Rent(PositionWrapper.Length);
                 ref PositionWrapper position = ref MemoryMarshal.AsRef<PositionWrapper>(buffer.AsSpan(0, PositionWrapper.Length));
                 position = new(ServerTick.Now, (short)player.Id, in c2sPosition);
-                ad.RecorderQueue.Add(new RecordBuffer(buffer, PositionWrapper.Length));
+                if (!ad.TryEnqueue(new RecordBuffer(buffer, PositionWrapper.Length)))
+                    _recordBufferPool.Return(buffer);
             }
             else if (length == C2S_PositionPacket.LengthWithExtra)
             {
@@ -603,7 +605,8 @@ namespace SS.Replay
                 byte[] buffer = _recordBufferPool.Rent(PositionWithExtraWrapper.Length);
                 ref PositionWithExtraWrapper position = ref MemoryMarshal.AsRef<PositionWithExtraWrapper>(buffer.AsSpan(0, PositionWithExtraWrapper.Length));
                 position = new(ServerTick.Now, (short)player.Id, in c2sPosition, in extra);
-                ad.RecorderQueue.Add(new RecordBuffer(buffer, PositionWithExtraWrapper.Length));
+                if (!ad.TryEnqueue(new RecordBuffer(buffer, PositionWithExtraWrapper.Length)))
+                    _recordBufferPool.Return(buffer);
             }
         }
 
@@ -613,7 +616,6 @@ namespace SS.Replay
             Description = "Controls a replay recording or playback.")]
         private void Command_replay(ReadOnlySpan<char> commandName, ReadOnlySpan<char> parameters, Player player, ITarget target)
         {
-            Debug.Assert(_mainloop.IsMainloop);
 
             Arena? arena = player.Arena;
             if (arena is null)
@@ -842,7 +844,8 @@ namespace SS.Replay
                 ServerTick now = ServerTick.Now;
                 change = new(now, greenSeed, doorSeed, (uint)(now - (ServerTick)timestamp));
 
-                ad.RecorderQueue!.Add(new RecordBuffer(buffer, SecuritySeedChange.Length));
+                if (!ad.TryEnqueue(new RecordBuffer(buffer, SecuritySeedChange.Length)))
+                    _recordBufferPool.Return(buffer);
             }
 
             void QueuePlayers(Arena arena, ArenaData ad)
@@ -861,7 +864,8 @@ namespace SS.Replay
                             ref Enter enter = ref MemoryMarshal.AsRef<Enter>(buffer.AsSpan(0, Enter.Length));
                             enter = new(ServerTick.Now, (short)player.Id, player.Name, player.Squad, player.Ship, player.Freq);
 
-                            ad.RecorderQueue!.Add(new RecordBuffer(buffer, Enter.Length));
+                            if (!ad.TryEnqueue(new RecordBuffer(buffer, Enter.Length)))
+                    _recordBufferPool.Return(buffer);
                         }
                     }
 
@@ -876,7 +880,8 @@ namespace SS.Replay
                             ref AttachChange attachChange = ref MemoryMarshal.AsRef<AttachChange>(buffer.AsSpan(0, AttachChange.Length));
                             attachChange = new(ServerTick.Now, (short)player.Id, player.Attached);
 
-                            ad.RecorderQueue!.Add(new RecordBuffer(buffer, AttachChange.Length));
+                            if (!ad.TryEnqueue(new RecordBuffer(buffer, AttachChange.Length)))
+                    _recordBufferPool.Return(buffer);
                         }
                     }
 
@@ -891,7 +896,8 @@ namespace SS.Replay
                             ref CrownToggle crownToggle = ref MemoryMarshal.AsRef<CrownToggle>(buffer.AsSpan(0, CrownToggle.Length));
                             crownToggle = new(ServerTick.Now, true, (short)player.Id);
 
-                            ad.RecorderQueue!.Add(new RecordBuffer(buffer, CrownToggle.Length));
+                            if (!ad.TryEnqueue(new RecordBuffer(buffer, CrownToggle.Length)))
+                    _recordBufferPool.Return(buffer);
                         }
                     }
                 }
@@ -975,7 +981,8 @@ namespace SS.Replay
                             fullUpdateOwners[i] = owners[i];
                         }
 
-                        ad.RecorderQueue!.Add(new RecordBuffer(buffer, eventLength));
+                        if (!ad.TryEnqueue(new RecordBuffer(buffer, eventLength)))
+                    _recordBufferPool.Return(buffer);
                         return true;
                     }
                 }
@@ -993,7 +1000,8 @@ namespace SS.Replay
             byte[] buffer = _recordBufferPool.Rent(CarryFlagOnMap.Length);
             ref CarryFlagOnMap onMap = ref MemoryMarshal.AsRef<CarryFlagOnMap>(buffer.AsSpan(0, CarryFlagOnMap.Length));
             onMap = new(ServerTick.Now, flagId, coordinates.X, coordinates.Y, freq);
-            ad.RecorderQueue!.Add(new RecordBuffer(buffer, CarryFlagOnMap.Length));
+            if (!ad.TryEnqueue(new RecordBuffer(buffer, CarryFlagOnMap.Length)))
+                    _recordBufferPool.Return(buffer);
         }
 
         private static void QueueCarryFlagPickup(ArenaData ad, short flagId, Player player)
@@ -1001,7 +1009,8 @@ namespace SS.Replay
             byte[] buffer = _recordBufferPool.Rent(CarryFlagPickup.Length);
             ref CarryFlagPickup pickup = ref MemoryMarshal.AsRef<CarryFlagPickup>(buffer.AsSpan(0, CarryFlagPickup.Length));
             pickup = new(ServerTick.Now, flagId, (short)player.Id);
-            ad.RecorderQueue!.Add(new RecordBuffer(buffer, CarryFlagPickup.Length));
+            if (!ad.TryEnqueue(new RecordBuffer(buffer, CarryFlagPickup.Length)))
+                    _recordBufferPool.Return(buffer);
         }
 
         private bool StopRecording(Arena arena)
@@ -1260,7 +1269,6 @@ namespace SS.Replay
         /// <param name="arena"></param>
         private void MainloopWorkItem_EndRecording(Arena arena)
         {
-            Debug.Assert(_mainloop.IsMainloop);
 
             if (arena is null || !arena.TryGetExtraData(_adKey, out ArenaData? ad))
                 return;
@@ -2755,15 +2763,42 @@ namespace SS.Replay
             /// Queue of events to record.
             /// </summary>
             /// <remarks>
-            /// Thread synchronization might seem strange for this field. However, here is the gist.
-            /// The mainloop thread: 
-            /// - is responsible for constructing the queue, 
-            /// - is the sole producer (all events written to the queue are on the mainloop thread, this includes callbacks and packet handlers), 
+            /// The mainloop thread:
+            /// - is responsible for constructing the queue,
             /// - is the one that will mark the queue complete for adding
             /// - and is the one that will dispose of the queue and the reference to it.
             /// The <see cref="RecorderTask"/> is the sole consumer.
+            /// <para>
+            /// Producers are no longer only the mainloop. A packet handler, and any callback it fires,
+            /// runs on the thread that owns the arena when Net:HandlePacketsOnArenaThread is on. So
+            /// events are queued through <see cref="TryEnqueue"/> rather than added directly, which is
+            /// what makes stopping a recording safe against an event arriving at the same moment.
+            /// </para>
             /// </remarks>
             public BlockingCollection<RecordBuffer>? RecorderQueue;
+
+            /// <summary>
+            /// Queues a recorded event, if this arena is still recording.
+            /// </summary>
+            /// <remarks>
+            /// Takes the same lock that marking the queue complete takes. Checking the queue and then
+            /// adding to it without that lock was safe only while both ran on the mainloop; once an event
+            /// can arrive from an arena thread, recording can stop in between, and adding to a completed
+            /// collection throws.
+            /// </remarks>
+            /// <param name="recordBuffer">The event to queue.</param>
+            /// <returns><see langword="true"/> if it was queued; <see langword="false"/> if this arena is no longer recording.</returns>
+            public bool TryEnqueue(RecordBuffer recordBuffer)
+            {
+                lock (Lock)
+                {
+                    if (State != ReplayState.Recording || RecorderQueue is null || RecorderQueue.IsAddingCompleted)
+                        return false;
+
+                    RecorderQueue.Add(recordBuffer);
+                    return true;
+                }
+            }
 
             /// <summary>
             /// For thread synchronization.
