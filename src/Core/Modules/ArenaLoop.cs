@@ -3,6 +3,8 @@ using SS.Core.ComponentInterfaces;
 using SS.Utilities;
 using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Diagnostics;
 using System.Threading;
 
 namespace SS.Core.Modules
@@ -20,7 +22,7 @@ namespace SS.Core.Modules
     /// </para>
     /// </remarks>
     [CoreModuleInfo]
-    public sealed class ArenaLoop : IModule, IArenaLoop, IDisposable
+    public sealed class ArenaLoop : IModule, IArenaLoop, IArenaTimer, IDisposable
     {
         private readonly IComponentBroker _broker;
         private readonly IConfigManager _configManager;
@@ -28,6 +30,7 @@ namespace SS.Core.Modules
         private readonly IObjectPoolManager _objectPoolManager;
 
         private InterfaceRegistrationToken<IArenaLoop>? _iArenaLoopToken;
+        private InterfaceRegistrationToken<IArenaTimer>? _iArenaTimerToken;
 
         // Optional dependency. Retrieved in Load, which is after the module that provides it.
         private IServerMetrics? _serverMetrics;
@@ -125,6 +128,7 @@ namespace SS.Core.Modules
             ArenaActionCallback.Register(broker, Callback_ArenaAction);
 
             _iArenaLoopToken = broker.RegisterInterface<IArenaLoop>(this);
+            _iArenaTimerToken = broker.RegisterInterface<IArenaTimer>(this);
 
             _logManager.LogM(LogLevel.Info, nameof(ArenaLoop), $"Started {workerCount} arena worker threads.");
 
@@ -134,6 +138,9 @@ namespace SS.Core.Modules
         bool IModule.Unload(IComponentBroker broker)
         {
             if (broker.UnregisterInterface(ref _iArenaLoopToken) != 0)
+                return false;
+
+            if (broker.UnregisterInterface(ref _iArenaTimerToken) != 0)
                 return false;
 
             ArenaActionCallback.Unregister(broker, Callback_ArenaAction);
@@ -168,11 +175,40 @@ namespace SS.Core.Modules
                 // mainloop, before anything can queue work for the arena.
                 _arenaWorkers[arena] = (int)((uint)Interlocked.Increment(ref _nextWorker) % (uint)_workers.Length);
             }
+#if DEBUG
+            else if (action == ArenaAction.Create)
+            {
+                // A timer on the arena, checking it fires on that arena's own thread. Cheap enough to
+                // leave in debug builds: it is the only thing that would catch an arena's timers being
+                // run somewhere they must not be, which is silent otherwise.
+                ((IArenaTimer)this).SetTimer(arena, ArenaTimer_SelfCheck, 5000, 5000, arena, null);
+            }
+#endif
             else if (action == ArenaAction.PostDestroy)
             {
+                // Before dropping the assignment, so that the timers are removed from the worker that
+                // actually holds them rather than from whichever one the fallback would pick.
+                GetWorker(arena).RemoveTimers(arena);
+
                 _arenaWorkers.TryRemove(arena, out _);
             }
         }
+
+#if DEBUG
+        /// <summary>
+        /// Asserts that an arena's timer runs on that arena's thread.
+        /// </summary>
+        /// <remarks>
+        /// The whole point of an arena timer is that its callback may touch the arena's state directly,
+        /// which is only true if it runs where that arena's other work runs. Nothing else would notice
+        /// if that stopped being true.
+        /// </remarks>
+        private bool ArenaTimer_SelfCheck(Arena arena)
+        {
+            Debug.Assert(((IArenaLoop)this).IsArenaThread(arena), $"An arena timer for '{arena.Name}' ran on a thread that does not own it.");
+            return true;
+        }
+#endif
 
         #endregion
 
@@ -208,6 +244,31 @@ namespace SS.Core.Modules
         }
 
         int IArenaLoop.WorkerCount => _workers.Length;
+
+        #endregion
+
+        #region IArenaTimer Members
+
+        void IArenaTimer.SetTimer<TState>(Arena arena, TimerDelegate<TState> callback, int initialDelay, int interval, TState state, object? key)
+        {
+            ArgumentNullException.ThrowIfNull(arena);
+            ArgumentNullException.ThrowIfNull(callback);
+
+            ArenaTimer<TState> timer = new(arena, callback, interval, state, key)
+            {
+                WhenDue = Environment.TickCount64 + initialDelay,
+            };
+
+            GetWorker(arena).AddTimer(timer);
+        }
+
+        void IArenaTimer.ClearTimer<TState>(Arena arena, TimerDelegate<TState> callback, object? key)
+        {
+            ArgumentNullException.ThrowIfNull(arena);
+            ArgumentNullException.ThrowIfNull(callback);
+
+            GetWorker(arena).RemoveTimers(arena, callback, key);
+        }
 
         #endregion
 
@@ -256,6 +317,65 @@ namespace SS.Core.Modules
         private interface IArenaWorkItem
         {
             void Process();
+        }
+
+        /// <summary>
+        /// Does nothing, and exists only to wake a worker that is waiting on its queue.
+        /// </summary>
+        /// <remarks>
+        /// Setting a timer has to make the thread recompute how long it may wait, and it may currently
+        /// be waiting forever. A single shared instance, since it carries nothing and is not pooled.
+        /// </remarks>
+        private sealed class WakeWorkItem : IArenaWorkItem
+        {
+            public static readonly WakeWorkItem Instance = new();
+
+            private WakeWorkItem()
+            {
+            }
+
+            public void Process()
+            {
+            }
+        }
+
+        /// <summary>
+        /// A timer belonging to one arena, fired by the worker that owns it.
+        /// </summary>
+        private abstract class ArenaTimer(Arena arena, Delegate callback, int interval, object? key)
+        {
+            public Arena Arena { get; } = arena;
+            public Delegate Callback { get; } = callback;
+            public int Interval { get; } = interval;
+            public object? Key { get; } = key;
+
+            /// <summary>
+            /// When this is next due, on the <see cref="Environment.TickCount64"/> clock.
+            /// </summary>
+            /// <remarks>Only read and written under the owning worker's timer lock.</remarks>
+            public long WhenDue { get; set; }
+
+            /// <summary>
+            /// Calls the timer's delegate.
+            /// </summary>
+            /// <returns><see langword="true"/> to keep running.</returns>
+            public abstract bool Invoke();
+        }
+
+        private sealed class ArenaTimer<TState>(
+            Arena arena,
+            TimerDelegate<TState> callback,
+            int interval,
+            TState state,
+            object? key) : ArenaTimer(arena, callback, interval, key)
+        {
+            private readonly TimerDelegate<TState> _callback = callback;
+            private readonly TState _state = state;
+
+            public override bool Invoke()
+            {
+                return _callback(_state);
+            }
         }
 
         private sealed class ArenaWorkItem<TState> : PooledObject, IArenaWorkItem
@@ -317,6 +437,26 @@ namespace SS.Core.Modules
             private readonly BlockingCollection<IArenaWorkItem> _queue = [];
             private Thread? _thread;
 
+            /// <summary>
+            /// The timers for the arenas this worker owns.
+            /// </summary>
+            /// <remarks>
+            /// Guarded by <see cref="_timerLock"/>, because timers are set and cleared from whatever
+            /// thread a module happens to be on, while only this worker's thread fires them.
+            /// </remarks>
+            private readonly List<ArenaTimer> _timers = [];
+            private readonly Lock _timerLock = new();
+
+            /// <summary>
+            /// A scratch list of the timers due, so that firing them does not hold <see cref="_timerLock"/>.
+            /// </summary>
+            /// <remarks>
+            /// A callback is free to set or clear timers, which would deadlock against the lock it was
+            /// called under and would in any case be modifying the list being walked. Only ever touched
+            /// by this worker's thread.
+            /// </remarks>
+            private readonly List<ArenaTimer> _dueTimers = [];
+
             public int Index { get; } = index;
 
             public void Start()
@@ -375,6 +515,123 @@ namespace SS.Core.Modules
                 return false;
             }
 
+            public void AddTimer(ArenaTimer timer)
+            {
+                lock (_timerLock)
+                {
+                    _timers.Add(timer);
+                }
+
+                // The thread may be waiting on a longer timeout than this timer's, or on no timeout at
+                // all. Nudge it so it recomputes.
+                TryQueue(WakeWorkItem.Instance, sheddable: false);
+            }
+
+            public void RemoveTimers(Arena arena, Delegate callback, object? key)
+            {
+                lock (_timerLock)
+                {
+                    for (int i = _timers.Count - 1; i >= 0; i--)
+                    {
+                        ArenaTimer timer = _timers[i];
+
+                        if (timer.Arena == arena
+                            && timer.Callback.Equals(callback)
+                            && (key is null || Equals(timer.Key, key)))
+                        {
+                            _timers.RemoveAt(i);
+                        }
+                    }
+                }
+            }
+
+            public void RemoveTimers(Arena arena)
+            {
+                lock (_timerLock)
+                {
+                    for (int i = _timers.Count - 1; i >= 0; i--)
+                    {
+                        if (_timers[i].Arena == arena)
+                            _timers.RemoveAt(i);
+                    }
+                }
+            }
+
+            /// <summary>
+            /// How long this thread may wait before a timer is due, in milliseconds.
+            /// </summary>
+            /// <returns>The wait, or <see cref="Timeout.Infinite"/> when there are no timers.</returns>
+            private int MillisecondsUntilNextTimerDue()
+            {
+                long soonest = long.MaxValue;
+
+                lock (_timerLock)
+                {
+                    foreach (ArenaTimer timer in _timers)
+                    {
+                        if (timer.WhenDue < soonest)
+                            soonest = timer.WhenDue;
+                    }
+                }
+
+                if (soonest == long.MaxValue)
+                    return Timeout.Infinite;
+
+                long wait = soonest - Environment.TickCount64;
+                return wait <= 0 ? 0 : (int)Math.Min(wait, int.MaxValue);
+            }
+
+            /// <summary>
+            /// Fires whichever timers are due.
+            /// </summary>
+            private void ProcessTimers()
+            {
+                long now = Environment.TickCount64;
+
+                lock (_timerLock)
+                {
+                    foreach (ArenaTimer timer in _timers)
+                    {
+                        if (timer.WhenDue <= now)
+                            _dueTimers.Add(timer);
+                    }
+                }
+
+                if (_dueTimers.Count == 0)
+                    return;
+
+                foreach (ArenaTimer timer in _dueTimers)
+                {
+                    bool keepRunning;
+
+                    try
+                    {
+                        keepRunning = timer.Invoke();
+                    }
+                    catch (Exception ex)
+                    {
+                        _owner._logManager.LogM(LogLevel.Warn, nameof(ArenaLoop), $"Caught an exception while invoking an arena timer. {ex}");
+                        keepRunning = true;
+                    }
+
+                    lock (_timerLock)
+                    {
+                        // Only if it is still there. The callback is allowed to have cleared it, and a
+                        // timer cleared while running must not be put back.
+                        int index = _timers.IndexOf(timer);
+                        if (index < 0)
+                            continue;
+
+                        if (keepRunning && timer.Interval > 0)
+                            timer.WhenDue = now + timer.Interval;
+                        else
+                            _timers.RemoveAt(index);
+                    }
+                }
+
+                _dueTimers.Clear();
+            }
+
             public void Drain()
             {
                 if (_queue.IsAddingCompleted)
@@ -403,32 +660,47 @@ namespace SS.Core.Modules
 
                 try
                 {
-                    foreach (IArenaWorkItem workItem in _queue.GetConsumingEnumerable(cancellationToken))
+                    while (!cancellationToken.IsCancellationRequested)
                     {
-                        try
+                        // Wait only until the next timer is due, rather than until work arrives. An
+                        // arena's timers run on its own thread, so this thread cannot sit blocked on its
+                        // queue and still fire them on time.
+                        int waitMilliseconds = MillisecondsUntilNextTimerDue();
+
+                        if (_queue.TryTake(out IArenaWorkItem? workItem, waitMilliseconds, cancellationToken)
+                            && workItem is not null)
                         {
-                            workItem.Process();
-                        }
-                        catch (Exception ex)
-                        {
-                            _owner._logManager.LogM(LogLevel.Warn, nameof(ArenaLoop), $"Caught an exception while processing a work item. {ex}");
-                        }
-                        finally
-                        {
-                            if (workItem is IDisposable disposable)
-                                disposable.Dispose();
+                            try
+                            {
+                                workItem.Process();
+                            }
+                            catch (Exception ex)
+                            {
+                                _owner._logManager.LogM(LogLevel.Warn, nameof(ArenaLoop), $"Caught an exception while processing a work item. {ex}");
+                            }
+                            finally
+                            {
+                                if (workItem is IDisposable disposable)
+                                    disposable.Dispose();
+                            }
+
+                            IServerMetrics? serverMetrics = _owner._serverMetrics;
+                            if (serverMetrics is not null && serverMetrics.IsEnabled)
+                            {
+                                serverMetrics.Increment(ServerMetric.ArenaLoopWorkItemsProcessed);
+                            }
                         }
 
-                        IServerMetrics? serverMetrics = _owner._serverMetrics;
-                        if (serverMetrics is not null && serverMetrics.IsEnabled)
-                        {
-                            serverMetrics.Increment(ServerMetric.ArenaLoopWorkItemsProcessed);
-                        }
+                        ProcessTimers();
                     }
                 }
                 catch (OperationCanceledException)
                 {
                     // Shutting down.
+                }
+                catch (InvalidOperationException)
+                {
+                    // The queue was marked complete for adding, which is also shutting down.
                 }
 
                 // Release anything still queued, so that pooled work items and whatever they hold go back
