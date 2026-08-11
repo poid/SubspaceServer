@@ -198,10 +198,25 @@ namespace SS.Core
         /// <summary>
         /// Done with scores, needs to send arena response and run arena entering callbacks.
         /// </summary>
-        /// <remarks>Transitions to: <see cref="Playing"/> (or <see cref="DoArenaSync2"/>).</remarks>
+        /// <remarks>Transitions to: <see cref="WaitEnterArenaHolds"/> (or <see cref="DoArenaSync2"/>).</remarks>
         ArenaRespAndCBS,
 
-        // TODO: add WaitEnterArenaHolds
+        /// <summary>
+        /// Waiting for anything that asked to hold the player's arena entry.
+        /// </summary>
+        /// <remarks>
+        /// The entering callbacks have run and modules have had their chance to take a hold, so this
+        /// waits until they have all released. It is the point at which the player becomes the arena's:
+        /// before it, nothing on an arena thread may touch them; after it, the arena thread owns their
+        /// game state and the mainloop does not write it.
+        /// <para>
+        /// Held with <see cref="ComponentInterfaces.IPlayerData.AddHold(Player)"/> and released with
+        /// <see cref="ComponentInterfaces.IPlayerData.RemoveHold(Player)"/>, exactly as for
+        /// <see cref="WaitConnectHolds"/>.
+        /// </para>
+        /// <para>Transitions to: <see cref="Playing"/>.</para>
+        /// </remarks>
+        WaitEnterArenaHolds,
 
         /// <summary>
         /// The player is playing in an arena. This is typically the longest state.
@@ -212,10 +227,19 @@ namespace SS.Core
         /// <summary>
         /// The player has left arena, callbacks need to be called.
         /// </summary>
-        /// <remarks>Transitions to: <see cref="DoArenaSync2"/>.</remarks>
+        /// <remarks>Transitions to: <see cref="WaitLeaveArenaHolds"/>.</remarks>
         LeavingArena,
 
-        // TODO: add WaitLeaveArenaHolds
+        /// <summary>
+        /// Waiting for anything that asked to hold the player's arena exit.
+        /// </summary>
+        /// <remarks>
+        /// The counterpart of <see cref="WaitEnterArenaHolds"/>, and the point at which the player stops
+        /// being the arena's. Work already queued for the arena may still be about to run against this
+        /// player, so a module that has any takes a hold here until it has finished with them.
+        /// <para>Transitions to: <see cref="DoArenaSync2"/>.</para>
+        /// </remarks>
+        WaitLeaveArenaHolds,
 
         /// <summary>
         /// Need to sync in the other direction.

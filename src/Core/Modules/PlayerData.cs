@@ -891,6 +891,8 @@ namespace SS.Core.Modules
                 switch (player.Status)
                 {
                     case PlayerState.WaitConnectHolds:
+                    case PlayerState.WaitEnterArenaHolds:
+                    case PlayerState.WaitLeaveArenaHolds:
                     case PlayerState.WaitDisconnectHolds:
                         player.Holds++;
                         break;
@@ -914,6 +916,8 @@ namespace SS.Core.Modules
                 switch (player.Status)
                 {
                     case PlayerState.WaitConnectHolds:
+                    case PlayerState.WaitEnterArenaHolds:
+                    case PlayerState.WaitLeaveArenaHolds:
                     case PlayerState.WaitDisconnectHolds:
                         if (player.Holds > 0)
                         {

@@ -387,8 +387,32 @@ namespace SS.Core.Modules
 
                         case PlayerState.SendLoginResponse: ns = PlayerState.LoggedIn; break;
                         case PlayerState.DoFreqAndArenaSync: ns = PlayerState.WaitArenaSync1; break;
-                        case PlayerState.ArenaRespAndCBS: ns = PlayerState.Playing; break;
-                        case PlayerState.LeavingArena: ns = PlayerState.DoArenaSync2; break;
+                        // Both arena transitions go through a hold state, so that a module given the
+                        // entering or leaving callback can keep the player from moving on until it has
+                        // finished with them. It is also where ownership of the player's game state
+                        // passes to the arena's thread and back.
+                        case PlayerState.ArenaRespAndCBS: ns = PlayerState.WaitEnterArenaHolds; break;
+
+                        case PlayerState.WaitEnterArenaHolds:
+                            if (player.Holds == 0)
+                            {
+                                ns = PlayerState.Playing;
+                                break;
+                            }
+
+                            continue;
+
+                        case PlayerState.LeavingArena: ns = PlayerState.WaitLeaveArenaHolds; break;
+
+                        case PlayerState.WaitLeaveArenaHolds:
+                            if (player.Holds == 0)
+                            {
+                                ns = PlayerState.DoArenaSync2;
+                                break;
+                            }
+
+                            continue;
+
                         case PlayerState.DoArenaSync2: ns = PlayerState.WaitArenaSync2; break;
                         case PlayerState.LeavingZone: ns = PlayerState.WaitDisconnectHolds; break;
 
