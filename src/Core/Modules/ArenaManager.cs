@@ -1945,6 +1945,14 @@ namespace SS.Core.Modules
                     player.Status = PlayerState.DoArenaSync2;
                     break;
 
+                case PlayerState.WaitEnterArenaHolds:
+                    // The entering callbacks have run, so the leaving ones have to run too, but the
+                    // player is not in yet. Sending them the same way as Playing does both: the leaving
+                    // callbacks fire, and the holds still outstanding are waited for in the state after.
+                    player.Status = PlayerState.LeavingArena;
+                    notify = true;
+                    break;
+
                 case PlayerState.Playing:
                     // Do all of the above, plus call leaving callbacks.
                     player.Status = PlayerState.LeavingArena;
@@ -1952,6 +1960,7 @@ namespace SS.Core.Modules
                     break;
 
                 case PlayerState.LeavingArena:
+                case PlayerState.WaitLeaveArenaHolds:
                 case PlayerState.DoArenaSync2:
                 case PlayerState.WaitArenaSync2:
                 case PlayerState.LeavingZone:
