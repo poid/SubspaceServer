@@ -16,6 +16,8 @@
     <PackageReference Include="Microsoft.Extensions.ObjectPool" Version="10.0.10">
       <ExcludeAssets>runtime</ExcludeAssets>
     </PackageReference>
+    <!-- PostgreSQL client for the league database (signups/teams). Bundled with the plugin (like SS.Matchmaking). -->
+    <PackageReference Include="Npgsql" Version="10.0.3" />
   </ItemGroup>
 
   <ItemGroup>

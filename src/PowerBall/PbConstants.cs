@@ -47,6 +47,11 @@ namespace SS.PowerBall
 
         // Small-4-team score digit base. Team i, score s => Small4TeamScore0 + s + 5*i.
         public const short Small4TeamScore0 = 2500;
+
+        // League match countdown banners.
+        public const short LeagueReady = 91;
+        public const short LeagueSet = 92;
+        public const short LeagueGo = 93;
     }
 
     /// <summary>
