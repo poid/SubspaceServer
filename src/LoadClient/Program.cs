@@ -192,7 +192,11 @@ namespace SS.LoadClient
 
                 receiveTasks[index] = client.ReceiveLoopAsync(cancellationToken);
 
-                await client.LoginAsync(cancellationToken);
+                // Both of these are sent reliably and now report whether the server acknowledged them, so
+                // a client that lost one stops here with a reason rather than waiting for a reply to
+                // something that never arrived.
+                if (!await client.LoginAsync(cancellationToken))
+                    return;
 
                 // Wait for the server to actually answer the login before asking for an arena, rather
                 // than guessing how long it will take. A request that arrives first is thrown away,
@@ -206,7 +210,8 @@ namespace SS.LoadClient
                     return;
 
                 string arena = options.Arenas[index % options.Arenas.Length];
-                await client.GoToArenaAsync(arena, options.ViewWidth, options.ViewHeight, cancellationToken);
+                if (!await client.GoToArenaAsync(arena, options.ViewWidth, options.ViewHeight, cancellationToken))
+                    return;
 
                 // Likewise, positions sent before the arena is entered are discarded.
                 if (!await WaitUntilAsync(() => client.IsInArena, TimeSpan.FromSeconds(60), cancellationToken))

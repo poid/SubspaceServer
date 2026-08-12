@@ -27,6 +27,39 @@ namespace SS.LoadClient
     {
         private const byte ClientTypeVIE = 0x01;
 
+        /// <summary>
+        /// How many times the connection init is sent before giving up.
+        /// </summary>
+        private const int ConnectionInitAttempts = 5;
+
+        /// <summary>
+        /// How long to wait for a reply before sending the connection init again.
+        /// </summary>
+        /// <remarks>
+        /// Short, because the thing being recovered from is a dropped packet rather than a slow server:
+        /// waiting longer only delays the retry that was always going to be needed.
+        /// </remarks>
+        private static readonly TimeSpan ConnectionInitTimeout = TimeSpan.FromSeconds(2);
+
+        /// <summary>
+        /// How many times a reliable packet is sent before giving up on it.
+        /// </summary>
+        private const int ReliableSendAttempts = 5;
+
+        /// <summary>
+        /// How long to wait for an acknowledgement before sending a reliable packet again.
+        /// </summary>
+        private static readonly TimeSpan ReliableSendTimeout = TimeSpan.FromSeconds(3);
+
+        /// <summary>
+        /// The highest sequence number the server has acknowledged, or -1.
+        /// </summary>
+        /// <remarks>
+        /// Highest rather than a set, since acknowledgements can arrive out of order and a sender only
+        /// needs to know whether its own has gone past.
+        /// </remarks>
+        private long _highestAckedSequenceNumber = -1;
+
         private readonly Socket _socket = new(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
         private readonly byte[] _receiveBuffer = new byte[2048];
 
@@ -116,33 +149,42 @@ namespace SS.LoadClient
                 // which is what EncryptionNull does.
                 int key = Random.Shared.Next(int.MinValue, int.MaxValue);
                 ConnectionInitPacket init = new(key, ClientTypeVIE);
-                await SendRawAsync(MemoryMarshal.AsBytes(MemoryMarshal.CreateReadOnlySpan(ref init, 1)).ToArray(), cancellationToken);
+                byte[] initBytes = MemoryMarshal.AsBytes(MemoryMarshal.CreateReadOnlySpan(ref init, 1)).ToArray();
 
-                // Wait for the response, ignoring anything else that turns up first.
-                using CancellationTokenSource timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-                timeout.CancelAfter(TimeSpan.FromSeconds(10));
-
-                try
+                // Retried, because this is UDP and it is the one packet with nothing behind it to notice
+                // it went missing. A real client retries too. Sending it once and waiting meant a single
+                // lost datagram cost that client the whole run, which showed up as a steady few percent
+                // of clients never connecting, with the server having no record of them at all.
+                for (int attempt = 0; attempt < ConnectionInitAttempts; attempt++)
                 {
-                    while (true)
+                    await SendRawAsync(initBytes, cancellationToken);
+
+                    using CancellationTokenSource attemptTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                    attemptTimeout.CancelAfter(ConnectionInitTimeout);
+
+                    try
                     {
-                        int received = await _socket.ReceiveAsync(_receiveBuffer, SocketFlags.None, timeout.Token);
-                        if (received >= 6 && _receiveBuffer[0] == 0x00 && _receiveBuffer[1] == 0x02)
+                        while (true)
                         {
-                            IsConnected = true;
-                            return true;
+                            int received = await _socket.ReceiveAsync(_receiveBuffer, SocketFlags.None, attemptTimeout.Token);
+                            if (received >= 6 && _receiveBuffer[0] == 0x00 && _receiveBuffer[1] == 0x02)
+                            {
+                                IsConnected = true;
+                                return true;
+                            }
                         }
                     }
+                    catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+                    {
+                        // This attempt timed out. Try again, unless that was the last one.
+                    }
                 }
-                catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
-                {
-                    // Our own timeout, rather than the run ending. Worth saying so specifically: by far
-                    // the most likely cause is another encryption module sitting ahead of EncryptionNull,
-                    // which answers the handshake and then expects encryption this client cannot do.
-                    // Reported as a plain cancellation, that is close to impossible to guess.
-                    FailureReason = "no connection init response; is EncryptionNull loaded before EncryptionVIE?";
-                    return false;
-                }
+
+                // The other likely cause, and worth naming because it is close to impossible to guess:
+                // another encryption module sitting ahead of EncryptionNull answers the handshake and
+                // then expects encryption this client cannot do.
+                FailureReason = $"no connection init response after {ConnectionInitAttempts} attempts; is EncryptionNull loaded before EncryptionVIE?";
+                return false;
             }
             catch (OperationCanceledException)
             {
@@ -361,6 +403,22 @@ namespace SS.LoadClient
                     }
                     break;
 
+                case 0x04: // the server acknowledging something sent reliably
+                    if (span.Length >= AckPacket.Length)
+                    {
+                        int acked = LittleEndianConverter.Convert(MemoryMarshal.Read<int>(span.Slice(2, 4)));
+
+                        // Highest seen, since acknowledgements can arrive out of order and the senders
+                        // only care whether theirs has gone past.
+                        long previous;
+                        while ((previous = Volatile.Read(ref _highestAckedSequenceNumber)) < acked)
+                        {
+                            if (Interlocked.CompareExchange(ref _highestAckedSequenceNumber, acked, previous) == previous)
+                                break;
+                        }
+                    }
+                    break;
+
                 case 0x07: // the server dropped us
                     FailureReason ??= "disconnected by server";
                     break;
@@ -456,15 +514,58 @@ namespace SS.LoadClient
             return SendRawAsync(MemoryMarshal.AsBytes(MemoryMarshal.CreateReadOnlySpan(ref ack, 1)).ToArray(), cancellationToken);
         }
 
+        /// <summary>
+        /// Sends a packet reliably, resending until the server acknowledges it.
+        /// </summary>
+        /// <remarks>
+        /// Resending is what makes it reliable, and this used to send once and hope. The two packets sent
+        /// this way, the login and the arena request, are the two with nothing behind them to notice they
+        /// went missing: lose either and the client sits waiting for a reply to something the server
+        /// never received. Measured over two thousand clients, twenty one lost their login and nineteen
+        /// their arena request, and every one of them was simply absent from the run afterwards.
+        /// </remarks>
+        /// <param name="payload">The packet to send, without the reliable header.</param>
+        /// <param name="cancellationToken">To stop waiting.</param>
+        /// <returns><see langword="true"/> if it was acknowledged.</returns>
         private async Task<bool> SendReliableAsync(byte[] payload, CancellationToken cancellationToken)
         {
-            byte[] buffer = new byte[ReliableHeader.Length + payload.Length];
+            int sequenceNumber = Interlocked.Increment(ref _outgoingSequenceNumber) - 1;
 
-            ReliableHeader header = new(Interlocked.Increment(ref _outgoingSequenceNumber) - 1);
+            byte[] buffer = new byte[ReliableHeader.Length + payload.Length];
+            ReliableHeader header = new(sequenceNumber);
             MemoryMarshal.AsBytes(MemoryMarshal.CreateReadOnlySpan(ref header, 1)).CopyTo(buffer);
             payload.CopyTo(buffer, ReliableHeader.Length);
 
-            return await SendRawAsync(buffer, cancellationToken);
+            for (int attempt = 0; attempt < ReliableSendAttempts; attempt++)
+            {
+                if (!await SendRawAsync(buffer, cancellationToken))
+                    return false;
+
+                // The receive loop records acknowledgements as they arrive, so this only has to watch for
+                // this one going past.
+                long deadline = Environment.TickCount64 + (long)ReliableSendTimeout.TotalMilliseconds;
+
+                while (Environment.TickCount64 < deadline)
+                {
+                    if (Volatile.Read(ref _highestAckedSequenceNumber) >= sequenceNumber)
+                        return true;
+
+                    if (cancellationToken.IsCancellationRequested)
+                        return false;
+
+                    try
+                    {
+                        await Task.Delay(50, cancellationToken);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        return false;
+                    }
+                }
+            }
+
+            FailureReason ??= $"no acknowledgement for reliable packet {sequenceNumber} after {ReliableSendAttempts} attempts";
+            return false;
         }
 
         private async Task<bool> SendRawAsync(byte[] data, CancellationToken cancellationToken)
