@@ -156,9 +156,18 @@ namespace SS.PowerBall.Modules
                 return;
             }
 
+            if (ad.CurrentPickFreq == -1)
+            {
+                _chat.SendMessage(player, "No team currently has the pick.");
+                return;
+            }
+
             Team? team = FindTeamFreq(ad, ad.CurrentPickFreq);
             if (team is null)
+            {
+                _chat.SendMessage(player, $"No team found with the current pick for frequency {ad.CurrentPickFreq}");
                 return;
+            }
 
             if (team.Captain is not null)
                 _chat.SendMessage(player, $"{team.Captain} has the current pick for {team.TeamName}.");
@@ -664,7 +673,9 @@ namespace SS.PowerBall.Modules
 
             team.Players.Add(teamPlayer);
 
-            if (ad.ActiveEvent is not null && !(wasLoaded || wasBorrowed))
+            // Anyone placed on a team is taken off the sign-up list (including loaded/borrowed players), so the
+            // list always reflects who is NOT on a team. A no-op if they weren't signed up.
+            if (ad.ActiveEvent is not null)
                 RemoveFromSignup(ad.ActiveEvent, name);
 
             return teamPlayer;
@@ -1515,7 +1526,22 @@ namespace SS.PowerBall.Modules
                     _chat.SendMessage(player, "You cannot lagout a player, only yourself.");
                     return;
                 }
-                subject = targeted ?? FindPlayerInArenaFuzzy(arena, args.Trim()) ?? player;
+                if (targeted is not null)
+                {
+                    subject = targeted;
+                }
+                else
+                {
+                    // A name was given but didn't resolve to a unique in-arena player: report it rather than
+                    // silently falling back to acting on the staff member.
+                    Player? resolved = FindPlayerInArenaFuzzy(arena, args.Trim());
+                    if (resolved is null)
+                    {
+                        _chat.SendMessage(player, $"No unique player found matching {args.Trim().ToString()}");
+                        return;
+                    }
+                    subject = resolved;
+                }
             }
 
             Team? team = FindTeamExactPlayer(ad, subject.Name!);
@@ -1543,7 +1569,22 @@ namespace SS.PowerBall.Modules
                     _chat.SendMessage(player, "You cannot set another player's team freq.");
                     return;
                 }
-                subject = targeted ?? FindPlayerInArenaFuzzy(arena, args.Trim()) ?? player;
+                if (targeted is not null)
+                {
+                    subject = targeted;
+                }
+                else
+                {
+                    // A name was given but didn't resolve to a unique in-arena player: report it rather than
+                    // silently falling back to acting on the staff member.
+                    Player? resolved = FindPlayerInArenaFuzzy(arena, args.Trim());
+                    if (resolved is null)
+                    {
+                        _chat.SendMessage(player, $"No unique player found matching {args.Trim().ToString()}");
+                        return;
+                    }
+                    subject = resolved;
+                }
             }
 
             Team? team = FindTeamExactPlayer(ad, subject.Name!) ?? FindCaptainTeam(ad, subject);

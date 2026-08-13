@@ -225,7 +225,9 @@ namespace SS.PowerBall.Modules
                 if (player is not null && player.Arena == arena)
                     _game.SetShipAndFreq(player, ShipType.Spec, arena.SpecFreq);
 
-                if (ad.RepopulateSignups && ad.ActiveEvent is not null && !teamPlayer.WasLoaded && !teamPlayer.WasBorrowed)
+                // Releasing a team returns all its players to the sign-up list (symmetric with AddPlayerToList's
+                // removal), so the list keeps reflecting who is not on a team.
+                if (ad.RepopulateSignups && ad.ActiveEvent is not null)
                     RepopulateSignup(ad.ActiveEvent, teamPlayer.Name);
             }
 
@@ -500,6 +502,8 @@ namespace SS.PowerBall.Modules
 
             if (ad.ActiveEvent is not null)
                 _chat.SendMessage(player, $"In order to be picked you must be on the signup list. If you haven't signed up already use ?signup {ad.ActiveEvent}");
+            else if (ad.PickingStage is PickingStage.Setup or PickingStage.Paused or PickingStage.Picking)
+                _chat.SendMessage(player, "Consider sending a message in public chat so captains know you are available to be picked.");
 
             _chat.SendMessage(player, "Type ?pbhelp for available commands.");
         }
