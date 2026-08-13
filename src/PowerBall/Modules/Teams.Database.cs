@@ -97,51 +97,82 @@ namespace SS.PowerBall.Modules
 
         private void Cmd_SaveTeams(Arena arena, ArenaData ad, Player player, ReadOnlySpan<char> args)
         {
-            if (!_db.IsAvailable)
+            // No argument: just report the current status (no DB required).
+            if (args.IsEmpty)
             {
-                _chat.SendMessage(player, "No DB connection available.");
+                _chat.SendMessage(player, $"Save Teams currently set as {(ad.SaveTeams ? "ON" : "OFF")}");
+                return;
+            }
+
+            if (args.StartsWith("ON", StringComparison.OrdinalIgnoreCase))
+            {
+                if (ad.SaveTeams)
+                {
+                    _chat.SendMessage(player, "Save teams is already set to ON");
+                    return;
+                }
+                if (!_db.IsAvailable)
+                {
+                    ad.SaveTeams = false;
+                    _chat.SendMessage(player, "Database connection not available. Save teams currently set as OFF");
+                    return;
+                }
+
+                List<TeamSnapshot> snapshot = SnapshotTeams(ad);
+                RunGuarded(async () =>
+                {
+                    List<string> teamNames = new(snapshot.Count);
+                    foreach (TeamSnapshot t in snapshot)
+                        teamNames.Add(t.Name);
+
+                    IReadOnlyList<string> existing = await _db.CheckExistingTeamsAsync(teamNames);
+                    if (existing.Count > 0)
+                    {
+                        int i = 0;
+                        foreach (string e in existing)
+                            _chat.SendMessage(player, $"{++i,2}.{e} already exists.");
+                        return;
+                    }
+
+                    ad.SaveTeams = true;
+                    _chat.SendMessage(player, "Save Teams currently set as ON");
+
+                    foreach (TeamSnapshot t in snapshot)
+                    {
+                        await _db.AddTeamAsync(t.Name, t.Captain);
+                        foreach (string p in t.Players)
+                            await _db.AddTeamPlayerAsync(t.Name, p);
+                    }
+                });
                 return;
             }
 
             if (args.StartsWith("OFF", StringComparison.OrdinalIgnoreCase))
             {
+                if (!ad.SaveTeams)
+                {
+                    _chat.SendMessage(player, "Save teams is already set to OFF");
+                    return;
+                }
+                if (!_db.IsAvailable)
+                {
+                    ad.SaveTeams = false;
+                    _chat.SendMessage(player, "Save Teams currently set as OFF");
+                    return;
+                }
+
                 List<string> names = SnapshotTeamNames(ad);
                 ad.SaveTeams = false;
                 RunGuarded(async () =>
                 {
                     foreach (string name in names)
                         await _db.DeleteTeamAsync(name);
-                    _chat.SendMessage(player, "Team saving canceled and saved teams removed.");
+                    _chat.SendMessage(player, "Save Teams currently set as OFF");
                 });
                 return;
             }
 
-            List<TeamSnapshot> snapshot = SnapshotTeams(ad);
-            RunGuarded(async () =>
-            {
-                List<string> teamNames = new(snapshot.Count);
-                foreach (TeamSnapshot t in snapshot)
-                    teamNames.Add(t.Name);
-
-                IReadOnlyList<string> existing = await _db.CheckExistingTeamsAsync(teamNames);
-                if (existing.Count > 0)
-                {
-                    int i = 0;
-                    foreach (string e in existing)
-                        _chat.SendMessage(player, $"{++i,2}.{e} already exists.");
-                    return;
-                }
-
-                ad.SaveTeams = true;
-                _chat.SendMessage(player, "Save teams enabled and current teams saved.");
-
-                foreach (TeamSnapshot t in snapshot)
-                {
-                    await _db.AddTeamAsync(t.Name, t.Captain);
-                    foreach (string p in t.Players)
-                        await _db.AddTeamPlayerAsync(t.Name, p);
-                }
-            });
+            _chat.SendMessage(player, "Please specify ON or OFF.");
         }
 
         private void Cmd_SavedTeams(Player player)
@@ -169,6 +200,12 @@ namespace SS.PowerBall.Modules
             if (!CheckDb(player))
                 return;
 
+            if (args.IsEmpty)
+            {
+                _chat.SendMessage(player, "You must specify a team to list the players for.");
+                return;
+            }
+
             string name = args.Trim().ToString();
             RunGuarded(async () =>
             {
@@ -179,12 +216,21 @@ namespace SS.PowerBall.Modules
                     return;
                 }
 
-                SavedTeamInfo chosen = PickExactOrFirst(matches, name);
-                _chat.SendMessage(player, $"Team {chosen.Name} - Captain: {chosen.Captain}");
+                // List every fuzzy match, each with its roster.
+                foreach (SavedTeamInfo t in matches)
+                {
+                    _chat.SendMessage(player, $"Team {t.Name} - Captain: {t.Captain}");
 
-                IReadOnlyList<string> players = await _db.GetTeamPlayersAsync(chosen.Name);
-                foreach (string p in players)
-                    _chat.SendMessage(player, $"+ {p}");
+                    IReadOnlyList<string> players = await _db.GetTeamPlayersAsync(t.Name);
+                    if (players.Count == 0)
+                    {
+                        _chat.SendMessage(player, "No players found for team.");
+                        continue;
+                    }
+
+                    foreach (string p in players)
+                        _chat.SendMessage(player, $"+ {p}");
+                }
             });
         }
 
@@ -203,10 +249,22 @@ namespace SS.PowerBall.Modules
             if (!CheckDb(player))
                 return;
 
-            SplitColon(args, out ReadOnlySpan<char> freqSpan, out ReadOnlySpan<char> nameSpan);
-            if (!int.TryParse(freqSpan.Trim(), out int freq))
+            if (args.IsEmpty)
             {
-                _chat.SendMessage(player, "Usage: ?loadteam <freq>:<name>");
+                _chat.SendMessage(player, "You must specify a team name and frequency.");
+                return;
+            }
+            if (!args.Contains(':'))
+            {
+                _chat.SendMessage(player, "You must specify a team name and frequency. ie ?loadteam 100:Best Team");
+                return;
+            }
+
+            SplitColon(args, out ReadOnlySpan<char> freqSpan, out ReadOnlySpan<char> nameSpan);
+            ReadOnlySpan<char> freqTrimmed = freqSpan.Trim();
+            if (!int.TryParse(freqTrimmed, out int freq) || freq < 0 || (freq == 0 && freqTrimmed[0] != '0'))
+            {
+                _chat.SendMessage(player, "No frequency specified");
                 return;
             }
 

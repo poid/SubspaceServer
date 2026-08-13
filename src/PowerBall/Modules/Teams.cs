@@ -344,18 +344,66 @@ namespace SS.PowerBall.Modules
             return null;
         }
 
-        private static (BorrowedPlayer? borrow, Team? team) FindBorrowedPlayerInTeams(ArenaData ad, ReadOnlySpan<char> name)
+        /// <summary>Fuzzy (prefix) borrow lookup across all teams; exact-length match wins and short-circuits.</summary>
+        private static (BorrowedPlayer? borrow, Team? team, int count) FindBorrowedPlayerInTeams(ArenaData ad, ReadOnlySpan<char> name)
         {
+            if (name.IsEmpty)
+                return (null, null, 0);
+
+            BorrowedPlayer? match = null;
+            Team? matchTeam = null;
+            int count = 0;
+
             foreach (Team team in ad.Teams)
             {
                 foreach (BorrowedPlayer borrow in team.BorrowList)
                 {
-                    if (name.Equals(borrow.Name, StringComparison.OrdinalIgnoreCase))
-                        return (borrow, team);
+                    if (borrow.Name is not { } bn || !bn.AsSpan().StartsWith(name, StringComparison.OrdinalIgnoreCase))
+                        continue;
+
+                    if (bn.Length == name.Length)
+                        return (borrow, team, 1); // exact
+
+                    count++;
+                    if (match is null)
+                    {
+                        match = borrow;
+                        matchTeam = team;
+                    }
                 }
             }
 
-            return (null, null);
+            if (count > 1)
+                return (null, null, count);
+
+            return (match, matchTeam, count);
+        }
+
+        /// <summary>Fuzzy (prefix) borrow lookup within a single team; exact-length match wins and short-circuits.</summary>
+        private static (BorrowedPlayer? borrow, int count) FindBorrowedPlayerInTeam(Team team, ReadOnlySpan<char> name)
+        {
+            if (name.IsEmpty)
+                return (null, 0);
+
+            BorrowedPlayer? match = null;
+            int count = 0;
+
+            foreach (BorrowedPlayer borrow in team.BorrowList)
+            {
+                if (borrow.Name is not { } bn || !bn.AsSpan().StartsWith(name, StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                if (bn.Length == name.Length)
+                    return (borrow, 1); // exact
+
+                count++;
+                match ??= borrow;
+            }
+
+            if (count > 1)
+                return (null, count);
+
+            return (match, count);
         }
 
         private bool IsCaptain(ArenaData ad, Player player)

@@ -75,89 +75,88 @@ namespace SS.PowerBall.Modules
 
         #region Pick orders
 
+        // Examines one position (1-based) per iteration, advancing by one each time (matching the C). A full cycle of
+        // positions with no pickable team means picking is complete. (The ASSS original could infinite-loop here; this
+        // is bounded.)
         private void NormalPick(Arena arena, ArenaData ad, bool notify)
         {
             SortTeamsByFreq(ad);
 
             if (ad.CurrentPick > ad.NumberOfTeams)
-                ad.CurrentPick = 1;
+                ad.CurrentPick = ad.NumberOfTeams;
 
-            int passes = 0;
-            while (passes < 2)
+            for (int examined = 0; examined < ad.NumberOfTeams; examined++)
             {
-                int pos = 0;
-                foreach (Team team in ad.Teams)
+                Team? team = TeamAtPosition(ad, ad.CurrentPick);
+                bool loadedFull = team is not null && team.WasLoaded && team.PlayersInGame >= ad.TeamInGameMax;
+
+                if (team is not null && !loadedFull)
                 {
-                    pos++;
-                    if (pos < ad.CurrentPick)
-                        continue;
-
-                    if (team.WasLoaded && team.PlayersInGame >= ad.TeamInGameMax)
-                        continue;
-
                     ad.CurrentPickFreq = team.Frequency;
                     if (notify)
                         AnnouncePick(arena, team);
-
-                    ad.CurrentPick++;
-                    if (ad.CurrentPick > ad.NumberOfTeams)
-                        ad.CurrentPick = 1;
+                    AdvanceNormal(ad);
                     return;
                 }
 
-                // Reached the end without a pick; wrap and try once more.
-                ad.CurrentPick = 1;
-                passes++;
+                AdvanceNormal(ad);
             }
 
             AnnouncePickingComplete(arena, ad);
+        }
+
+        private static void AdvanceNormal(ArenaData ad)
+        {
+            ad.CurrentPick++;
+            if (ad.CurrentPick > ad.NumberOfTeams)
+                ad.CurrentPick = 1;
         }
 
         private void SnakePick(Arena arena, ArenaData ad, bool notify, bool skip)
         {
             SortTeamsByFreq(ad);
 
-            int loopCount = 0;
-            while (loopCount < 2)
+            if (ad.CurrentPick > ad.NumberOfTeams)
+                ad.CurrentPick = ad.NumberOfTeams;
+
+            int reversals = 0;
+            int safety = 2 * ad.NumberOfTeams + 4;
+            while (safety-- > 0)
             {
-                int pos = 0;
-                foreach (Team team in ad.Teams)
+                Team? team = TeamAtPosition(ad, ad.CurrentPick);
+                bool loadedFull = team is not null && team.WasLoaded && team.PlayersInGame >= ad.TeamInGameMax;
+                bool skipThis = skip && team is not null && team.Frequency == ad.CurrentPickFreq;
+
+                if (team is not null && !loadedFull && !skipThis)
                 {
-                    pos++;
-                    if (pos != ad.CurrentPick)
-                        continue;
-
-                    bool eligible = !(team.WasLoaded && team.PlayersInGame >= ad.TeamInGameMax)
-                        && !(skip && team.Frequency == ad.CurrentPickFreq);
-
-                    if (eligible)
-                    {
-                        ad.CurrentPickFreq = team.Frequency;
-                        if (notify)
-                            AnnouncePick(arena, team);
-                        AdvanceSnake(ad);
-                        return;
-                    }
-
-                    break;
+                    ad.CurrentPickFreq = team.Frequency;
+                    if (notify)
+                        AnnouncePick(arena, team);
+                    AdvanceSnake(ad, ref reversals);
+                    return;
                 }
 
-                AdvanceSnake(ad);
-                loopCount++;
-            }
+                AdvanceSnake(ad, ref reversals);
 
-            AnnouncePickingComplete(arena, ad);
+                // Two direction reversals means we've swept the field twice without a pick — picking is complete.
+                if (reversals >= 2)
+                {
+                    AnnouncePickingComplete(arena, ad);
+                    return;
+                }
+            }
         }
 
-        private static void AdvanceSnake(ArenaData ad)
+        private static void AdvanceSnake(ArenaData ad, ref int reversals)
         {
             if (!ad.PickDirection)
             {
                 ad.CurrentPick++;
                 if (ad.CurrentPick > ad.NumberOfTeams)
                 {
-                    ad.CurrentPick = ad.NumberOfTeams; // the end team picks twice
+                    ad.CurrentPick--; // the end team picks twice
                     ad.PickDirection = true;
+                    reversals++;
                 }
             }
             else
@@ -165,10 +164,19 @@ namespace SS.PowerBall.Modules
                 ad.CurrentPick--;
                 if (ad.CurrentPick < 1)
                 {
-                    ad.CurrentPick = 1; // the first team picks twice
+                    ad.CurrentPick++; // the first team picks twice
                     ad.PickDirection = false;
+                    reversals++;
                 }
             }
+        }
+
+        private static Team? TeamAtPosition(ArenaData ad, int position)
+        {
+            if (position < 1 || position > ad.Teams.Count)
+                return null;
+
+            return ad.Teams[position - 1];
         }
 
         private void RandomPick(Arena arena, ArenaData ad, bool notify)
@@ -221,33 +229,56 @@ namespace SS.PowerBall.Modules
 
         #region Round management
 
-        /// <summary>Finds the team most behind on picks and gives it the pick. Returns true if one was found.</summary>
+        /// <summary>
+        /// Finds the team most behind on picks (lowest count under round-1, tie-break to the current-pick freq) and
+        /// gives it the pick. Returns true if one was found.
+        /// </summary>
         private bool FindMissingPicks(Arena arena, ArenaData ad, bool notify, bool skip)
         {
-            Team? behind = null;
+            Team? lowest = null;
+            int lowestCount = -1;
+
             foreach (Team team in ad.Teams)
             {
-                if (skip && team.Frequency == ad.CurrentPickFreq)
-                    continue;
-
-                int count = team.WasLoaded ? team.PlayersInGame : team.PickedCount;
-                if (count < ad.PickingRound - 1)
+                int count;
+                if (ad.IsDraft)
                 {
-                    behind = team;
-                    break;
+                    count = team.PickedCount;
+                    if (count >= ad.PickingRound - 1)
+                        continue;
+                }
+                else if (team.WasLoaded)
+                {
+                    count = team.PlayersInGame;
+                    if (!(count < ad.PickingRound - 1 && count < ad.TeamInGameMax))
+                        continue;
+                }
+                else
+                {
+                    count = team.PickedCount;
+                    if (count >= ad.PickingRound - 1)
+                        continue;
+                }
+
+                bool better = lowestCount == -1 || count < lowestCount
+                    || (count == lowestCount && team.Frequency == ad.CurrentPickFreq);
+                if (better && (!skip || team.Frequency != ad.CurrentPickFreq))
+                {
+                    lowestCount = count;
+                    lowest = team;
                 }
             }
 
-            if (behind is null)
+            if (lowest is null)
                 return false;
 
-            ad.CurrentPickFreq = behind.Frequency;
+            ad.CurrentPickFreq = lowest.Frequency;
             if (notify)
             {
-                if (behind.Captain is not null)
-                    _chat.SendArenaMessage(arena, $"Your pick {behind.Captain}");
+                if (lowest.Captain is not null)
+                    _chat.SendArenaMessage(arena, ChatSound.Beep1, $"Your pick {lowest.Captain}");
                 else
-                    _chat.SendArenaMessage(arena, $"{behind.TeamName} team pick, but no captain set!");
+                    _chat.SendArenaMessage(arena, ChatSound.Beep1, $"{lowest.TeamName} team pick, but no captain set!");
             }
 
             return true;
@@ -256,25 +287,25 @@ namespace SS.PowerBall.Modules
         /// <summary>Advances the picking round. Returns true when all rounds are complete.</summary>
         private bool SetPickingRound(Arena arena, ArenaData ad)
         {
+            bool nonLoadedTeam = false;
             foreach (Team team in ad.Teams)
             {
-                int count = team.WasLoaded ? team.PlayersInGame : team.PickedCount;
-                if (count < ad.PickingRound)
-                    return false; // some team still owes a pick this round
+                if (team.WasLoaded && team.PlayersInGame < ad.PickingRound)
+                    return false;
+
+                if (!team.WasLoaded)
+                {
+                    nonLoadedTeam = true;
+                    if (team.PickedCount < ad.PickingRound)
+                        return false;
+                }
             }
 
             ad.PickingRound++;
-
-            bool anyNonLoaded = false;
-            foreach (Team team in ad.Teams)
-            {
-                if (!team.WasLoaded)
-                    anyNonLoaded = true;
-            }
-
-            int cap = anyNonLoaded ? ad.TeamMax : ad.TeamInGameMax;
+            int cap = nonLoadedTeam ? ad.TeamMax : ad.TeamInGameMax;
             if (ad.PickingRound > cap)
             {
+                ad.PickingRound = cap; // clamp so the "behind" thresholds don't drift
                 if (ad.PickingStage == PickingStage.Picking)
                     _chat.SendArenaMessage(arena, "Teams have picked the maximum number of players. Captains to ?ready when ready.");
                 return true;
@@ -283,11 +314,20 @@ namespace SS.PowerBall.Modules
             return false;
         }
 
-        private bool IsTeamMissingPicks(ArenaData ad, Team team)
+        private static bool IsTeamMissingPicks(ArenaData ad, Team team)
         {
-            int count = team.WasLoaded ? team.PlayersInGame : team.PickedCount;
-            int cap = team.WasLoaded ? ad.TeamInGameMax : (ad.PickingStage == PickingStage.Completed ? ad.TeamMax : ad.PickingRound);
-            return count < cap;
+            if (team.WasLoaded)
+            {
+                if (ad.PickingStage == PickingStage.Completed)
+                    return team.PlayersInGame < ad.TeamInGameMax;
+
+                return team.PlayersInGame < ad.TeamInGameMax && team.PlayersInGame < ad.PickingRound;
+            }
+
+            if (ad.PickingStage == PickingStage.Completed)
+                return team.PickedCount < ad.TeamMax;
+
+            return team.PickedCount < ad.PickingRound;
         }
 
         private bool IsCurrentPick(ArenaData ad, int freq)
@@ -370,14 +410,14 @@ namespace SS.PowerBall.Modules
         private void AnnouncePick(Arena arena, Team team)
         {
             if (team.Captain is not null)
-                _chat.SendArenaMessage(arena, $"Your pick {team.Captain}");
+                _chat.SendArenaMessage(arena, ChatSound.Beep1, $"Your pick {team.Captain}");
             else
-                _chat.SendArenaMessage(arena, $"Your pick {team.TeamName} (No Captain assigned)");
+                _chat.SendArenaMessage(arena, ChatSound.Beep1, $"Your pick {team.TeamName} (No Captain assigned)");
         }
 
         private void AnnouncePickingComplete(Arena arena, ArenaData ad)
         {
-            _chat.SendArenaMessage(arena, "Picking complete. Captains to ?ready when ready.");
+            _chat.SendArenaMessage(arena, ChatSound.Beep2, "Picking complete. Captains to ?ready when ready.");
         }
 
         #endregion

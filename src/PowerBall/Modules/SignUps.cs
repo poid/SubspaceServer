@@ -432,10 +432,14 @@ namespace SS.PowerBall.Modules
 
             Run(player, async () =>
             {
-                if (await _db.GetEventStateAsync(ev).ConfigureAwait(false) == EventState.NotFound)
+                switch (await _db.GetEventStateAsync(ev).ConfigureAwait(false))
                 {
-                    _chat.SendMessage(player, "Cannot find event.");
-                    return;
+                    case EventState.NotFound:
+                        _chat.SendMessage(player, "Cannot find event.");
+                        return;
+                    case EventState.Inactive:
+                        _chat.SendMessage(player, "Event is not currently active.");
+                        return;
                 }
 
                 IReadOnlyList<string> existing = await _db.FindSignUpsAsync(ev, playerName).ConfigureAwait(false);

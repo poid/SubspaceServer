@@ -62,7 +62,7 @@ namespace SS.PowerBall.Modules
                 case "teams": Cmd_Teams(arena, ad, player); break;
                 case "caps" or "captains": Cmd_Captains(arena, ad, player); break;
                 case "currentpick": Cmd_CurrentPick(arena, ad, player); break;
-                case "pickstatus" or "setpickingstage" when args.IsEmpty: DisplayPickStatus(arena, ad, player); break;
+                case "pickstatus": DisplayPickStatus(arena, ad, player); break;
                 case "listborrows": Cmd_ListBorrows(arena, ad, player, args); break;
                 case "teamshelp": PrintHelp(player); break;
                 case "teamsversion": _chat.SendMessage(player, "PowerBall Teams module (C# port of ASSS Teams Module v1.1 by POiD)"); break;
@@ -71,7 +71,7 @@ namespace SS.PowerBall.Modules
                 case "addteam": Cmd_AddTeam(arena, ad, player, args); break;
                 case "removeteam": Cmd_RemoveTeam(arena, ad, player, args); break;
                 case "addcap" or "addcaptain": Cmd_AddCaptain(arena, ad, player, args, target); break;
-                case "removecap" or "removecaptain": Cmd_RemoveCaptain(arena, ad, player, args); break;
+                case "removecap" or "removecaptain": Cmd_RemoveCaptain(arena, ad, player, args, target); break;
                 case "saveteams": Cmd_SaveTeams(arena, ad, player, args); break;
                 case "setteamship": Cmd_SetTeamShip(arena, ad, player, args); break;
                 case "teammax": Cmd_TeamMax(arena, ad, player, args, inGame: false); break;
@@ -96,7 +96,7 @@ namespace SS.PowerBall.Modules
                 case "borrow": Cmd_Borrow(arena, ad, player, args); break;
                 case "unborrow": Cmd_UnBorrow(arena, ad, player, args); break;
                 case "approve": Cmd_Approve(arena, ad, player, args); break;
-                case "addborrow": Cmd_AddBorrow(arena, ad, player, args); break;
+                case "addborrow": Cmd_AddBorrow(arena, ad, player, args, target); break;
                 case "lagout" or "forcelagout": Cmd_LagOut(arena, ad, player, args, target); break;
                 case "teamfreq" or "forceteamfreq": Cmd_TeamFreq(arena, ad, player, args, target); break;
 
@@ -242,9 +242,10 @@ namespace SS.PowerBall.Modules
             }
 
             SplitColon(args, out ReadOnlySpan<char> freqSpan, out ReadOnlySpan<char> nameSpan);
-            if (!int.TryParse(freqSpan.Trim(), out int freq))
+            ReadOnlySpan<char> freqTrimmed = freqSpan.Trim();
+            if (!int.TryParse(freqTrimmed, out int freq) || freq < 0 || (freq == 0 && freqTrimmed[0] != '0'))
             {
-                _chat.SendMessage(player, "Invalid frequency.");
+                _chat.SendMessage(player, "No frequency specified.");
                 return;
             }
 
@@ -370,23 +371,58 @@ namespace SS.PowerBall.Modules
                 RunDb(() => _db.ChangeTeamCaptainAsync(team.TeamName, captainName));
         }
 
-        private void Cmd_RemoveCaptain(Arena arena, ArenaData ad, Player player, ReadOnlySpan<char> args)
+        private void Cmd_RemoveCaptain(Arena arena, ArenaData ad, Player player, ReadOnlySpan<char> args, ITarget target)
         {
-            SplitColon(args, out ReadOnlySpan<char> teamSpan, out ReadOnlySpan<char> nameSpan);
-            Team? team = FindTeam(ad, teamSpan.Trim());
-            if (team is null || team.Captain is null)
+            Team? team;
+            string captainQuery;
+
+            if (target.TryGetPlayerTarget(out Player? targeted))
             {
-                _chat.SendMessage(player, "Team or captain not found.");
+                if (args.IsEmpty)
+                {
+                    _chat.SendMessage(player, "No frequency or team name specified");
+                    return;
+                }
+                team = FindTeam(ad, args);
+                captainQuery = targeted.Name ?? "";
+            }
+            else
+            {
+                if (!args.Contains(':'))
+                {
+                    _chat.SendMessage(player, "You must specify the team name or frequency and the captain. Ex: ?removecap 0:John.");
+                    return;
+                }
+                SplitColon(args, out ReadOnlySpan<char> teamSpan, out ReadOnlySpan<char> nameSpan);
+                team = FindTeam(ad, teamSpan.Trim());
+                captainQuery = nameSpan.Trim().ToString();
+            }
+
+            if (team is null)
+            {
+                _chat.SendMessage(player, "Team not found.");
                 return;
             }
 
-            if (!nameSpan.IsEmpty && !nameSpan.Trim().Equals(team.Captain, StringComparison.OrdinalIgnoreCase))
+            RemoveCaptain(arena, ad, player, team, captainQuery);
+        }
+
+        private void RemoveCaptain(Arena arena, ArenaData ad, Player actor, Team team, string captainQuery)
+        {
+            if (team.Captain is null)
             {
-                _chat.SendMessage(player, $"{nameSpan.Trim().ToString()} is not the captain of {team.TeamName}.");
+                _chat.SendMessage(actor, $"There is no captain set for team {team.TeamName}");
                 return;
             }
 
-            _chat.SendArenaMessage(arena, $"{team.Captain} removed as captain of team {team.Frequency}");
+            // The provided string must be a case-insensitive prefix of the current captain's name.
+            if (!team.Captain.AsSpan().StartsWith(captainQuery, StringComparison.OrdinalIgnoreCase))
+            {
+                _chat.SendMessage(actor, $"{team.Captain} is the captain of team {team.TeamName}, not {captainQuery}.");
+                return;
+            }
+
+            _chat.SendArenaMessage(arena, ChatSound.Beep1, $"{team.Captain} removed from captain of team {team.TeamName} by {actor.Name}");
             team.Captain = null;
 
             if (ad.SaveTeams)
@@ -546,14 +582,39 @@ namespace SS.PowerBall.Modules
 
         private void Cmd_SetPickingStage(Arena arena, ArenaData ad, Player player, ReadOnlySpan<char> args)
         {
-            if (!int.TryParse(args, out int stage) || stage < 1 || stage > 5)
+            if (args.IsEmpty)
             {
-                _chat.SendMessage(player, "Usage: ?setpickingstage <1-5>");
+                DisplayPickStatus(arena, ad, player);
                 return;
             }
 
-            ad.PickingStage = (PickingStage)stage;
-            _chat.SendMessage(player, $"Picking stage set to {ad.PickingStage}.");
+            // ASSS maps 1->Setup, 2->Picking, 3->Completed, 4->GameStart, 5->GameOver (Paused is not settable here).
+            switch (args[0])
+            {
+                case '1':
+                    ad.PickingStage = PickingStage.Setup;
+                    _chat.SendMessage(player, "Picking Stage reset to Setup");
+                    break;
+                case '2':
+                    ad.PickingStage = PickingStage.Picking;
+                    _chat.SendMessage(player, "Picking Stage reset to Picking");
+                    break;
+                case '3':
+                    ad.PickingStage = PickingStage.Completed;
+                    _chat.SendMessage(player, "Picking Stage reset to Completed");
+                    break;
+                case '4':
+                    ad.PickingStage = PickingStage.GameStart;
+                    _chat.SendMessage(player, "Picking Stage reset to Game Start");
+                    break;
+                case '5':
+                    ad.PickingStage = PickingStage.GameOver;
+                    _chat.SendMessage(player, "Picking Stage reset to Game Over");
+                    break;
+                default:
+                    _chat.SendMessage(player, $"Unrecognized stage {args[0]}, please specify 1-5 as the option");
+                    break;
+            }
         }
 
         private void Cmd_SameTeams(Arena arena, ArenaData ad, Player player)
@@ -669,9 +730,10 @@ namespace SS.PowerBall.Modules
                 _chat.SendMessage(player, "Currently in team adding mode. Pick is only used for drafting.");
                 return;
             }
-            if (!draftCommand && ad.IsDraft && false)
+            if (!draftCommand && ad.IsDraft)
             {
-                // ?add in draft mode is still allowed for staff in ASSS; leave add usable.
+                _chat.SendMessage(player, "Currently in team drafting mode. Add is only used for team picking.");
+                return;
             }
 
             bool isStaff = _capabilityManager.HasCapability(player, "cmd_forceadd");
@@ -688,13 +750,51 @@ namespace SS.PowerBall.Modules
                 return;
             }
 
-            // Resolve the target team and player name.
-            Team? team;
+            // Resolve the target team, the player name, and (when a live player was targeted) the Player object.
+            // Mirrors the ASSS CAddHandleInput resolution.
+            Team? team = null;
             string targetName;
+            Player? targetPlayer = null;
+            bool captainPath = false;
+
             if (target.TryGetPlayerTarget(out Player? targeted))
             {
-                team = isStaff ? FindCaptainTeam(ad, player) ?? (ad.Teams.Count > 0 ? ad.Teams[0] : null) : FindCaptainTeam(ad, player);
+                if (args.IsEmpty)
+                {
+                    if (isCaptain)
+                    {
+                        team = FindCaptainTeam(ad, player);
+                        if (team is null)
+                        {
+                            _chat.SendMessage(player, "Unable to determine your team");
+                            return;
+                        }
+                        captainPath = true;
+                    }
+                    else
+                    {
+                        _chat.SendMessage(player, "No frequency or team Name specified.");
+                        return;
+                    }
+                }
+                else if (isStaff)
+                {
+                    // Staff targeting a player while also naming a team/freq: resolve that team.
+                    team = FindTeam(ad, args);
+                }
+                else
+                {
+                    _chat.SendMessage(player, "No parameters needed if selecting a player as captain.");
+                    return;
+                }
+
                 targetName = targeted.Name ?? "";
+                targetPlayer = targeted;
+            }
+            else if (args.IsEmpty)
+            {
+                _chat.SendMessage(player, isCaptain ? "No player name specified." : "No player and no freq nor team name specified");
+                return;
             }
             else if (isStaff && args.Contains(':'))
             {
@@ -702,10 +802,21 @@ namespace SS.PowerBall.Modules
                 team = FindTeam(ad, teamSpan.Trim());
                 targetName = nameSpan.Trim().ToString();
             }
-            else
+            else if (isCaptain)
             {
                 team = FindCaptainTeam(ad, player);
+                if (team is null)
+                {
+                    _chat.SendMessage(player, "Unable to determine your team");
+                    return;
+                }
+                captainPath = true;
                 targetName = args.ToString();
+            }
+            else
+            {
+                _chat.SendMessage(player, "No player and freq specified");
+                return;
             }
 
             if (team is null)
@@ -719,25 +830,37 @@ namespace SS.PowerBall.Modules
                 return;
             }
 
-            // Captain turn enforcement.
-            if (isCaptain && !isStaff && ad.PickingStage is not (PickingStage.GameStart or PickingStage.Completed))
+            // Captain turn/stage enforcement (mirrors CheckCaptainPick): applied only on the captain resolution
+            // paths and only outside the GameStart/Completed stages.
+            if (captainPath && ad.PickingStage is not (PickingStage.GameStart or PickingStage.Completed))
             {
-                if (ad.PickingStage == PickingStage.Completed && !IsTeamMissingPicks(ad, team))
-                {
-                    _chat.SendMessage(player, "Your team is at the team max. No further picking allowed.");
+                if (!CheckCaptainPick(player, ad, team))
                     return;
-                }
-                if (!IsCurrentPick(ad, team.Frequency))
-                {
-                    _chat.SendMessage(player, "It is not currently your turn to pick. Please wait.");
-                    return;
-                }
             }
 
-            CheckPlayerAvailable(arena, ad, player, team, targetName);
+            CheckPlayerAvailable(arena, ad, player, team, targetName, targetPlayer);
         }
 
-        private void CheckPlayerAvailable(Arena arena, ArenaData ad, Player picker, Team team, string targetName)
+        private bool CheckCaptainPick(Player player, ArenaData ad, Team team)
+        {
+            if (ad.PickingStage == PickingStage.Completed)
+            {
+                if (!IsTeamMissingPicks(ad, team))
+                {
+                    _chat.SendMessage(player, "Your team is at the team max. No further picking allowed.");
+                    return false;
+                }
+            }
+            else if (!IsCurrentPick(ad, team.Frequency))
+            {
+                _chat.SendMessage(player, "It is not currently your turn to pick. Please wait.");
+                return false;
+            }
+
+            return true;
+        }
+
+        private void CheckPlayerAvailable(Arena arena, ArenaData ad, Player picker, Team team, string targetName, Player? targetPlayer)
         {
             if (!team.WasLoaded && ad.ActiveEvent is not null)
             {
@@ -745,30 +868,60 @@ namespace SS.PowerBall.Modules
                 return;
             }
 
-            NotUsingSignupList(arena, ad, picker, team, targetName);
+            NotUsingSignupList(arena, ad, picker, team, targetName, targetPlayer);
         }
 
-        private void NotUsingSignupList(Arena arena, ArenaData ad, Player picker, Team team, string targetName)
+        private void NotUsingSignupList(Arena arena, ArenaData ad, Player picker, Team team, string targetName, Player? targetPlayer)
         {
-            Player? targetPlayer = FindPlayerInArenaFuzzy(arena, targetName) ?? _playerData.FindPlayer(targetName);
-            string name = targetPlayer?.Name ?? targetName;
+            // When the name came from arguments (no live target), require a unique resolution: arena first, then zone-wide.
+            if (targetPlayer is null)
+            {
+                targetPlayer = FindPlayerInArenaFuzzy(arena, targetName, out int arenaCount);
+                if (arenaCount > 1)
+                {
+                    _chat.SendMessage(picker, $"Found {arenaCount} players matching to {targetName}");
+                    return;
+                }
+                if (arenaCount < 1)
+                {
+                    targetPlayer = FindPlayerOnlineFuzzy(targetName, out int onlineCount);
+                    if (onlineCount != 1)
+                    {
+                        _chat.SendMessage(picker, $"No players matching in the arena and found {onlineCount} players matching to {targetName} online.");
+                        return;
+                    }
+                }
+            }
+
+            if (targetPlayer is null)
+                return;
+
+            string name = targetPlayer.Name ?? targetName;
+            int freq = FindTeamExactPlayer(ad, name)?.Frequency ?? -1;
 
             if (team.WasLoaded)
             {
-                // Only allow if the target is part of this loaded team's roster.
-                if (FindPlayerInTeamExact(team, name) is null)
+                if (freq == team.Frequency)
                 {
-                    _chat.SendMessage(picker, $"{name} isn't part of team {team.TeamName} so cannot be added.");
+                    HandleFreqAdd(arena, ad, team, targetPlayer, name);
                     return;
                 }
-                HandleFreqAdd(arena, ad, team, targetPlayer, name);
+
+                _chat.SendMessage(picker, $"{name} isn't part of team {team.TeamName} so cannot be added.");
                 return;
             }
 
-            Team? owner = FindTeamExactPlayer(ad, name);
-            if (owner is not null)
+            if (freq != -1)
             {
                 _chat.SendMessage(picker, $"{name} is already on a team!");
+                return;
+            }
+
+            // Adding a player who is the captain of a *different* team is not allowed.
+            int captainFreq = FindCaptainTeam(ad, targetPlayer)?.Frequency ?? -1;
+            if (captainFreq != -1 && captainFreq != team.Frequency)
+            {
+                _chat.SendMessage(picker, $"{name} is the other captain!");
                 return;
             }
 
@@ -812,17 +965,89 @@ namespace SS.PowerBall.Modules
                 return;
             }
 
-            Team? scope = isStaff ? null : FindCaptainTeam(ad, player);
-            string name = target.TryGetPlayerTarget(out Player? targeted) ? targeted.Name ?? "" : args.ToString();
-
-            (TeamPlayer? teamPlayer, Team? team, _) = FindPlayerInTeamFuzzy(ad, scope, name);
-            if (teamPlayer is null || team is null)
+            if (!isStaff && ad.PickingStage is PickingStage.Setup or PickingStage.Paused or PickingStage.GameOver)
             {
-                _chat.SendMessage(player, $"Player not found matching {name}");
+                _chat.SendMessage(player, "Picking currently not available.");
                 return;
             }
 
-            RemovePlayer(arena, ad, team, teamPlayer, player);
+            Team? team = null;
+            string name;
+
+            if (target.TryGetPlayerTarget(out Player? targeted))
+            {
+                if (args.IsEmpty)
+                {
+                    if (isCaptain)
+                    {
+                        team = FindCaptainTeam(ad, player);
+                        if (team is null)
+                        {
+                            _chat.SendMessage(player, "Unable to determine your team");
+                            return;
+                        }
+                    }
+                    else
+                    {
+                        _chat.SendMessage(player, "No frequency or team name specified.");
+                        return;
+                    }
+                }
+                else if (isStaff)
+                {
+                    team = FindTeam(ad, args);
+                }
+                else
+                {
+                    _chat.SendMessage(player, "No parameters needed if selecting a player.");
+                    return;
+                }
+
+                name = targeted.Name ?? "";
+            }
+            else if (args.IsEmpty)
+            {
+                _chat.SendMessage(player, isCaptain ? "No player name specified." : "No player and frequency or team name specified");
+                return;
+            }
+            else if (isStaff && args.Contains(':'))
+            {
+                SplitColon(args, out ReadOnlySpan<char> teamSpan, out ReadOnlySpan<char> nameSpan);
+                team = FindTeam(ad, teamSpan.Trim());
+                name = nameSpan.Trim().ToString();
+            }
+            else if (isCaptain)
+            {
+                team = FindCaptainTeam(ad, player);
+                if (team is null)
+                {
+                    _chat.SendMessage(player, "Unable to determine your team");
+                    return;
+                }
+                name = args.ToString();
+            }
+            else
+            {
+                _chat.SendMessage(player, "No player and frequency or team name specified");
+                return;
+            }
+
+            if (team is null)
+            {
+                _chat.SendMessage(player, "Team not found.");
+                return;
+            }
+
+            (TeamPlayer? teamPlayer, Team? foundTeam, int count) = FindPlayerInTeamFuzzy(ad, team, name);
+            if (count != 1 || teamPlayer is null || foundTeam is null)
+            {
+                _chat.SendMessage(player, isCaptain
+                    ? $"Found {count} players matching to {name} on your team"
+                    : $"Found {count} players matching to {name}");
+                return;
+            }
+
+            RemovePlayer(arena, ad, foundTeam, teamPlayer, player);
         }
 
         private void Cmd_Ready(Arena arena, ArenaData ad, Player player, ReadOnlySpan<char> args)
@@ -858,12 +1083,12 @@ namespace SS.PowerBall.Modules
             bool isStaff = _capabilityManager.HasCapability(player, "cmd_forcesub");
             if (!isStaff && !IsCaptain(ad, player))
             {
-                _chat.SendMessage(player, "Only captains or Moderators can substitute.");
+                _chat.SendMessage(player, "Only captains or staff may sub a player.");
                 return;
             }
             if (ad.PickingStage is not (PickingStage.Completed or PickingStage.GameStart))
             {
-                _chat.SendMessage(player, "Substitution is only available after picking.");
+                _chat.SendMessage(player, "Can only substitute players after picking completed or while game is underway.");
                 return;
             }
             if (ad.IsDraft)
@@ -872,41 +1097,206 @@ namespace SS.PowerBall.Modules
                 return;
             }
 
-            SplitColon(args, out ReadOnlySpan<char> inSpan, out ReadOnlySpan<char> outSpan);
-            Team? scope = isStaff ? null : FindCaptainTeam(ad, player);
-
-            (TeamPlayer? outPlayer, Team? outTeam, _) = FindPlayerInTeamFuzzy(ad, scope, outSpan.Trim());
-            Player? inArena = FindPlayerInArenaFuzzy(arena, inSpan.Trim());
-
-            if (outPlayer is null || outTeam is null)
+            // Captains are restricted to their own team; staff may sub across teams.
+            Team? captainsTeam = null;
+            if (!isStaff)
             {
-                _chat.SendMessage(player, "Player to sub out not found on a team.");
-                return;
-            }
-            if (inArena is null)
-            {
-                _chat.SendMessage(player, $"{inSpan.Trim().ToString()} isn't in the arena so cannot be subbed in.");
-                return;
-            }
-            if (outPlayer.Ship == SpecShip)
-            {
-                _chat.SendMessage(player, "The player to sub out is not in game.");
-                return;
-            }
-
-            // Ensure the sub-in is on the team (append as spec if needed, non-loaded only).
-            TeamPlayer? inPlayer = FindPlayerInTeamExact(outTeam, inArena.Name!);
-            if (inPlayer is null)
-            {
-                if (outTeam.WasLoaded)
+                captainsTeam = FindCaptainTeam(ad, player);
+                if (captainsTeam is null)
                 {
-                    _chat.SendMessage(player, $"Player {inArena.Name} is not on team {outTeam.TeamName}.");
+                    _chat.SendMessage(player, "Cannot determine your team frequency.");
                     return;
                 }
-                inPlayer = AddPlayerToList(arena, ad, outTeam, inArena.Name!, SpecShip, wasLoaded: false, wasBorrowed: false);
             }
 
-            PerformSubstitution(arena, ad, outTeam, outPlayer, inPlayer, inArena, player);
+            string name1, name2;
+            TeamPlayer? tp1, tp2;
+            Team? team1, team2;
+            Player? sub1, sub2;
+
+            if (target.TryGetPlayerTarget(out Player? targeted))
+            {
+                if (args.IsEmpty)
+                {
+                    _chat.SendMessage(player, "Must specify the second player taking part in the substitution.");
+                    return;
+                }
+
+                name1 = targeted.Name ?? "";
+                sub1 = targeted;
+                (tp1, team1, _) = FindPlayerInTeamFuzzy(ad, captainsTeam, name1);
+
+                name2 = args.ToString();
+                (tp2, team2, int c2) = FindPlayerInTeamFuzzy(ad, captainsTeam, name2);
+                if (c2 > 1)
+                {
+                    _chat.SendMessage(player, $"Found {c2} players matching to {name2}");
+                    return;
+                }
+                sub2 = FindPlayerInArenaFuzzy(arena, name2, out int ac2);
+                if (ac2 > 1)
+                {
+                    _chat.SendMessage(player, $"Found {ac2} players matching to {name2}");
+                    return;
+                }
+            }
+            else
+            {
+                if (args.IsEmpty)
+                {
+                    _chat.SendMessage(player, "You must specify the 2 players as part of the substitution.");
+                    return;
+                }
+                if (!args.Contains(':'))
+                {
+                    _chat.SendMessage(player, "Ex: ?sub Paul:John");
+                    return;
+                }
+
+                SplitColon(args, out ReadOnlySpan<char> s1, out ReadOnlySpan<char> s2);
+                name1 = s1.Trim().ToString();
+                name2 = s2.Trim().ToString();
+
+                (tp1, team1, int c1) = FindPlayerInTeamFuzzy(ad, captainsTeam, name1);
+                if (c1 > 1)
+                {
+                    _chat.SendMessage(player, $"Found {c1} players matching to {name1}");
+                    return;
+                }
+                (tp2, team2, int c2) = FindPlayerInTeamFuzzy(ad, captainsTeam, name2);
+                if (c2 > 1)
+                {
+                    _chat.SendMessage(player, $"Found {c2} players matching to {name2}");
+                    return;
+                }
+                sub1 = FindPlayerInArenaFuzzy(arena, name1, out int ac1);
+                if (ac1 > 1)
+                {
+                    _chat.SendMessage(player, $"Found {ac1} players matching to {name1}");
+                    return;
+                }
+                sub2 = FindPlayerInArenaFuzzy(arena, name2, out int ac2);
+                if (ac2 > 1)
+                {
+                    _chat.SendMessage(player, $"Found {ac2} players matching to {name2}");
+                    return;
+                }
+            }
+
+            ProcessSubPlayers(arena, ad, player, captainsTeam, tp1, team1, sub1, name1, tp2, team2, sub2, name2);
+        }
+
+        // Determines which of the two players is substituted out vs in based on roster membership and in-game
+        // status (NOT the colon side): the rostered, in-game player is sent to spec and the other takes their place.
+        private void ProcessSubPlayers(Arena arena, ArenaData ad, Player actor, Team? captainsTeam,
+            TeamPlayer? tp1, Team? team1, Player? sub1, string name1,
+            TeamPlayer? tp2, Team? team2, Player? sub2, string name2)
+        {
+            bool found1 = tp1 is not null && team1 is not null;
+            bool found2 = tp2 is not null && team2 is not null;
+
+            if (!found1 && !found2)
+            {
+                _chat.SendMessage(actor, "Neither player found in a team");
+                return;
+            }
+
+            if (found1 && found2)
+            {
+                if (team1!.Frequency != team2!.Frequency)
+                {
+                    _chat.SendMessage(actor, $"Players {tp1!.Name} and {tp2!.Name} are not on the same team.");
+                    return;
+                }
+
+                if (tp1!.Ship == SpecShip)
+                {
+                    if (tp2!.Ship == SpecShip)
+                    {
+                        _chat.SendMessage(actor, "Neither player is in game to be subbed.");
+                        return;
+                    }
+
+                    // player2 is in game (goes out); player1 is in spec (comes in) and must be online.
+                    if (sub1 is null)
+                    {
+                        _chat.SendMessage(actor, $"{tp2.Name} isn't in the arena so cannot be subbed in.");
+                        return;
+                    }
+                    PerformSubstitution(arena, ad, team1, tp2, tp1, sub1, actor);
+                }
+                else
+                {
+                    if (tp2!.Ship != SpecShip)
+                    {
+                        _chat.SendMessage(actor, "Both players are already in game!");
+                        return;
+                    }
+                    if (sub2 is null)
+                    {
+                        _chat.SendMessage(actor, $"{tp2.Name} isn't in the arena so cannot be subbed in.");
+                        return;
+                    }
+                    PerformSubstitution(arena, ad, team1, tp1, tp2, sub2, actor);
+                }
+
+                return;
+            }
+
+            if (found1)
+            {
+                if (captainsTeam is not null && captainsTeam.WasLoaded)
+                {
+                    _chat.SendMessage(actor, $"Player {tp1!.Name} is not on team {captainsTeam.TeamName}.");
+                    return;
+                }
+                if (tp1!.Ship == SpecShip)
+                {
+                    _chat.SendMessage(actor, $"{tp1.Name} isn't in game to be substituted!");
+                    return;
+                }
+                if (sub2 is null)
+                {
+                    _chat.SendMessage(actor, $"{name2} isn't in the arena so cannot be subbed in.");
+                    return;
+                }
+
+                Team? team = captainsTeam ?? FindTeamExactPlayer(ad, tp1.Name);
+                if (team is null)
+                {
+                    _chat.SendMessage(actor, $"Unable to find team for {tp1.Name}");
+                    return;
+                }
+                TeamPlayer newTp = AddPlayerToList(arena, ad, team, sub2.Name!, SpecShip, wasLoaded: false, wasBorrowed: false);
+                PerformSubstitution(arena, ad, team, tp1, newTp, sub2, actor);
+                return;
+            }
+
+            // Only player2 is on a team.
+            if (captainsTeam is not null && captainsTeam.WasLoaded)
+            {
+                _chat.SendMessage(actor, $"Player {tp2!.Name} is not on team {captainsTeam.TeamName}.");
+                return;
+            }
+            if (tp2!.Ship == SpecShip)
+            {
+                _chat.SendMessage(actor, $"{tp2.Name} isn't in game to be substituted!");
+                return;
+            }
+            if (sub1 is null)
+            {
+                _chat.SendMessage(actor, $"{name1} isn't in the arena so cannot be subbed in.");
+                return;
+            }
+
+            Team? team2Found = captainsTeam ?? FindTeamExactPlayer(ad, tp2.Name);
+            if (team2Found is null)
+            {
+                _chat.SendMessage(actor, $"Unable to find team for {tp2.Name}");
+                return;
+            }
+            TeamPlayer newTp2 = AddPlayerToList(arena, ad, team2Found, sub1.Name!, SpecShip, wasLoaded: false, wasBorrowed: false);
+            PerformSubstitution(arena, ad, team2Found, tp2, newTp2, sub1, actor);
         }
 
         private void PerformSubstitution(Arena arena, ArenaData ad, Team team, TeamPlayer outPlayer, TeamPlayer inPlayer, Player inArena, Player actor)
@@ -935,64 +1325,98 @@ namespace SS.PowerBall.Modules
         private void Cmd_Borrow(Arena arena, ArenaData ad, Player player, ReadOnlySpan<char> args)
         {
             Team? team = FindCaptainTeam(ad, player);
-            if (team is null || !team.WasLoaded)
+            if (team is null)
+            {
+                _chat.SendMessage(player, "Only captains may request to borrow players.");
+                return;
+            }
+            if (!team.WasLoaded)
             {
                 _chat.SendMessage(player, "Borrowing only applies to pre-defined teams.");
                 return;
             }
+            if (args.IsEmpty)
+            {
+                _chat.SendMessage(player, "In order to request a borrow, you must provide the player name.");
+                return;
+            }
 
-            string name = args.Trim().ToString();
-            if (FindTeamExactPlayer(ad, name) is not null)
+            Player? targetPlayer = FindPlayerInArenaFuzzy(arena, args, out int count);
+            if (count != 1 || targetPlayer is null)
+            {
+                _chat.SendMessage(player, $"Found {count} players matching to {args.ToString()}");
+                return;
+            }
+
+            if (FindTeamExactPlayer(ad, targetPlayer.Name!) is not null)
             {
                 _chat.SendMessage(player, "Player is already on a team.");
                 return;
             }
 
-            (BorrowedPlayer? existing, _) = FindBorrowedPlayerInTeams(ad, name);
-            if (existing is not null)
+            (BorrowedPlayer? existing, Team? existingTeam, _) = FindBorrowedPlayerInTeams(ad, targetPlayer.Name!);
+            if (existing is not null && existingTeam is not null)
             {
-                _chat.SendMessage(player, $"{name} is already on the borrow list for {team.TeamName}");
+                _chat.SendMessage(player, $"{targetPlayer.Name} is already on the borrow list for {existingTeam.TeamName}");
                 return;
             }
 
-            team.BorrowList.Add(new BorrowedPlayer { Name = name });
-            _chat.SendArenaMessage(arena, ChatSound.Beep2, $"{player.Name} is requesting to borrow {name} for this game.");
+            team.BorrowList.Add(new BorrowedPlayer { Name = targetPlayer.Name! });
+            _chat.SendArenaMessage(arena, ChatSound.Beep2, $"{team.TeamName} is requesting to borrow {targetPlayer.Name} for this game.");
         }
 
         private void Cmd_UnBorrow(Arena arena, ArenaData ad, Player player, ReadOnlySpan<char> args)
         {
             Team? team = FindCaptainTeam(ad, player);
             if (team is null)
-                return;
-
-            string name = args.Trim().ToString();
-            foreach (BorrowedPlayer borrow in team.BorrowList)
             {
-                if (!borrow.Approved && name.Equals(borrow.Name, StringComparison.OrdinalIgnoreCase))
-                {
-                    team.BorrowList.Remove(borrow);
-                    _chat.SendArenaMessage(arena, $"{player.Name} removed request to borrow {name}");
-                    return;
-                }
+                _chat.SendMessage(player, "Only captains may unborrow players.");
+                return;
+            }
+            if (!team.WasLoaded)
+            {
+                _chat.SendMessage(player, "Borrowing only applies to pre-defined teams.");
+                return;
+            }
+            if (args.IsEmpty)
+            {
+                _chat.SendMessage(player, "In order to unborrow someone, you must provide the player name.");
+                return;
             }
 
-            _chat.SendMessage(player, "No pending borrow found for that player.");
+            (BorrowedPlayer? borrow, int count) = FindBorrowedPlayerInTeam(team, args);
+            if (count != 1 || borrow is null)
+            {
+                _chat.SendMessage(player, $"Found {count} players matching to {args.ToString()}");
+                return;
+            }
+
+            // Removes the borrow request whether or not it had already been approved.
+            _chat.SendArenaMessage(arena, ChatSound.Beep2, $"{team.TeamName} removed request to borrow {borrow.Name}");
+            team.BorrowList.Remove(borrow);
         }
 
         private void Cmd_Approve(Arena arena, ArenaData ad, Player player, ReadOnlySpan<char> args)
         {
-            if (!IsCaptain(ad, player))
-                return;
-
-            string name = args.Trim().ToString();
-            (BorrowedPlayer? borrow, Team? team) = FindBorrowedPlayerInTeams(ad, name);
-            if (borrow is null || team is null)
+            Team? myTeam = FindCaptainTeam(ad, player);
+            if (myTeam is null)
             {
-                _chat.SendMessage(player, "No pending borrow found for that player.");
+                _chat.SendMessage(player, "Only captains may approve borrows.");
+                return;
+            }
+            if (args.IsEmpty)
+            {
+                _chat.SendMessage(player, "In order to approve someone, you must provide the player name.");
                 return;
             }
 
-            Team? myTeam = FindCaptainTeam(ad, player);
+            (BorrowedPlayer? borrow, Team? team, int count) = FindBorrowedPlayerInTeams(ad, args);
+            if (count != 1 || borrow is null || team is null)
+            {
+                _chat.SendMessage(player, $"Found {count} players matching to {args.ToString()}");
+                return;
+            }
+
             if (myTeam == team)
             {
                 _chat.SendMessage(player, "You cannot approve your own borrow requests");
@@ -1006,7 +1430,7 @@ namespace SS.PowerBall.Modules
         {
             borrow.Approved = true;
             borrow.ApprovedBy = approvedBy;
-            _chat.SendArenaMessage(arena, $"{borrow.Name} approved for being borrowed by {approvedBy}.");
+            _chat.SendArenaMessage(arena, ChatSound.Beep2, $"{borrow.Name} approved for being borrowed by {approvedBy}.");
 
             Player? online = _playerData.FindPlayer(borrow.Name);
             AddPlayerToList(arena, ad, team, borrow.Name, SpecShip, wasLoaded: false, wasBorrowed: true);
@@ -1014,18 +1438,47 @@ namespace SS.PowerBall.Modules
                 _game.SetShipAndFreq(online, ShipType.Spec, (short)team.Frequency);
         }
 
-        private void Cmd_AddBorrow(Arena arena, ArenaData ad, Player player, ReadOnlySpan<char> args)
+        private void Cmd_AddBorrow(Arena arena, ArenaData ad, Player player, ReadOnlySpan<char> args, ITarget target)
         {
-            SplitColon(args, out ReadOnlySpan<char> teamSpan, out ReadOnlySpan<char> nameSpan);
-            Team? team = FindTeam(ad, teamSpan.Trim());
+            Team? team;
+            Player? targetPlayer;
+
+            if (target.TryGetPlayerTarget(out Player? targeted))
+            {
+                if (args.IsEmpty)
+                {
+                    _chat.SendMessage(player, "No frequency or team name specified");
+                    return;
+                }
+                team = FindTeam(ad, args);
+                targetPlayer = targeted;
+            }
+            else
+            {
+                if (!args.Contains(':'))
+                {
+                    _chat.SendMessage(player, "You must specify the team name or frequency and the player to borrow");
+                    return;
+                }
+                SplitColon(args, out ReadOnlySpan<char> teamSpan, out ReadOnlySpan<char> nameSpan);
+                team = FindTeam(ad, teamSpan.Trim());
+                targetPlayer = FindPlayerInArenaFuzzy(arena, nameSpan.Trim(), out int count);
+                if (count != 1 || targetPlayer is null)
+                {
+                    _chat.SendMessage(player, $"Found {count} players matching to {nameSpan.Trim().ToString()}");
+                    return;
+                }
+            }
+
             if (team is null)
             {
                 _chat.SendMessage(player, "Team not found.");
                 return;
             }
+            if (targetPlayer is null)
+                return;
 
-            string name = nameSpan.Trim().ToString();
-            BorrowedPlayer borrow = new() { Name = name };
+            BorrowedPlayer borrow = new() { Name = targetPlayer.Name! };
             team.BorrowList.Add(borrow);
             ApproveBorrowedPlayer(arena, ad, team, borrow, player.Name!);
         }
@@ -1087,13 +1540,16 @@ namespace SS.PowerBall.Modules
 
         #region Helpers
 
-        private Player? FindPlayerInArenaFuzzy(Arena arena, ReadOnlySpan<char> name)
+        private Player? FindPlayerInArenaFuzzy(Arena arena, ReadOnlySpan<char> name) =>
+            FindPlayerInArenaFuzzy(arena, name, out _);
+
+        private Player? FindPlayerInArenaFuzzy(Arena arena, ReadOnlySpan<char> name, out int count)
         {
+            count = 0;
             if (name.IsEmpty)
                 return null;
 
             Player? match = null;
-            int count = 0;
 
             _playerData.Lock();
             try
@@ -1106,7 +1562,10 @@ namespace SS.PowerBall.Modules
                     if (p.Name.AsSpan().StartsWith(name, StringComparison.OrdinalIgnoreCase))
                     {
                         if (p.Name.Length == name.Length)
+                        {
+                            count = 1;
                             return p; // exact
+                        }
 
                         count++;
                         match ??= p;
@@ -1118,7 +1577,44 @@ namespace SS.PowerBall.Modules
                 _playerData.Unlock();
             }
 
-            return count == 1 ? match : (count > 1 ? null : match);
+            return count > 1 ? null : match;
+        }
+
+        private Player? FindPlayerOnlineFuzzy(ReadOnlySpan<char> name, out int count)
+        {
+            count = 0;
+            if (name.IsEmpty)
+                return null;
+
+            Player? match = null;
+
+            _playerData.Lock();
+            try
+            {
+                foreach (Player p in _playerData.Players)
+                {
+                    if (p.Status != PlayerState.Playing || p.Name is null)
+                        continue;
+
+                    if (p.Name.AsSpan().StartsWith(name, StringComparison.OrdinalIgnoreCase))
+                    {
+                        if (p.Name.Length == name.Length)
+                        {
+                            count = 1;
+                            return p; // exact
+                        }
+
+                        count++;
+                        match ??= p;
+                    }
+                }
+            }
+            finally
+            {
+                _playerData.Unlock();
+            }
+
+            return count > 1 ? null : match;
         }
 
         private void ResetPowerBallStats(Arena arena)

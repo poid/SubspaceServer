@@ -869,11 +869,11 @@ namespace SS.PowerBall.Modules
                 // MVP block.
                 SendMvp(Send, "Most Goals:          ", mvp.Goals, mvp.GoalsNames, always: true, minutes: false);
                 if (mvp.Assists > 0) SendMvp(Send, "Most Assists:        ", mvp.Assists, mvp.AssistsNames, always: true, minutes: false);
-                if (mvp.Kills > 0) SendMvp(Send, "Most Kills:         ", mvp.Kills, mvp.KillsNames, always: true, minutes: false);
-                if (mvp.Deaths > 0) SendMvp(Send, "Most Deaths:        ", mvp.Deaths, mvp.DeathsNames, always: true, minutes: false);
-                if (mvp.Steals > 0) SendMvp(Send, "Most Steals:        ", mvp.Steals, mvp.StealsNames, always: true, minutes: false);
-                SendMvp(Send, "Most Spawns:        ", mvp.Spawns, mvp.SpawnsNames, always: true, minutes: false);
-                SendMvp(Send, "Most Ball Carries:  ", mvp.Carries, mvp.CarriesNames, always: true, minutes: false);
+                if (mvp.Kills > 0) SendMvp(Send, "Most Kills:          ", mvp.Kills, mvp.KillsNames, always: true, minutes: false);
+                if (mvp.Deaths > 0) SendMvp(Send, "Most Deaths:         ", mvp.Deaths, mvp.DeathsNames, always: true, minutes: false);
+                if (mvp.Steals > 0) SendMvp(Send, "Most Steals:         ", mvp.Steals, mvp.StealsNames, always: true, minutes: false);
+                SendMvp(Send, "Most Spawns:         ", mvp.Spawns, mvp.SpawnsNames, always: true, minutes: false);
+                SendMvp(Send, "Most Ball Carries:   ", mvp.Carries, mvp.CarriesNames, always: true, minutes: false);
 
                 int ballSeconds = (int)(mvp.Time / 100);
                 Send($"Most Ball Time:    {ballSeconds / 60,2}:{ballSeconds % 60:D2}   {mvp.TimeNames}");
