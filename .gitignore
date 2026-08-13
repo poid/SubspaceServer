@@ -422,3 +422,6 @@ FodyWeavers.xsd
 # Ignore SubspaceServer packaging folders
 /zone/
 /dist/
+
+# Where the load test scripts put their logs and results by default.
+/loadtest-results/
