@@ -1129,7 +1129,7 @@ namespace SS.PowerBall.Modules
                 return;
 
             _chat.SendMessage(player, "Welcome to PowerBall! ");
-            _chat.SendMessage(player, "This arena is powered by the PB Module!");
+            _chat.SendMessage(player, "This arena is powered by PB Module!");
             _chat.SendMessage(player, "Type ?pbhelp for available commands.");
             _chat.SendMessage(player, ad.GameType switch
             {

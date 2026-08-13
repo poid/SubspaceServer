@@ -134,9 +134,11 @@ namespace SS.PowerBall.Modules
             ballData.XSpeed = 0;
             ballData.YSpeed = 0;
             ballData.Carrier = null;
+            ballData.Freq = -1;
             ballData.Time = ServerTick.Now;
 
             _balls.TryPlaceBall(arena, ballId, ref ballData);
+            _chat.SendArenaMessage(arena, $"Ball {ballId} centered by {player.Name}!");
         }
 
         [CommandHelp(Targets = CommandTarget.None, Args = null, Description = "Ends the current ball game (and triggers end-of-game handling).")]
@@ -149,7 +151,10 @@ namespace SS.PowerBall.Modules
         private void Command_startgame(ReadOnlySpan<char> commandName, ReadOnlySpan<char> parameters, Player player, ITarget target)
         {
             if (player.Arena is { } arena)
+            {
+                _chat.SendArenaMessage(arena, $"Game Started by {player.Name}");
                 _balls.TrySetBallCount(arena, null); // null => revert to the arena's configured ball count
+            }
         }
 
         [CommandHelp(Targets = CommandTarget.None, Args = null, Description = "Stops the current ball game and resets the scores.")]
@@ -161,11 +166,18 @@ namespace SS.PowerBall.Modules
         [CommandHelp(Targets = CommandTarget.None, Args = null, Description = "Resets the score (reset interval) for all players.")]
         private void Command_scoreresetall(ReadOnlySpan<char> commandName, ReadOnlySpan<char> parameters, Player player, ITarget target)
         {
+            Arena? arena = player.Arena;
+            if (arena is null)
+                return;
+
             _playerData.Lock();
             try
             {
                 foreach (Player otherPlayer in _playerData.Players)
-                    _scoreStats.ScoreReset(otherPlayer, PersistInterval.Reset);
+                {
+                    if (otherPlayer.Arena == arena)
+                        _scoreStats.ScoreReset(otherPlayer, PersistInterval.Reset);
+                }
             }
             finally
             {
@@ -173,6 +185,7 @@ namespace SS.PowerBall.Modules
             }
 
             _scoreStats.SendUpdates(null, null);
+            _chat.SendArenaMessage(arena, "All player scores reset in this arena.");
         }
 
         #endregion
