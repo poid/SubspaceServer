@@ -82,6 +82,7 @@ namespace SS.PowerBall.Modules
             BallGameGoalCallback.Register(arena, Callback_BallGameGoal);
             BallGameStartCallback.Register(arena, Callback_BallGameStart);
             BallGameOverCallback.Register(arena, Callback_BallGameOver);
+            GameTimerChangedCallback.Register(arena, Callback_GameTimerChanged);
 
             _commandManager.AddCommand("pblvzsversion", Command_pblvzsversion, arena);
 
@@ -110,6 +111,7 @@ namespace SS.PowerBall.Modules
             BallGameGoalCallback.Unregister(arena, Callback_BallGameGoal);
             BallGameStartCallback.Unregister(arena, Callback_BallGameStart);
             BallGameOverCallback.Unregister(arena, Callback_BallGameOver);
+            GameTimerChangedCallback.Unregister(arena, Callback_GameTimerChanged);
 
             return true;
         }
@@ -447,6 +449,30 @@ namespace SS.PowerBall.Modules
             // second Timer_GameDisplay and run the clock at double speed.
             _mainloopTimer.ClearTimer<Arena>(Timer_GameDisplay, arena);
             _mainloopTimer.SetTimer(Timer_GameDisplay, startDelayMs, 10000, arena, arena);
+        }
+
+        // Keeps the on-screen game clock in sync when the core game timer is paused/resumed (ASSS pblvzs
+        // TimerPause/TimerResume). The clock display (Timer_GameDisplay) already honours TimerPaused, so we only
+        // flip the flag and announce. A "set" is driven directly by the league via StartGameTimer, and the core
+        // callback carries no time value, so Started/Stopped are left to that path / BallGameOver.
+        private void Callback_GameTimerChanged(Arena arena, TimerChange change, TimerChangeReason reason, bool isTimedGame)
+        {
+            if (!arena.TryGetExtraData(_adKey, out ArenaData? ad) || !ad.IsLeagueGame)
+                return;
+
+            switch (change)
+            {
+                case TimerChange.Paused when !ad.TimerPaused:
+                    ad.TimerPaused = true;
+                    _lvzObjects.Toggle(arena, PbLvz.SecondsCountdown, false);
+                    _chat.SendArenaMessage(arena, ChatSound.Beep2, "Timer Paused!");
+                    break;
+
+                case TimerChange.Unpaused when ad.TimerPaused:
+                    ad.TimerPaused = false;
+                    _chat.SendArenaMessage(arena, ChatSound.Beep2, "Timer Resumed!");
+                    break;
+            }
         }
 
         private int CalculateLvzTimerValues(Arena arena, ArenaData ad, int seconds)
