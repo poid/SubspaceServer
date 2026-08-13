@@ -443,6 +443,9 @@ namespace SS.PowerBall.Modules
             ad.Lvzs.TimerDisplay = true;
 
             int startDelayMs = CalculateLvzTimerValues(arena, ad, seconds);
+            // Clear any existing clock timer first so a restart (e.g. golden-goal extra time) doesn't stack a
+            // second Timer_GameDisplay and run the clock at double speed.
+            _mainloopTimer.ClearTimer<Arena>(Timer_GameDisplay, arena);
             _mainloopTimer.SetTimer(Timer_GameDisplay, startDelayMs, 10000, arena, arena);
         }
 
