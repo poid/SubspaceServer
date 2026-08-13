@@ -131,11 +131,12 @@ namespace SS.PowerBall.Modules
                         int i = 0;
                         foreach (string e in existing)
                             _chat.SendMessage(player, $"{++i,2}.{e} already exists.");
+                        _chat.SendMessage(player, "Cannot save teams until the new team names are unique.");
                         return;
                     }
 
                     ad.SaveTeams = true;
-                    _chat.SendMessage(player, "Save Teams currently set as ON");
+                    _chat.SendMessage(player, "Save Teams currently set as ON and current teams saved.");
 
                     foreach (TeamSnapshot t in snapshot)
                     {
