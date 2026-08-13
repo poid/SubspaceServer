@@ -307,7 +307,7 @@ namespace SS.PowerBall.Modules
             {
                 ad.PickingRound = cap; // clamp so the "behind" thresholds don't drift
                 if (ad.PickingStage == PickingStage.Picking)
-                    _chat.SendArenaMessage(arena, "Teams have picked the maximum number of players. Captains to ?ready when ready.");
+                    _chat.SendArenaMessage(arena, ChatSound.Beep2, "Teams have picked the maximum number of players. Captains to ?ready when ready.");
                 return true;
             }
 
@@ -357,6 +357,8 @@ namespace SS.PowerBall.Modules
                 if (!team.Ready)
                     return; // not all ready
             }
+
+            _chat.SendArenaMessage(arena, ChatSound.Beep1, "All teams are ready to begin!");
 
             if (ad.IsDraft)
             {
