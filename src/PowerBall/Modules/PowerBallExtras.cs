@@ -97,7 +97,7 @@ namespace SS.PowerBall.Modules
             DisplayModCommand(player, ref displayedMod, "stopgame", "?stopgame", "Stop the current ball game and reset scores");
             DisplayModCommand(player, ref displayedMod, "scoreresetall", "?scoreresetall", "Reset the score (reset interval) for all players");
 
-            // Aggregate help from the other attached PowerBall modules.
+            // Aggregate help from the other attached PowerBall modules (order matches the ASSS pbextras).
             IMultiPub? multiPub = arena.GetInterface<IMultiPub>();
             if (multiPub is not null)
             {
@@ -105,11 +105,32 @@ namespace SS.PowerBall.Modules
                 finally { arena.ReleaseInterface(ref multiPub); }
             }
 
+            ITeams? teams = arena.GetInterface<ITeams>();
+            if (teams is not null)
+            {
+                try { teams.PrintHelp(player); }
+                finally { arena.ReleaseInterface(ref teams); }
+            }
+
+            ISignUps? signUps = arena.GetInterface<ISignUps>();
+            if (signUps is not null)
+            {
+                try { signUps.PrintHelp(player); }
+                finally { arena.ReleaseInterface(ref signUps); }
+            }
+
             IPowerBallStats? stats = arena.GetInterface<IPowerBallStats>();
             if (stats is not null)
             {
                 try { stats.PrintHelp(player); }
                 finally { arena.ReleaseInterface(ref stats); }
+            }
+
+            IPowerBallLeague? league = arena.GetInterface<IPowerBallLeague>();
+            if (league is not null)
+            {
+                try { league.PrintHelp(player); }
+                finally { arena.ReleaseInterface(ref league); }
             }
         }
 

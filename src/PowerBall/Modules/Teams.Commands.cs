@@ -720,13 +720,16 @@ namespace SS.PowerBall.Modules
             Player? online = _playerData.FindPlayer(teamPlayer.Name);
             if (online is not null && online.Arena == arena)
             {
-                if (team.WasLoaded)
+                // A loaded roster member stays on the team's freq (spec); anyone else (a drafted or borrowed
+                // player) goes to the arena spec freq. Keyed on the PLAYER, not the team, so a borrowed player
+                // on a loaded team is treated as non-loaded.
+                if (teamPlayer.WasLoaded)
                     _game.SetShipAndFreq(online, ShipType.Spec, (short)team.Frequency);
                 else
                     _game.SetShipAndFreq(online, ShipType.Spec, arena.SpecFreq);
             }
 
-            if (team.WasLoaded)
+            if (teamPlayer.WasLoaded)
             {
                 teamPlayer.Ship = SpecShip;
             }
