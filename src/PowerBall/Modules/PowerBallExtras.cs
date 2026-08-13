@@ -144,7 +144,12 @@ namespace SS.PowerBall.Modules
         [CommandHelp(Targets = CommandTarget.None, Args = null, Description = "Ends the current ball game (and triggers end-of-game handling).")]
         private void Command_endgame(ReadOnlySpan<char> commandName, ReadOnlySpan<char> parameters, Player player, ITarget target)
         {
-            ResetBallGame(player.Arena, player);
+            // ?endgame ends the ball game (which fires BallGameOver); ?stopgame additionally resets scores.
+            if (player.Arena is { } arena)
+            {
+                _chat.SendArenaMessage(arena, $"Game Ended by {player.Name}");
+                _balls.EndGame(arena);
+            }
         }
 
         [CommandHelp(Targets = CommandTarget.None, Args = null, Description = "Starts a ball game (restores the configured ball count).")]
