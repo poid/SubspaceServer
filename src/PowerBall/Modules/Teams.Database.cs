@@ -21,7 +21,7 @@ namespace SS.PowerBall.Modules
             RunDb(() => _signUps.RemovePlayerAsync(eventName, playerName));
         }
 
-        private void UsingSignupList(Arena arena, ArenaData ad, Player picker, Team team, string targetName)
+        private void UsingSignupList(Arena arena, ArenaData ad, Player picker, Team team, string targetName, bool captainPath)
         {
             string ev = ad.ActiveEvent!;
             RunGuarded(async () =>
@@ -38,15 +38,28 @@ namespace SS.PowerBall.Modules
                         return;
 
                     case 1:
+                        // Re-validate after the await: the arena may have recycled, the event/team may have changed,
+                        // and (crucially) an earlier ?pick for the same turn may have already advanced the pick — so a
+                        // spammed second pick doesn't slip a second player onto one turn.
+                        if (!arena.TryGetExtraData(_adKey, out ArenaData? liveAd)
+                            || liveAd.ActiveEvent != ev
+                            || !liveAd.Teams.Contains(team))
+                            return;
+
+                        if (captainPath
+                            && liveAd.PickingStage is not (PickingStage.GameStart or PickingStage.Completed)
+                            && !IsCurrentPick(liveAd, team.Frequency))
+                            return;
+
                         string name = match.Names[0];
                         Player? online = _playerData.FindPlayer(name);
-                        if (online is null && (!ad.IsDraft || !ad.OfflineDrafting))
+                        if (online is null && (!liveAd.IsDraft || !liveAd.OfflineDrafting))
                         {
                             _chat.SendMessage(picker, $"Player {name} is not online so cannot be picked.");
                             return;
                         }
 
-                        AddPlayer(arena, ad, team, online, name, picker); // online may be null for an offline draft
+                        AddPlayer(arena, liveAd, team, online, name, picker); // online may be null for an offline draft
                         return;
 
                     default:
@@ -86,7 +99,11 @@ namespace SS.PowerBall.Modules
                     return;
                 }
 
-                ad.ActiveEvent = ev;
+                // Re-fetch after the await in case the arena recycled during the DB round-trip.
+                if (!arena.TryGetExtraData(_adKey, out ArenaData? liveAd))
+                    return;
+
+                liveAd.ActiveEvent = ev;
                 _chat.SendMessage(player, $"Active event set to {ev}");
             });
         }
@@ -135,14 +152,24 @@ namespace SS.PowerBall.Modules
                         return;
                     }
 
-                    ad.SaveTeams = true;
+                    // Re-fetch after the await in case the arena recycled during the existence check.
+                    if (!arena.TryGetExtraData(_adKey, out ArenaData? liveAd))
+                        return;
+
+                    liveAd.SaveTeams = true;
                     _chat.SendMessage(player, "Save Teams currently set as ON and current teams saved.");
 
+                    // Write the snapshot through the serialized DB chain so it commits ahead of any later roster
+                    // mutations (each team's row before its players).
                     foreach (TeamSnapshot t in snapshot)
                     {
-                        await _db.AddTeamAsync(t.Name, t.Captain);
-                        foreach (string p in t.Players)
-                            await _db.AddTeamPlayerAsync(t.Name, p);
+                        TeamSnapshot captured = t;
+                        RunDb(async () =>
+                        {
+                            await _db.AddTeamAsync(captured.Name, captured.Captain);
+                            foreach (string p in captured.Players)
+                                await _db.AddTeamPlayerAsync(captured.Name, p);
+                        });
                     }
                 });
                 return;
@@ -289,7 +316,11 @@ namespace SS.PowerBall.Modules
 
                 SavedTeamInfo chosen = PickExactOrFirst(matches, name);
 
-                Team? team = AddTeam(arena, ad, null, freq, chosen.Name, isLoaded: true);
+                // Re-fetch after the first DB round-trip in case the arena recycled during it.
+                if (!arena.TryGetExtraData(_adKey, out ArenaData? liveAd))
+                    return;
+
+                Team? team = AddTeam(arena, liveAd, null, freq, chosen.Name, isLoaded: true);
                 if (team is null)
                 {
                     _chat.SendMessage(player, $"Could not load team {chosen.Name} onto freq {freq}.");
@@ -299,9 +330,15 @@ namespace SS.PowerBall.Modules
                 team.Captain = chosen.Captain;
 
                 IReadOnlyList<string> players = await _db.GetTeamPlayersAsync(chosen.Name);
+
+                // Re-validate after the second round-trip: the arena may have recycled, or the team we just added may
+                // have been removed by a concurrent ?newteams/?removeteam.
+                if (!arena.TryGetExtraData(_adKey, out liveAd) || !liveAd.Teams.Contains(team))
+                    return;
+
                 foreach (string p in players)
                 {
-                    AddPlayerToList(arena, ad, team, p, SpecShip, wasLoaded: true, wasBorrowed: false);
+                    AddPlayerToList(arena, liveAd, team, p, SpecShip, wasLoaded: true, wasBorrowed: false);
 
                     Player? online = _playerData.FindPlayer(p);
                     if (online is not null && online.Arena == arena)
@@ -378,9 +415,18 @@ namespace SS.PowerBall.Modules
             return teams[0];
         }
 
+        private Task _dbWriteChain = Task.CompletedTask;
+        private readonly object _dbWriteChainLock = new();
+
         private void RunDb(Func<Task> action)
         {
-            _ = RunGuardedAsync(action);
+            // Serialize DB writes so dependent writes (a team row, then its captain/players) commit in the order they
+            // were submitted on the mainloop, instead of racing on separate connections — otherwise a child row can be
+            // written before its parent commits and silently insert 0 rows.
+            lock (_dbWriteChainLock)
+            {
+                _dbWriteChain = _dbWriteChain.ContinueWith(_ => RunGuardedAsync(action), TaskScheduler.Default).Unwrap();
+            }
         }
 
         private void RunGuarded(Func<Task> action)
@@ -396,7 +442,7 @@ namespace SS.PowerBall.Modules
             }
             catch (Exception ex)
             {
-                _logManager.LogM(LogLevel.Error, nameof(Teams), $"League database error. {ex.Message}");
+                _logManager.LogM(LogLevel.Error, nameof(Teams), $"League database error. {ex}");
             }
         }
 

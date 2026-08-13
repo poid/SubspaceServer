@@ -868,7 +868,7 @@ namespace SS.PowerBall.Modules
                     return;
             }
 
-            CheckPlayerAvailable(arena, ad, player, team, targetName, targetPlayer);
+            CheckPlayerAvailable(arena, ad, player, team, targetName, targetPlayer, captainPath);
         }
 
         private bool CheckCaptainPick(Player player, ArenaData ad, Team team)
@@ -890,11 +890,11 @@ namespace SS.PowerBall.Modules
             return true;
         }
 
-        private void CheckPlayerAvailable(Arena arena, ArenaData ad, Player picker, Team team, string targetName, Player? targetPlayer)
+        private void CheckPlayerAvailable(Arena arena, ArenaData ad, Player picker, Team team, string targetName, Player? targetPlayer, bool captainPath)
         {
             if (!team.WasLoaded && ad.ActiveEvent is not null)
             {
-                UsingSignupList(arena, ad, picker, team, targetName);
+                UsingSignupList(arena, ad, picker, team, targetName, captainPath);
                 return;
             }
 
