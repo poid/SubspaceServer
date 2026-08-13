@@ -125,7 +125,7 @@ namespace SS.PowerBall.Modules
                 foreach (TeamPlayer teamPlayer in team.Players)
                 {
                     string lag = teamPlayer.LaggedOut && teamPlayer.Ship != SpecShip ? " (Lagged Out)" : "";
-                    _chat.SendMessage(player, $"+ {teamPlayer.Name,-24} [{teamPlayer.Ship}]{lag}");
+                    _chat.SendMessage(player, $"+ {teamPlayer.Name,-24} [{ShipName(teamPlayer.Ship)}]{lag}");
                 }
             }
         }
@@ -168,9 +168,24 @@ namespace SS.PowerBall.Modules
 
         private void Cmd_ListBorrows(Arena arena, ArenaData ad, Player player, ReadOnlySpan<char> args)
         {
+            // Optional team/freq filter; with no argument, list borrows for every team.
+            Team? filter = null;
+            if (!args.IsEmpty)
+            {
+                filter = FindTeam(ad, args);
+                if (filter is null)
+                {
+                    _chat.SendMessage(player, "Team not found.");
+                    return;
+                }
+            }
+
             bool any = false;
             foreach (Team team in ad.Teams)
             {
+                if (filter is not null && team != filter)
+                    continue;
+
                 foreach (BorrowedPlayer borrow in team.BorrowList)
                 {
                     any = true;
@@ -293,7 +308,7 @@ namespace SS.PowerBall.Modules
             ad.NumberOfTeams++;
 
             if (actor is not null)
-                _chat.SendArenaMessage(arena, $"New team {name} added using frequency {freq}");
+                _chat.SendArenaMessage(arena, ChatSound.Beep1, $"New team {name} added using frequency {freq}");
 
             if (ad.SaveTeams && !isLoaded)
                 RunDb(() => _db.AddTeamAsync(name, ""));
@@ -323,7 +338,7 @@ namespace SS.PowerBall.Modules
             if (ad.SaveTeams && !team.WasLoaded)
                 RunDb(() => _db.DeleteTeamAsync(team.TeamName));
 
-            _chat.SendArenaMessage(arena, $"Team {team.TeamName} removed");
+            _chat.SendArenaMessage(arena, ChatSound.Beep1, $"Team {team.TeamName} removed");
         }
 
         private void Cmd_AddCaptain(Arena arena, ArenaData ad, Player player, ReadOnlySpan<char> args, ITarget target)
@@ -361,9 +376,9 @@ namespace SS.PowerBall.Modules
         private void SetCaptain(Arena arena, ArenaData ad, Team team, string captainName)
         {
             if (team.Captain is null)
-                _chat.SendArenaMessage(arena, $"{captainName} set as captain of team {team.Frequency}");
+                _chat.SendArenaMessage(arena, ChatSound.Beep1, $"{captainName} set as captain of team {team.Frequency}");
             else
-                _chat.SendArenaMessage(arena, $"{team.Captain} replaced with {captainName} as captain of team {team.Frequency}");
+                _chat.SendArenaMessage(arena, ChatSound.Beep1, $"{team.Captain} replaced with {captainName} as captain of team {team.Frequency}");
 
             team.Captain = captainName;
 
@@ -450,12 +465,13 @@ namespace SS.PowerBall.Modules
                     if (teamPlayer.Ship == SpecShip)
                         continue;
 
+                    // Update the stored ship for every rostered in-game player, even if they're momentarily
+                    // out of the arena; only the live re-placement is gated on being present.
+                    teamPlayer.Ship = team.FreqShip;
+
                     Player? online = _playerData.FindPlayer(teamPlayer.Name);
                     if (online is not null && online.Arena == arena)
-                    {
-                        teamPlayer.Ship = team.FreqShip;
                         _game.SetShipAndFreq(online, (ShipType)team.FreqShip, (short)team.Frequency);
-                    }
                 }
             }
             finally
@@ -629,7 +645,7 @@ namespace SS.PowerBall.Modules
                 team.Ready = false;
 
             ad.PickingStage = PickingStage.Picking;
-            _chat.SendArenaMessage(arena, "A new game using the same teams. Captains to ?ready when ready.");
+            _chat.SendArenaMessage(arena, ChatSound.Beep1, "A new game using the same teams. Captains to ?ready when ready.");
         }
 
         #endregion
@@ -661,15 +677,15 @@ namespace SS.PowerBall.Modules
             _scoreStats.SendUpdates(arena, null);
         }
 
-        private void AddPlayer(Arena arena, ArenaData ad, Team team, Player? targetPlayer, string targetName)
+        private void AddPlayer(Arena arena, ArenaData ad, Team team, Player? targetPlayer, string targetName, Player picker)
         {
             if (team.PickedCount >= ad.TeamMax)
             {
-                _chat.SendArenaMessage(arena, "Team maximum has been reached. No more players can be selected.");
+                _chat.SendMessage(picker, "Team maximum has been reached. No more players can be selected.");
                 return;
             }
 
-            _chat.SendArenaMessage(arena, $"{targetName} picked for team {team.TeamName}");
+            _chat.SendArenaMessage(arena, ChatSound.Beep1, $"{targetName} picked for team {team.TeamName}");
 
             int ship = DetermineShip(ad, team);
             AddPlayerToList(arena, ad, team, targetName, ship, wasLoaded: false, wasBorrowed: false);
@@ -903,7 +919,7 @@ namespace SS.PowerBall.Modules
             {
                 if (freq == team.Frequency)
                 {
-                    HandleFreqAdd(arena, ad, team, targetPlayer, name);
+                    HandleFreqAdd(arena, ad, team, targetPlayer, name, picker);
                     return;
                 }
 
@@ -925,18 +941,21 @@ namespace SS.PowerBall.Modules
                 return;
             }
 
-            AddPlayer(arena, ad, team, targetPlayer, name);
+            AddPlayer(arena, ad, team, targetPlayer, name, picker);
         }
 
-        private void HandleFreqAdd(Arena arena, ArenaData ad, Team team, Player? targetPlayer, string name)
+        private void HandleFreqAdd(Arena arena, ArenaData ad, Team team, Player? targetPlayer, string name, Player picker)
         {
             TeamPlayer? teamPlayer = FindPlayerInTeamExact(team, name);
             if (teamPlayer is null)
+            {
+                _chat.SendMessage(picker, "Cannot find player in the team!");
                 return;
+            }
 
             if (teamPlayer.Ship != SpecShip)
             {
-                _chat.SendArenaMessage(arena, $"Cannot add {name} as they are already not in spec!");
+                _chat.SendMessage(picker, $"Cannot add {name} as they are already not in spec!");
                 return;
             }
 
@@ -951,7 +970,7 @@ namespace SS.PowerBall.Modules
             if (targetPlayer is not null && targetPlayer.Arena == arena)
                 PlacePlayer(arena, targetPlayer, team, ship);
 
-            _chat.SendArenaMessage(arena, $"{name} picked for team {team.TeamName}");
+            _chat.SendArenaMessage(arena, ChatSound.Beep1, $"{name} picked for team {team.TeamName}");
             NextPick(arena, ad, notify: true, skip: false);
         }
 
@@ -1348,7 +1367,8 @@ namespace SS.PowerBall.Modules
                 return;
             }
 
-            if (FindTeamExactPlayer(ad, targetPlayer.Name!) is not null)
+            // Rejected if the target is already a rostered player OR a captain of any team.
+            if (FindTeamExactPlayer(ad, targetPlayer.Name!) is not null || FindCaptainTeam(ad, targetPlayer) is not null)
             {
                 _chat.SendMessage(player, "Player is already on a team.");
                 return;
@@ -1628,6 +1648,13 @@ namespace SS.PowerBall.Modules
         }
 
         private static string MaxToString(int value) => value == int.MaxValue ? "unlimited" : value.ToString();
+
+        private static readonly string[] ShipNames =
+        [
+            "warbird", "javelin", "spider", "leviathan", "terrier", "weasel", "lancaster", "shark", "spectator",
+        ];
+
+        private static string ShipName(int ship) => ship >= 0 && ship < ShipNames.Length ? ShipNames[ship] : ship.ToString();
 
         private void PrintHelp(Player player)
         {

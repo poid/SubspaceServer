@@ -46,7 +46,7 @@ namespace SS.PowerBall.Modules
                             return;
                         }
 
-                        AddPlayer(arena, ad, team, online, name); // online may be null for an offline draft
+                        AddPlayer(arena, ad, team, online, name, picker); // online may be null for an offline draft
                         return;
 
                     default:
