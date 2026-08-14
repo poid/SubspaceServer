@@ -483,7 +483,9 @@ namespace SS.PowerBall.Modules
                     {
                         foreach (Player p in _playerData.Players)
                         {
-                            if (p.Arena == arena && p.Status == PlayerState.Playing && p.Freq < ad.MaxPubFreq)
+                            // <= MaxPubFreq so both pub teams see the assist credit (the C used <, dropping the top
+                            // pub freq; every sibling broadcast here uses <=).
+                            if (p.Arena == arena && p.Status == PlayerState.Playing && p.Freq <= ad.MaxPubFreq)
                                 set.Add(p);
                         }
                     }

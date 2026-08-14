@@ -40,7 +40,6 @@ namespace SS.PowerBall.Modules
         private readonly IObjectPoolManager _objectPoolManager;
         private readonly IPlayerData _playerData;
         private readonly IScoreStats _scoreStats;
-        private readonly ITeams _teams;
 
         private ArenaDataKey<ArenaData> _adKey;
 
@@ -59,8 +58,7 @@ namespace SS.PowerBall.Modules
             IMapData mapData,
             IObjectPoolManager objectPoolManager,
             IPlayerData playerData,
-            IScoreStats scoreStats,
-            ITeams teams)
+            IScoreStats scoreStats)
         {
             _arenaManager = arenaManager ?? throw new ArgumentNullException(nameof(arenaManager));
             _balls = balls ?? throw new ArgumentNullException(nameof(balls));
@@ -77,7 +75,6 @@ namespace SS.PowerBall.Modules
             _objectPoolManager = objectPoolManager ?? throw new ArgumentNullException(nameof(objectPoolManager));
             _playerData = playerData ?? throw new ArgumentNullException(nameof(playerData));
             _scoreStats = scoreStats ?? throw new ArgumentNullException(nameof(scoreStats));
-            _teams = teams ?? throw new ArgumentNullException(nameof(teams));
         }
 
         #region Module members
@@ -185,9 +182,22 @@ namespace SS.PowerBall.Modules
             if (!arena.TryGetExtraData(_adKey, out ArenaData? ad))
                 return false;
 
-            // If the teams were reset or changed during the countdown (e.g. a mid-countdown ?newteams), abort it
-            // rather than warping everyone and starting a ball game on top of a half-reset match.
-            if (!_teams.IsGameStarting(arena))
+            // If the teams were reset or changed during the countdown (e.g. a staff ?setpickingstage away from
+            // GameStart), abort it rather than warping everyone and starting a ball game on a half-reset match.
+            // ITeams is arena-scoped, so fetch it on demand (it can't be a constructor dependency).
+            ITeams? teams = arena.GetInterface<ITeams>();
+            bool stillStarting;
+            try
+            {
+                stillStarting = teams is null || teams.IsGameStarting(arena); // no Teams => can't tell, so proceed
+            }
+            finally
+            {
+                if (teams is not null)
+                    arena.ReleaseInterface(ref teams);
+            }
+
+            if (!stillStarting)
             {
                 _lvzObjects.Toggle(arena, PbLvz.LeagueReady, false);
                 _lvzObjects.Toggle(arena, PbLvz.LeagueSet, false);

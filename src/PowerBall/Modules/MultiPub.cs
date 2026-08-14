@@ -514,13 +514,13 @@ namespace SS.PowerBall.Modules
 
             if (!ad.PubMode)
             {
-                _chat.SendMessage(player, "Pub Mode is disabled. Cannot randomize teams.");
+                _chat.SendMessage(player, "Pub Mode is disabled. Cannot change the game type.");
                 return;
             }
 
             if (player.Freq > ad.MaxPubFreq)
             {
-                _chat.SendMessage(player, "Cannot vote for pub mode from spec or side game.");
+                _chat.SendMessage(player, "Cannot vote to change the game type from spec or a side game.");
                 return;
             }
 
@@ -672,7 +672,7 @@ namespace SS.PowerBall.Modules
 
             if (!ad.PubMode)
             {
-                _chat.SendMessage(player, "Pub Mode is disabled. Cannot randomize teams.");
+                _chat.SendMessage(player, "Pub Mode is disabled. Cannot change the map.");
                 return false;
             }
 
