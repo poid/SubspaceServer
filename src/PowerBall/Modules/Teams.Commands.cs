@@ -1752,7 +1752,7 @@ namespace SS.PowerBall.Modules
         private void PrintHelp(Player player)
         {
             _chat.SendMessage(player, "----------------------------------------------------");
-            _chat.SendMessage(player, "The following Teams Module commands are available:");
+            _chat.SendMessage(player, "The following PB Teams Module commands are available:");
             _chat.SendMessage(player, "----------------------------------------------------");
             DisplayCommand(player, "?teams", "List the teams and their players");
             DisplayCommand(player, "?caps", "List the team captains");
@@ -1770,7 +1770,7 @@ namespace SS.PowerBall.Modules
                 DisplayCommand(player, "?add <name>", "Add a player to your team");
                 DisplayCommand(player, "?remove <name>", "Remove a player from your team");
                 DisplayCommand(player, "?ready", "Mark your team ready");
-                DisplayCommand(player, "?sub <in>:<out>", "Substitute players");
+                DisplayCommand(player, "?sub <player1>:<player2>", "Substitute players (the in-game one goes to spec)");
                 DisplayCommand(player, "?borrow <name>", "Request to borrow a player (loaded teams)");
                 DisplayCommand(player, "?approve <name>", "Approve another team's borrow request");
             }

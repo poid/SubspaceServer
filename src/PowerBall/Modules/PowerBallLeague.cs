@@ -438,7 +438,7 @@ namespace SS.PowerBall.Modules
         private void PrintHelp(Player player)
         {
             _chat.SendMessage(player, "-------------------------------------------------------");
-            _chat.SendMessage(player, "The following PB Leagues Module commands are available:");
+            _chat.SendMessage(player, "The following PB League Module commands are available:");
             _chat.SendMessage(player, "-------------------------------------------------------");
 
             bool displayedMod = false;
