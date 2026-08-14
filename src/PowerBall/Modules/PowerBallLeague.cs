@@ -366,25 +366,31 @@ namespace SS.PowerBall.Modules
                 return;
             }
 
-            int seconds;
+            long total;
             int colon = arg.IndexOf(':');
             if (colon >= 0)
             {
                 int minutes = ParseIntOrZero(arg[..colon]);
                 int secs = ParseIntOrZero(arg[(colon + 1)..]);
-                seconds = secs + minutes * 60;
+                total = (long)minutes * 60 + secs; // long to avoid overflow on absurd input
             }
             else
             {
-                seconds = ParseIntOrZero(arg);
+                total = ParseIntOrZero(arg);
             }
 
-            if (seconds == 0 && arg[0] != '0')
+            if (total == 0 && arg[0] != '0')
             {
                 _chat.SendMessage(player, "Please specify a new time in the form of <seconds> or <min>:<seconds>");
                 return;
             }
+            if (total < 0 || total > 24 * 60 * 60)
+            {
+                _chat.SendMessage(player, "Please specify a time between 0 and 24 hours.");
+                return;
+            }
 
+            int seconds = (int)total;
             ad.TimerSeconds = seconds;
             _chat.SendMessage(player, $"Timer now set to {ad.TimerSeconds / 60}:{ad.TimerSeconds % 60:D2}");
         }
