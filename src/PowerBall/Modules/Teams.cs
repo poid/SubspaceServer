@@ -135,8 +135,17 @@ namespace SS.PowerBall.Modules
 
         void ITeams.InitiateNewTeams(Arena arena)
         {
-            if (arena.TryGetExtraData(_adKey, out ArenaData? ad))
-                ResetTeams(arena, ad);
+            if (!arena.TryGetExtraData(_adKey, out ArenaData? ad))
+                return;
+
+            // Mirror ?newteams: don't tear down a running game, and otherwise stop the ball game and reset stats.
+            if (ad.PickingStage == PickingStage.GameStart)
+                return;
+
+            ResetTeams(arena, ad);
+            _balls.TrySetBallCount(arena, 0);
+            ResetPowerBallStats(arena);
+            _chat.SendArenaMessage(arena, ChatSound.Beep1, "Picking of New Teams Started!");
         }
 
         string? ITeams.GetActiveEvent(Arena arena)

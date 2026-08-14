@@ -168,6 +168,10 @@ namespace SS.PowerBall.Modules
             _logManager.LogA(LogLevel.Info, nameof(PowerBallLeague), arena, "Handle Teams Ready");
             _chat.SendArenaMessage(arena, "Game Starts in 30 seconds ...");
 
+            // Clear any in-flight countdown first so a re-ready (or ?newteams then re-ready) during the countdown
+            // doesn't stack a second one.
+            _mainloopTimer.ClearTimer<CountdownState>(Timer_Countdown, arena);
+
             // Initial delay 30s, then every 3s: READY (30s) -> SET (33s) -> GO + start (36s) -> GO off (39s).
             _mainloopTimer.SetTimer(Timer_Countdown, 30000, 3000, new CountdownState(arena) { Countdown = 3 }, arena);
         }

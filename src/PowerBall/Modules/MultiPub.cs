@@ -1118,7 +1118,9 @@ namespace SS.PowerBall.Modules
 
             if (ad.ChangeMapOnGoal != "-")
             {
-                // Defer the map change slightly so it doesn't run inside the goal handling.
+                // Defer the map change slightly so it doesn't run inside the goal handling. Clear any pending one
+                // first so two goals within 100ms (multi-ball) don't stack two timers.
+                _mainloopTimer.ClearTimer<Arena>(MainloopTimer_ChangeMapOnGoal, arena);
                 _mainloopTimer.SetTimer(MainloopTimer_ChangeMapOnGoal, 100, Timeout.Infinite, arena, arena);
             }
         }

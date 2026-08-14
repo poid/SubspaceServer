@@ -441,6 +441,7 @@ namespace SS.PowerBall.Modules
                 RoundStart(arena, ad);
 
             ad.IsLeagueGame = true;
+            ad.TimerPaused = false; // a freshly-started clock is never born paused
             _lvzObjects.Toggle(arena, PbLvz.Timer, true);
             ad.Lvzs.TimerDisplay = true;
 
@@ -470,6 +471,7 @@ namespace SS.PowerBall.Modules
 
                 case TimerChange.Unpaused when ad.TimerPaused:
                     ad.TimerPaused = false;
+                    _lvzObjects.Toggle(arena, PbLvz.SecondsCountdown, true); // re-light the seconds animation
                     _chat.SendArenaMessage(arena, ChatSound.Beep2, "Timer Resumed!");
                     break;
             }
