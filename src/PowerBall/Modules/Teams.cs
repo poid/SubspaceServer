@@ -148,6 +148,11 @@ namespace SS.PowerBall.Modules
             _chat.SendArenaMessage(arena, ChatSound.Beep1, "Picking of New Teams Started!");
         }
 
+        bool ITeams.IsGameStarting(Arena arena)
+        {
+            return arena.TryGetExtraData(_adKey, out ArenaData? ad) && ad.PickingStage == PickingStage.GameStart;
+        }
+
         string? ITeams.GetActiveEvent(Arena arena)
         {
             return arena.TryGetExtraData(_adKey, out ArenaData? ad) ? ad.ActiveEvent : null;

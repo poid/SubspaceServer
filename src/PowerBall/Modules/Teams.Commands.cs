@@ -563,6 +563,12 @@ namespace SS.PowerBall.Modules
 
         private void Cmd_StartPicking(Arena arena, ArenaData ad, Player player)
         {
+            if (ad.PickingStage != PickingStage.Setup)
+            {
+                _chat.SendMessage(player, "Picking can only be started from the setup stage.");
+                return;
+            }
+
             if (ad.NumberOfTeams < 2)
             {
                 _chat.SendMessage(player, "Less than 2 teams setup. Please set teams first.");
