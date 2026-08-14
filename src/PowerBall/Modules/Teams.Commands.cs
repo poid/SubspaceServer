@@ -280,6 +280,11 @@ namespace SS.PowerBall.Modules
             }
 
             string name = nameSpan.IsEmpty ? $"Team {freq}" : nameSpan.Trim().ToString();
+            if (name.Length > MaxTeamNameLength)
+            {
+                _chat.SendMessage(player, $"Team name must be {MaxTeamNameLength} characters or fewer.");
+                return;
+            }
             AddTeam(arena, ad, player, freq, name, isLoaded: false);
         }
 
@@ -1472,6 +1477,12 @@ namespace SS.PowerBall.Modules
                 _chat.SendMessage(player, "You cannot approve your own borrow requests");
                 return;
             }
+            if (borrow.Approved)
+            {
+                // Already approved and on the roster; re-approving would append a duplicate.
+                _chat.SendMessage(player, $"{borrow.Name} has already been approved.");
+                return;
+            }
 
             ApproveBorrowedPlayer(arena, ad, team, borrow, player.Name!);
         }
@@ -1527,6 +1538,19 @@ namespace SS.PowerBall.Modules
             }
             if (targetPlayer is null)
                 return;
+
+            // Don't add a player who is already rostered, a captain, or already borrowed — it would duplicate them.
+            if (FindTeamExactPlayer(ad, targetPlayer.Name!) is not null || FindCaptainTeam(ad, targetPlayer) is not null)
+            {
+                _chat.SendMessage(player, "Player is already on a team.");
+                return;
+            }
+            (BorrowedPlayer? existingBorrow, _, _) = FindBorrowedPlayerInTeams(ad, targetPlayer.Name!);
+            if (existingBorrow is not null)
+            {
+                _chat.SendMessage(player, $"{targetPlayer.Name} is already on the borrow list.");
+                return;
+            }
 
             BorrowedPlayer borrow = new() { Name = targetPlayer.Name! };
             team.BorrowList.Add(borrow);
@@ -1707,6 +1731,9 @@ namespace SS.PowerBall.Modules
             finally { arena.ReleaseInterface(ref stats); }
         }
 
+        // Matches the pb.team.name column width in the schema; over-length names would fail to persist silently.
+        private const int MaxTeamNameLength = 64;
+
         private static string MaxToString(int value) => value == int.MaxValue ? "unlimited" : value.ToString();
 
         private static readonly string[] ShipNames =
@@ -1727,7 +1754,10 @@ namespace SS.PowerBall.Modules
             DisplayCommand(player, "?lagout", "Re-enter the game on your team after lagging/speccing");
             DisplayCommand(player, "?teamfreq", "Join your team's freq in spectator mode");
 
-            if (IsCaptain(player.Arena is { } arena && arena.TryGetExtraData(_adKey, out ArenaData? ad) ? ad : null!, player))
+            bool isCaptain = player.Arena is { } arena
+                && arena.TryGetExtraData(_adKey, out ArenaData? ad)
+                && IsCaptain(ad, player);
+            if (isCaptain)
             {
                 _chat.SendMessage(player, "-=-=-= Captain Commands =-=-=-");
                 DisplayCommand(player, "?pick <name>", "Draft a player onto your team");

@@ -938,6 +938,10 @@ namespace SS.PowerBall.Modules
 
             if (newFreq > ad.MaxPubFreq && newFreq != ad.SpecFreq)
             {
+                // Reset any previously-applied overrides first, so repeated ship/freq changes within a side-game
+                // (or hopping between side-games) don't accumulate duplicate overrides or leave stale cross-band ones.
+                UnoverrideAll(player, pd);
+
                 if (newFreq == ad.ScrambleFreq || newFreq == ad.ScrambleFreq + 1)
                 {
                     bool warp = !(oldFreq == ad.ScrambleFreq || oldFreq == ad.ScrambleFreq + 1);
