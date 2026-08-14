@@ -970,11 +970,11 @@ namespace SS.PowerBall.Modules
             _chat.SendMessage(player, "             1         Far Kills     [Killing enemy player far from the ball]");
             _chat.SendMessage(player, "  TK        -1         Team Kills    [Killing members of your own team]");
             _chat.SendMessage(player, "   D        -1         Deaths");
-            _chat.SendMessage(player, "   B        -2         Ball Deaths   [Deaths while carrying the ball]");
+            _chat.SendMessage(player, "  BD        -2         Ball Deaths   [Deaths while carrying the ball]");
             _chat.SendMessage(player, "   S         4         Steals        [Stealing the ball from opposition]");
             _chat.SendMessage(player, "   T        -3         Turn Overs    [Losing the ball to the opposition]");
             _chat.SendMessage(player, "   V         5         Saves         [Catching ball from enemy in goal]");
-            _chat.SendMessage(player, "   W         2         Spawns.       [Gathering ball from center after a goal]");
+            _chat.SendMessage(player, "   W         2         Spawns        [Gathering ball from center after a goal]");
             _chat.SendMessage(player, "  BC         0.1       Ball Carries  [Times with the ball, Capped at Ball Time / 5]");
             _chat.SendMessage(player, "  NT         0.1       Near Time     [Time near the ball]");
         }

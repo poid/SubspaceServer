@@ -554,7 +554,7 @@ namespace SS.PowerBall.Modules
         private void PrintHelp(Player player)
         {
             _chat.SendMessage(player, "----------------------------------------------------");
-            _chat.SendMessage(player, "The following Signups Module commands are available:");
+            _chat.SendMessage(player, "The following PB Signups Module commands are available:");
             _chat.SendMessage(player, "----------------------------------------------------");
             DisplayCommand(player, "?listevents", "List current events and their description");
             DisplayCommand(player, "?signup <event>", "Add yourself to the signup list for <event>");

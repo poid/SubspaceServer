@@ -465,7 +465,7 @@ namespace SS.PowerBall.Modules
                     if (otherPlayer == player)
                     {
                         opd.RandomizeVote = !opd.RandomizeVote;
-                        _chat.SendMessage(player, $"Your vote to random teams has been set to {(opd.RandomizeVote ? "Yes" : "No")}");
+                        _chat.SendMessage(player, $"Your vote to randomize teams has been set to {(opd.RandomizeVote ? "Yes" : "No")}");
                     }
 
                     if (opd.RandomizeVote)
@@ -1134,7 +1134,7 @@ namespace SS.PowerBall.Modules
             if (action != PlayerAction.EnterArena || arena is null || !arena.TryGetExtraData(_adKey, out ArenaData? ad))
                 return;
 
-            _chat.SendMessage(player, "Welcome to PowerBall! ");
+            _chat.SendMessage(player, "Welcome to PowerBall!");
             _chat.SendMessage(player, "This arena is powered by PB Module!");
             _chat.SendMessage(player, "Type ?pbhelp for available commands.");
             _chat.SendMessage(player, ad.GameType switch
@@ -1276,7 +1276,7 @@ namespace SS.PowerBall.Modules
                 _chat.SendMessage(player, "---------- SCRAMBLE ARENA Commands ------------------");
                 DisplayCommand(player, "?rules", "Display the rules of scramble");
                 DisplayCommand(player, "?startgm", "Start a scramble game!");
-                DisplayCommand(player, "?stopgm", "Pre-maturely stop a scramble game");
+                DisplayCommand(player, "?stopgm", "Prematurely stop a scramble game");
             }
             else
             {
