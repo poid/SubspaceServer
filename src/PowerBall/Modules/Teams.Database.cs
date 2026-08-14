@@ -295,6 +295,12 @@ namespace SS.PowerBall.Modules
                 _chat.SendMessage(player, "No frequency specified");
                 return;
             }
+            if (freq > short.MaxValue)
+            {
+                // Frequencies are sent to clients as a short; a larger value would wrap to a negative freq.
+                _chat.SendMessage(player, $"Frequency must be between 0 and {short.MaxValue}.");
+                return;
+            }
 
             string name = nameSpan.Trim().ToString();
             RunGuarded(async () =>

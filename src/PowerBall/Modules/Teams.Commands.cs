@@ -272,6 +272,12 @@ namespace SS.PowerBall.Modules
                 _chat.SendMessage(player, "No frequency specified.");
                 return;
             }
+            if (freq > short.MaxValue)
+            {
+                // Frequencies are sent to clients as a short; a larger value would wrap to a negative freq.
+                _chat.SendMessage(player, $"Frequency must be between 0 and {short.MaxValue}.");
+                return;
+            }
 
             string name = nameSpan.IsEmpty ? $"Team {freq}" : nameSpan.Trim().ToString();
             AddTeam(arena, ad, player, freq, name, isLoaded: false);
@@ -357,11 +363,21 @@ namespace SS.PowerBall.Modules
 
             if (target.TryGetPlayerTarget(out Player? targetPlayer))
             {
+                if (args.IsEmpty)
+                {
+                    _chat.SendMessage(player, "No frequency or team name specified");
+                    return;
+                }
                 team = FindTeam(ad, args);
                 captainName = targetPlayer.Name ?? "";
             }
             else
             {
+                if (!args.Contains(':'))
+                {
+                    _chat.SendMessage(player, "You must specify the team name or frequency and the captain. Ex: ?addcap 0:John.");
+                    return;
+                }
                 SplitColon(args, out ReadOnlySpan<char> teamSpan, out ReadOnlySpan<char> nameSpan);
                 team = FindTeam(ad, teamSpan.Trim());
                 Player? resolved = FindPlayerInArenaFuzzy(arena, nameSpan.Trim());
