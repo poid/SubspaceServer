@@ -277,6 +277,12 @@ namespace SS.PowerBall.Modules
             if (!CheckDb(player))
                 return;
 
+            if (ad.PickingStage != PickingStage.Setup)
+            {
+                _chat.SendMessage(player, "Teams can only be loaded during the setup stage.");
+                return;
+            }
+
             if (args.IsEmpty)
             {
                 _chat.SendMessage(player, "You must specify a team name and frequency.");
