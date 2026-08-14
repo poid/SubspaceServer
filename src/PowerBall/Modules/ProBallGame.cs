@@ -15,7 +15,7 @@ namespace SS.PowerBall.Modules
     /// A two-team capture-points soccer game played on a dedicated freq band (<c>MultiPub:ProballFreq</c> and +1) inside
     /// the main pub arena, in the lower-right region of the map. It keeps its own score for its own ball id and ends when
     /// a team reaches the capture-point target with the required win-by margin. The proball ball must be listed in the
-    /// <c>Soccer:CustomGame</c> bitmask so that <see cref="PowerBallGamePoints"/> lets its goals through without scoring them.
+    /// <c>Soccer:CustomGame</c> bitmask so that <see cref="SS.Core.Modules.Scoring.BallGamePoints"/> lets its goals through without scoring them.
     /// </remarks>
     [ModuleInfo("Proball side-game (ASSS proball port): 2-team capture-points soccer in the lower-right region.")]
     public sealed class ProBallGame : IModule, IArenaAttachableModule

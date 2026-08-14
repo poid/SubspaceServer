@@ -52,6 +52,15 @@ namespace SS.PowerBall.Modules
                             return;
 
                         string name = match.Names[0];
+
+                        // They may have been picked onto another team while we awaited the sign-up lookup (the
+                        // sign-up-list removal is async); don't add a duplicate. Mirrors NotUsingSignupList.
+                        if (FindTeamExactPlayer(liveAd, name) is not null)
+                        {
+                            _chat.SendMessage(picker, $"{name} is already on a team!");
+                            return;
+                        }
+
                         Player? online = _playerData.FindPlayer(name);
                         if (online is null && (!liveAd.IsDraft || !liveAd.OfflineDrafting))
                         {

@@ -13,7 +13,7 @@ namespace SS.PowerBall.Modules
     /// <remarks>
     /// Four teams each start with 1 point and steal each other's; the first to 4 wins. This module only maintains the
     /// 4-team LVZ scoreboard: each team's score is a digit object at <c>Small4TeamScore0 + score + 5*teamIndex</c>. The
-    /// actual scoring is done by <see cref="PowerBallGamePoints"/> (read via <see cref="IBallGamePoints.GetScores"/>).
+    /// actual scoring is done by <see cref="SS.Core.Modules.Scoring.BallGamePoints"/> (read via <see cref="IBallGamePoints.GetScores"/>).
     /// <para>
     /// Note: the ASSS original reads scores for freqs 0..3. Whether the small-4-team players sit on freqs 0..3 or on the
     /// <c>MultiPub:Small4TmFreq</c> band is a zone-config concern; this port preserves the freq 0..3 read and should be
