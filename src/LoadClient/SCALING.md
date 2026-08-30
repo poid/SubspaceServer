@@ -1,5 +1,12 @@
 # Where the server runs out
 
+> **Read [Ten thousand players](#ten-thousand-players) first.** The server has since been run with
+> 9,906 players in a hundred arenas, logging nothing. Every ceiling in the earlier sections of this
+> document — starting with the "about 2,600 players" immediately below — was the load generator
+> running out, not the server. Those sections are kept because the reasoning about what scales with
+> what is still sound and is what guided the work, but their numbers are wrong and no extrapolation
+> from them should be trusted.
+
 Measured after Phase 2 (per-arena player collections), which is what makes these numbers worth
 recording: the position scan is no longer a meaningful cost, so what is left is what actually limits
 the server.
@@ -229,7 +236,57 @@ and it is why the load client has `--connect-delay`.
 
 ---
 
-# Pushing past two thousand
+# Ten thousand players
+
+**The figures in the rest of this section, and every ceiling quoted earlier in this document, were
+measured with a load generator that was itself the limit.** They are kept below only because the
+reasoning about *shapes* — what scales with population, what scales with arena size — still holds. The
+absolute numbers do not. What follows is the series repeated once the generator was fixed.
+
+100 players per arena throughout, so what changes between runs is population alone.
+
+| clients | connected | logged in | in arenas | each sending | server sent | errors |
+|---|---|---|---|---|---|---|
+| 2,000 | 2,000 | 2,000 | **2,000** | 10.0/s | 1.63M updates/s, 27.7 MB/s | 0 |
+| 4,000 | 4,000 | 4,000 | **4,000** | 10.0/s | 1.83M updates/s, 40.8 MB/s | 0 |
+| 7,000 | 6,978 | 6,977 | **6,977** | 10.0/s | 3.36M updates/s, 75.8 MB/s | 0 |
+| 10,000 | 9,928 | — | **9,906** | 10.0/s | 2.16M updates/s, 51.1 MB/s | 0 |
+
+**Ten thousand concurrent players in a hundred arenas, on a debug build, sharing one machine with the
+load generator, with nothing logged.** At that point the server was running eight send threads at
+42–44% of a core each, having grown into them by itself from one, with the mainloop at 19%.
+
+The server's limit is still not known. Its own receive socket's drop counter did not move across a
+whole run at six thousand and its receive queue was empty at every sample, so it was never the one
+losing packets.
+
+## Why the delivered rate falls with population, and why it is not the server
+
+Per-client delivery falls from 814/s at two thousand to 218/s at ten thousand, which looks like the
+server running out. It is not: the kernel discarded 1.6 million datagrams during that run, on the
+*client's* sockets, and those are updates the server had already sent.
+
+Raising the client's receive buffer eightfold barely moved it:
+
+| client receive buffer | in arenas | delivered per client | kernel drops | memory peak |
+|---|---|---|---|---|
+| 512 KB | 9,907 | 198/s | 1,700,981 | 3,185 MB |
+| 4 MB | 9,906 | 218/s | 1,569,502 | 3,280 MB |
+
+So it is not a buffer size problem. Ten thousand receive loops in one process cannot all be serviced
+promptly, and a socket that goes unattended fills whatever it has been given. Memory was never a
+constraint — Linux charges a socket buffer by what is queued in it, not by its limit.
+
+**Splitting the generator across processes makes it worse, not better.** Five processes of two thousand
+against one process of ten thousand: 5,835 connections against 9,778, all five stalling at the same
+count at the same instant. Same scheduler, same cores, five runtimes competing. For the same reason,
+more WSL instances or virtual machines on one box will not help either — a second physical machine is
+the only thing that adds capacity, and a gigabit link would itself become the limit somewhere near
+these numbers, since the server was already pushing 75.8 MB/s at seven thousand.
+
+---
+
+# Pushing past two thousand (superseded — generator-limited)
 
 With the fan-out on the arena threads, the mainloop is no longer the limit, so the load was raised
 until something else became one. Arenas were added along with players, to keep per-arena counts near
@@ -269,7 +326,15 @@ The cost stopped growing with the population at all — total processor time is 
 6,000 clients, because the extra work is offset by the smaller in-view counts that come with spreading
 players over more arenas.
 
-## What the harness can no longer tell us
+## What the harness could not tell us, and why (superseded)
+
+Everything below was true of the generator at the time and is no longer. Four defects in it, each
+found only because a figure did not add up, were between this and the numbers above: it never retried
+a connection init, never retransmitted anything it sent "reliably", divided its counters by the wrong
+window, and left its sockets on a receive buffer sized for a socket someone was attending to. Each one
+made the server look slower than it is.
+
+
 
 **The load client is now the limit, not the server.** At six thousand clients it produces 30,824
 position packets a second, about 5 per client per second against the ~9.5 each is trying to send, and
