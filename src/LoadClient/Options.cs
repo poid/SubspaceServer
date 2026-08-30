@@ -111,6 +111,20 @@
         public bool BatchPositions { get; private set; } = true;
 
         /// <summary>
+        /// Bytes to ask for on each client socket's receive buffer, or 0 to leave the operating system's default.
+        /// </summary>
+        /// <remarks>
+        /// The default is sized for a socket someone is attending to promptly, which thousands sharing
+        /// one process are not. At six thousand clients the kernel was discarding four percent of
+        /// everything arriving, including the replies clients were waiting on, and those clients then
+        /// timed out having never seen a packet that did arrive.
+        /// <para>
+        /// Capped by the operating system at its own maximum, which on Linux is net.core.rmem_max.
+        /// </para>
+        /// </remarks>
+        public int ReceiveBufferSize { get; private set; } = 524288;
+
+        /// <summary>
         /// Commands to issue once the clients are in, without the leading '?'.
         /// </summary>
         public List<string> Commands { get; } = [];
@@ -200,6 +214,11 @@
                         options.BatchPositions = false;
                         break;
 
+                    case "--recv-buffer" when next is not null && int.TryParse(next, out int recvBuffer) && recvBuffer >= 0:
+                        options.ReceiveBufferSize = recvBuffer;
+                        i++;
+                        break;
+
                     case "--view" when next is not null:
                         string[] parts = next.Split('x', StringSplitOptions.TrimEntries);
                         if (parts.Length != 2 || !short.TryParse(parts[0], out short width) || !short.TryParse(parts[1], out short height))
@@ -253,6 +272,13 @@
                   --spread <pixels>        How far apart to place clients in an arena. This decides
                                            how many end up within view of each other, which is what
                                            the fan out cost scales with. Default 4096
+                  --recv-buffer <bytes>    Bytes to ask for on each client socket's receive buffer, or
+                                           0 for the operating system default. The default is sized for
+                                           a socket being attended to promptly, which thousands sharing
+                                           one process are not, and the kernel then discards what does
+                                           not fit, including replies clients are waiting on.
+                                           Capped by the OS; on Linux see net.core.rmem_max.
+                                           Default 524288
                   --no-batch-positions     Do not claim support for batched position packets. Clients
                                            claim it by default, as Continuum does, which is what makes
                                            the server send the compact 10 and 11 byte forms rather

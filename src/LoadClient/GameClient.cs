@@ -23,7 +23,7 @@ namespace SS.LoadClient
     /// the EncryptionNull module loaded, so that no encryption is negotiated.
     /// </para>
     /// </remarks>
-    internal sealed class GameClient(string name, string password, bool batchPositions = true) : IDisposable
+    internal sealed class GameClient(string name, string password, bool batchPositions = true, int receiveBufferSize = 0) : IDisposable
     {
         private const byte ClientTypeVIE = 0x01;
 
@@ -143,6 +143,28 @@ namespace SS.LoadClient
             try
             {
                 _serverEndPoint = new IPEndPoint(IPAddress.Parse(host), port);
+
+                // Asked for explicitly, because the default is whatever the operating system hands out
+                // and that is sized for a socket someone is attending to promptly. Thousands of these
+                // share one process, so any individual socket can wait a while between drains, and
+                // whatever arrives meanwhile has to fit. Measured with the default: at six thousand
+                // clients the kernel discarded four percent of everything arriving, including the login
+                // responses and arena acknowledgements that clients were sitting waiting for.
+                //
+                // The operating system silently caps this at its own maximum, so asking for more than it
+                // allows looks like it worked. On Linux that is net.core.rmem_max.
+                if (receiveBufferSize > 0)
+                {
+                    try
+                    {
+                        _socket.ReceiveBufferSize = receiveBufferSize;
+                    }
+                    catch (Exception ex)
+                    {
+                        FailureReason ??= $"receive buffer: {ex.Message}";
+                    }
+                }
+
                 _socket.Bind(new IPEndPoint(IPAddress.Any, 0));
 
                 // Connection init. Sending the key back unchanged is how the server says "no encryption",
