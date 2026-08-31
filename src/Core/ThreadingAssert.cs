@@ -46,6 +46,41 @@ namespace SS.Core
         }
 
         /// <summary>
+        /// Asserts that the caller is on the thread that owns an arena.
+        /// </summary>
+        /// <remarks>
+        /// The arena counterpart of <see cref="OnMainloop"/>, for code that has been moved off the mainloop
+        /// and relies on its arena having a single writer. A failure means two threads can be in that
+        /// arena's state at once, which is the one thing the arena workers exist to prevent.
+        /// </remarks>
+        /// <param name="arena">The arena the caller is meant to be running for.</param>
+        /// <param name="caller">Filled in by the compiler, to name what ran on the wrong thread.</param>
+        [Conditional("DEBUG")]
+        public static void OnArenaThread(Arena? arena, [CallerMemberName] string? caller = null)
+        {
+            if (arena is null)
+                return;
+
+            // An Arena is itself a broker, so the service can be looked up from the one argument that
+            // matters rather than being injected into every caller for the sake of an assertion. The
+            // lookup only exists in debug builds, along with the rest of this method.
+            IArenaLoop? arenaLoop = arena.GetInterface<IArenaLoop>();
+            if (arenaLoop is null)
+                return;
+
+            try
+            {
+                Debug.Assert(
+                    arenaLoop.IsArenaThread(arena),
+                    $"{caller} must run on the thread that owns arena '{arena.Name}', but ran on '{Thread.CurrentThread.Name ?? "unnamed"}'.");
+            }
+            finally
+            {
+                arena.ReleaseInterface(ref arenaLoop);
+            }
+        }
+
+        /// <summary>
         /// Asserts that the caller is on the thread that owns a player's game state.
         /// </summary>
         /// <remarks>
@@ -109,6 +144,39 @@ namespace SS.Core
             Debug.Assert(
                 playerData.IsWriteLockHeld,
                 $"{caller} changes shared player state and requires the global player write lock, and the calling thread does not hold it.");
+        }
+
+        /// <summary>
+        /// Asserts that a callback about to reach handlers registered above an arena is being fired from a
+        /// thread those handlers can tolerate.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// Called from the generated <c>Fire</c> methods, at the point where firing on an arena walks up to
+        /// the root broker. Handlers registered there are zone-wide infrastructure -- logging, stats,
+        /// replay, security -- and were written when the mainloop was the only thread that could reach
+        /// them. An arena thread reaching them is a silent hazard, which this turns into a failed
+        /// assertion naming the callback.
+        /// </para>
+        /// <para>
+        /// Deliberately not an assertion about arena threads in general. An arena firing a callback that
+        /// nothing registered zone-wide is fine, and so is one whose zone-wide handlers are thread-safe;
+        /// the first is why this takes <paramref name="hasZoneWideHandlers"/> rather than checking the
+        /// thread alone, and the second is what <see cref="ShardSafeAttribute"/> is for.
+        /// </para>
+        /// </remarks>
+        /// <param name="hasZoneWideHandlers">Whether any handler is actually registered above the arena.</param>
+        /// <param name="callbackName">The callback being fired, to name it in the failure.</param>
+        [Conditional("DEBUG")]
+        public static void CallbackReachesZoneWide(bool hasZoneWideHandlers, string callbackName)
+        {
+            if (!hasZoneWideHandlers)
+                return;
+
+            Debug.Assert(
+                !Modules.ArenaLoop.IsArenaWorkerThread,
+                $"{callbackName} was fired from an arena thread and reaches handlers registered zone-wide, which are not written to run there. " +
+                $"Fire it on the mainloop, or mark the callback [ShardSafe] if every handler it can reach really is thread-safe.");
         }
 
         /// <summary>

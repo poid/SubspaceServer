@@ -254,6 +254,29 @@
         }
 
         /// <summary>
+        /// A callback marked [ShardSafe] states that its handlers are safe on any thread, so Fire is
+        /// generated without the assertion that fires when an arena thread reaches zone-wide handlers.
+        /// </summary>
+        [Fact]
+        public Task ShardSafe()
+        {
+            string source = """
+                using SS.Core;
+
+                namespace Foo.Bar;
+
+                [CallbackHelper]
+                [ShardSafe]
+                public static partial class ShardSafeCallback
+                {
+                    public delegate void ShardSafeDelegate(int x);
+                }
+                """;
+
+            return TestHelper.VerifyCallbackHelperGenerator(source);
+        }
+
+        /// <summary>
         /// This test purposely should not output a result.
         /// </summary>
         [Fact]

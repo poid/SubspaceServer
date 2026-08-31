@@ -47,7 +47,10 @@ namespace Foo.Bar
                 InvokeCallbacks(broker, callbacks, arena, in ballPacket);
 
             if (broker.Parent is not null)
+            {
+                SS.Core.ThreadingAssert.CallbackReachesZoneWide(broker.Parent.GetCallback<BallPacketSentDelegate>() is not null, nameof(BallPacketSentDelegate));
                 Fire(broker.Parent, arena, in ballPacket);
+            }
 
             // local helper (for recursion)
             static void InvokeCallbacks(IComponentBroker broker, BallPacketSentDelegate callbacks, global::SS.Core.Arena arena, ref readonly global::SS.Packets.Game.BallPacket ballPacket)

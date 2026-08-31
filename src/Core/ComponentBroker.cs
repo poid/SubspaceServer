@@ -65,6 +65,32 @@ namespace SS.Core
     }
 
     /// <summary>
+    /// Marks a callback as safe to fire from a thread other than the mainloop.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Firing a callback on an <see cref="Arena"/> walks up to the root broker as well, so handlers that
+    /// a module registered zone-wide run on whichever thread fired it. While everything ran on the
+    /// mainloop that was not worth stating. Now that arenas have threads of their own, it means an arena
+    /// can run zone-wide handlers that were written on the assumption that only the mainloop ever would.
+    /// </para>
+    /// <para>
+    /// A debug assertion catches that, and this attribute is how a callback says it does not apply: that
+    /// every handler it can reach is safe to run on any thread. <c>LogCallback</c> is the clearest case,
+    /// since logging has always been called from the receive, reliable and send threads.
+    /// </para>
+    /// <para>
+    /// Marking a callback is a statement about its handlers, not about the callback itself, so it is only
+    /// correct while every module that registers one keeps its side of the bargain. Prefer firing on the
+    /// mainloop to marking a callback that is merely believed to be safe.
+    /// </para>
+    /// </remarks>
+    [AttributeUsage(AttributeTargets.Class, AllowMultiple = false, Inherited = false)]
+    public class ShardSafeAttribute : Attribute
+    {
+    }
+
+    /// <summary>
     /// A service that functions as an intermediary between components by managing interfaces, callbacks, and advisors.
     /// </summary>
     /// <remarks>
