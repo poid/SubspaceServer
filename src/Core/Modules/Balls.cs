@@ -24,9 +24,9 @@ namespace SS.Core.Modules
     public sealed class Balls(
         IComponentBroker broker,
         IArenaManager arenaManager,
+        IArenaTimer arenaTimer,
         IConfigManager configManager,
         ILogManager logManager,
-        IMainloopTimer mainloopTimer,
         IMapData mapData,
         INetwork network,
         IPlayerData playerData,
@@ -40,9 +40,9 @@ namespace SS.Core.Modules
 
         private readonly IComponentBroker _broker = broker ?? throw new ArgumentNullException(nameof(broker));
         private readonly IArenaManager _arenaManager = arenaManager ?? throw new ArgumentNullException(nameof(arenaManager));
+        private readonly IArenaTimer _arenaTimer = arenaTimer ?? throw new ArgumentNullException(nameof(arenaTimer));
         private readonly IConfigManager _configManager = configManager ?? throw new ArgumentNullException(nameof(configManager));
         private readonly ILogManager _logManager = logManager ?? throw new ArgumentNullException(nameof(logManager));
-        private readonly IMainloopTimer _mainloopTimer = mainloopTimer ?? throw new ArgumentNullException(nameof(mainloopTimer));
         private readonly IMapData _mapData = mapData ?? throw new ArgumentNullException(nameof(mapData));
         private readonly INetwork _network = network ?? throw new ArgumentNullException(nameof(network));
         private readonly IPlayerData _playerData = playerData ?? throw new ArgumentNullException(nameof(playerData));
@@ -66,8 +66,6 @@ namespace SS.Core.Modules
             _network.AddPacket(C2SPacketType.ShootBall, Packet_ShootBall);
             _network.AddPacket(C2SPacketType.Goal, Packet_Goal);
 
-            _mainloopTimer.SetTimer(MainloopTimer_BasicBallTimer, 3000, 250, null);
-
             _iBallsToken = _broker.RegisterInterface<IBalls>(this);
             return true;
         }
@@ -76,8 +74,6 @@ namespace SS.Core.Modules
         {
             if (broker.UnregisterInterface(ref _iBallsToken) != 0)
                 return false;
-
-            _mainloopTimer.ClearTimer(MainloopTimer_BasicBallTimer, null);
 
             _network.RemovePacket(C2SPacketType.PickupBall, Packet_PickupBall);
             _network.RemovePacket(C2SPacketType.ShootBall, Packet_ShootBall);
@@ -425,9 +421,16 @@ namespace SS.Core.Modules
 
                     if (ad.BallCount > 0)
                         _logManager.LogA(LogLevel.Drivel, nameof(Balls), arena, $"{ad.BallCount} balls spawned.");
+
+                    // One timer per arena, on the arena's own thread. This used to be a single 250 ms
+                    // mainloop timer that walked every arena in the zone, which put every arena's ball
+                    // updates on one thread and made each of them wait behind all the others.
+                    _arenaTimer.SetTimer(arena, ArenaTimer_BasicBallTimer, 3000, 250, arena, arena);
                 }
                 else if (action == ArenaAction.Destroy)
                 {
+                    _arenaTimer.ClearTimer<Arena>(arena, ArenaTimer_BasicBallTimer, arena);
+
                     // clean up ball data
                     ad.BallCount = 0;
 
@@ -744,65 +747,53 @@ namespace SS.Core.Modules
 
         #endregion
 
-        private bool MainloopTimer_BasicBallTimer()
+        private bool ArenaTimer_BasicBallTimer(Arena arena)
         {
-            _arenaManager.Lock();
+            if (arena.Status != ArenaState.Running)
+                return true;
 
-            try
+            if (!arena.TryGetExtraData(_adKey, out ArenaData? ad))
+                return true;
+
+            lock (ad.Lock)
             {
-                foreach (Arena arena in _arenaManager.Arenas)
+                if (ad.BallCount <= 0)
+                    return true;
+
+                // See if we're ready to send packets.
+                ServerTick now = ServerTick.Now;
+
+                if (now - ad.LastSendTime < ad.Settings.SendTime)
+                    return true;
+
+                for (int ballId = 0; ballId < ad.BallCount; ballId++)
                 {
-                    if (arena.Status != ArenaState.Running)
-                        continue;
+                    ref BallData b = ref ad.Balls[ballId];
 
-                    if (!arena.TryGetExtraData(_adKey, out ArenaData? ad))
-                        continue;
-
-                    lock (ad.Lock)
+                    if (b.State == BallState.OnMap)
                     {
-                        if (ad.BallCount <= 0)
-                            continue;
+                        // It's on the map, just send the position update.
+                        SendBallPacket(arena, ballId);
+                    }
+                    else if (b.State == BallState.Carried)
+                    {
+                        // It's being carried, update its x,y coords.
+                        var position = b.Carrier!.Position;
+                        b.X = position.X;
+                        b.Y = position.Y;
 
-                        // See if we're ready to send packets.
-                        ServerTick now = ServerTick.Now;
-
-                        if (now - ad.LastSendTime < ad.Settings.SendTime)
-                            continue;
-
-                        for (int ballId = 0; ballId < ad.BallCount; ballId++)
+                        SendBallPacket(arena, ballId);
+                    }
+                    else if (b.State == BallState.Waiting)
+                    {
+                        if (now >= b.Time)
                         {
-                            ref BallData b = ref ad.Balls[ballId];
-
-                            if (b.State == BallState.OnMap)
-                            {
-                                // It's on the map, just send the position update.
-                                SendBallPacket(arena, ballId);
-                            }
-                            else if (b.State == BallState.Carried)
-                            {
-                                // It's being carried, update its x,y coords.
-                                var position = b.Carrier!.Position;
-                                b.X = position.X;
-                                b.Y = position.Y;
-
-                                SendBallPacket(arena, ballId);
-                            }
-                            else if (b.State == BallState.Waiting)
-                            {
-                                if (now >= b.Time)
-                                {
-                                    TrySpawnBall(arena, ballId);
-                                }
-                            }
+                            TrySpawnBall(arena, ballId);
                         }
-
-                        ad.LastSendTime = now;
                     }
                 }
-            }
-            finally
-            {
-                _arenaManager.Unlock();
+
+                ad.LastSendTime = now;
             }
 
             return true;
