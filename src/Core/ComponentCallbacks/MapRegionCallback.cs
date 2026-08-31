@@ -6,8 +6,14 @@ namespace SS.Core.ComponentCallbacks
     /// Helper class for the <see cref="MapRegionDelegate"/> callback.
     /// </summary>
     [CallbackHelper]
+    [ShardSafe]
     public static partial class MapRegionCallback
     {
+        // Fired from the position packet handler, which runs on the player's arena thread when
+        // Net:HandlePacketsOnArenaThread is on. A region is a property of one arena's map and a handler
+        // for one has no reason to touch anything zone-wide; AutoWarp, the only handler in the server,
+        // hands the one thing that does -- sending the player to another arena -- to the mainloop itself.
+
         /// <summary>
         /// Delegate for a callback that is invoked when a <see cref="Player"/> enters or exits a <see cref="MapRegion"/>.
         /// </summary>
