@@ -2144,7 +2144,7 @@ namespace SS.Replay
                                         return;
                                     }
 
-                                    ballPacketWrapper.BallPacket.PlayerId = (short)player.Id;
+                                    ballPacketWrapper.BallPacket.PlayerId = player.ArenaSlot;
                                 }
 
                                 HashSet<Player> players = _objectPoolManager.PlayerSetPool.Get();
@@ -2271,7 +2271,7 @@ namespace SS.Replay
                             ref CarryFlagPickup carryFlagPickup = ref MemoryMarshal.AsRef<CarryFlagPickup>(buffer);
                             if (ad.PlayerIdMap.TryGetValue(carryFlagPickup.PlayerId, out player))
                             {
-                                S2C_FlagPickup flagPickupPacket = new(carryFlagPickup.FlagId, (short)player.Id);
+                                S2C_FlagPickup flagPickupPacket = new(carryFlagPickup.FlagId, player.ArenaSlot);
                                 _network.SendToArena(arena, null, ref flagPickupPacket, NetSendFlags.Reliable);
                             }
                             else
@@ -2284,7 +2284,7 @@ namespace SS.Replay
                             ref CarryFlagDrop carryFlagDrop = ref MemoryMarshal.AsRef<CarryFlagDrop>(buffer);
                             if (ad.PlayerIdMap.TryGetValue(carryFlagDrop.PlayerId, out player))
                             {
-                                S2C_FlagDrop flagDropPacket = new((short)player.Id);
+                                S2C_FlagDrop flagDropPacket = new(player.ArenaSlot);
                                 _network.SendToArena(arena, null, ref flagDropPacket, NetSendFlags.Reliable);
                             }
                             else

@@ -1129,7 +1129,7 @@ namespace SS.Core.Modules
                     bd.Y,
                     bd.XSpeed,
                     bd.YSpeed,
-                    (short)(bd.Carrier?.Id ?? -1),
+                    bd.Carrier?.ArenaSlot ?? -1,
                     time);
 
                 var bpBytes = MemoryMarshal.AsBytes(MemoryMarshal.CreateReadOnlySpan(ref bp, 1));
