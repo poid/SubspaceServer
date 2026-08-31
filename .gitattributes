@@ -1,0 +1,11 @@
+# Let git decide how to store text files, and normalize them to LF in the repository.
+* text=auto
+
+# Shell scripts must keep LF even when checked out on Windows. The load test harness is run from WSL
+# against a working tree checked out by Windows git, and bash refuses a script with CRLF endings: it
+# reads the carriage return as part of the command and fails on the shebang line onwards.
+*.sh text eol=lf
+
+# Batch files are the other way around.
+*.cmd text eol=crlf
+*.bat text eol=crlf
