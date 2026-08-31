@@ -573,7 +573,7 @@ namespace SS.Core.Modules.FlagGame
 
             if (flagData.DirtyPlayer is not null)
             {
-                S2C_FlagPickup s2c = new(flagId, (short)flagData.DirtyPlayer.Id);
+                S2C_FlagPickup s2c = new(flagId, flagData.DirtyPlayer.ArenaSlot);
                 _network.SendToArena(arena, null, ref s2c, NetSendFlags.Reliable);
 
                 flagData.DirtyPlayer = null;
