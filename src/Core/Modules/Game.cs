@@ -79,6 +79,12 @@ namespace SS.Core.Modules
         /// </remarks>
         private Action<PositionBroadcast>? _arenaWork_BroadcastPosition;
 
+        /// <summary>
+        /// For firing <see cref="PlayerAction.EnterGame"/> on the mainloop.
+        /// </summary>
+        /// <inheritdoc cref="_arenaWork_BroadcastPosition" path="/remarks"/>
+        private Action<Player>? _mainloopWork_FireEnterGame;
+
         private InterfaceRegistrationToken<IGame>? _iGameToken;
 
         private PlayerDataKey<PlayerData> _pdKey;
@@ -105,6 +111,7 @@ namespace SS.Core.Modules
             _arenaLoop = broker.GetInterface<IArenaLoop>();
 
             _arenaWork_BroadcastPosition = BroadcastPosition;
+            _mainloopWork_FireEnterGame = MainloopWork_FireEnterGame;
 
             _adKey = _arenaManager.AllocateArenaData<ArenaData>();
             _pdKey = _playerData.AllocatePlayerData<PlayerData>();
@@ -1257,7 +1264,18 @@ namespace SS.Core.Modules
             if (player.Flags.SentPositionPacket == false && !isFake)
             {
                 player.Flags.SentPositionPacket = true;
-                PlayerActionCallback.Fire(arena, player, PlayerAction.EnterGame, arena);
+
+                // Fired on the mainloop rather than here, because this method runs on the player's arena
+                // thread when Net:HandlePacketsOnArenaThread is on, and PlayerAction has three dozen
+                // handlers registered zone-wide -- billing, capabilities, security, chat, stats -- that
+                // were all written when the mainloop was the only thread that could reach them.
+                //
+                // It costs nothing to hand over: this fires once per player per arena entry, not per
+                // position packet. The same idiom, and the same re-validation on arrival, is what Attach
+                // already does with AttachDTO.
+                Action<Player>? mainloopWork = _mainloopWork_FireEnterGame;
+                if (mainloopWork is not null)
+                    _mainloop.QueueMainWorkItem(mainloopWork, player);
             }
 
             int latency = gtc - pos.Time;
@@ -1556,6 +1574,29 @@ namespace SS.Core.Modules
         /// </para>
         /// </remarks>
         /// <param name="broadcast">What to send and to which arena. Returned to its pool before returning.</param>
+        /// <summary>
+        /// Fires <see cref="PlayerAction.EnterGame"/> for a player who has just sent their first position
+        /// packet, on the mainloop.
+        /// </summary>
+        /// <remarks>
+        /// Re-checks the player on arrival, because the arena thread that queued this and the mainloop that
+        /// runs it are not the same thread and the player may have left in between.
+        /// </remarks>
+        /// <param name="player">The player who entered the game.</param>
+        private void MainloopWork_FireEnterGame(Player player)
+        {
+            ThreadingAssert.OnMainloop(_mainloop);
+
+            if (player is null)
+                return;
+
+            Arena? arena = player.Arena;
+            if (arena is null || player.Status != PlayerState.Playing)
+                return;
+
+            PlayerActionCallback.Fire(arena, player, PlayerAction.EnterGame, arena);
+        }
+
         private void BroadcastPosition(PositionBroadcast broadcast)
         {
             using (broadcast)
