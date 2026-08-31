@@ -749,6 +749,10 @@ namespace SS.Core.Modules
 
         private bool ArenaTimer_BasicBallTimer(Arena arena)
         {
+            // This used to be a mainloop timer, and the ball state it walks is only safe to touch because
+            // the arena's own thread is the only one that does.
+            ThreadingAssert.OnArenaThread(arena);
+
             if (arena.Status != ArenaState.Running)
                 return true;
 

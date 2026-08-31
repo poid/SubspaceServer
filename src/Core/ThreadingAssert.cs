@@ -46,6 +46,41 @@ namespace SS.Core
         }
 
         /// <summary>
+        /// Asserts that the caller is on the thread that owns an arena.
+        /// </summary>
+        /// <remarks>
+        /// The arena counterpart of <see cref="OnMainloop"/>, for code that has been moved off the mainloop
+        /// and relies on its arena having a single writer. A failure means two threads can be in that
+        /// arena's state at once, which is the one thing the arena workers exist to prevent.
+        /// </remarks>
+        /// <param name="arena">The arena the caller is meant to be running for.</param>
+        /// <param name="caller">Filled in by the compiler, to name what ran on the wrong thread.</param>
+        [Conditional("DEBUG")]
+        public static void OnArenaThread(Arena? arena, [CallerMemberName] string? caller = null)
+        {
+            if (arena is null)
+                return;
+
+            // An Arena is itself a broker, so the service can be looked up from the one argument that
+            // matters rather than being injected into every caller for the sake of an assertion. The
+            // lookup only exists in debug builds, along with the rest of this method.
+            IArenaLoop? arenaLoop = arena.GetInterface<IArenaLoop>();
+            if (arenaLoop is null)
+                return;
+
+            try
+            {
+                Debug.Assert(
+                    arenaLoop.IsArenaThread(arena),
+                    $"{caller} must run on the thread that owns arena '{arena.Name}', but ran on '{Thread.CurrentThread.Name ?? "unnamed"}'.");
+            }
+            finally
+            {
+                arena.ReleaseInterface(ref arenaLoop);
+            }
+        }
+
+        /// <summary>
         /// Asserts that the caller holds the global player lock, in any of its forms.
         /// </summary>
         /// <param name="playerData">The player data service.</param>

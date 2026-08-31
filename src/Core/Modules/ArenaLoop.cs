@@ -55,10 +55,15 @@ namespace SS.Core.Modules
         private int _nextWorker = -1;
 
         /// <summary>
-        /// Which worker the running thread is, or -1 on any other thread.
+        /// Which worker the running thread is, offset by one, or 0 on any other thread.
         /// </summary>
+        /// <remarks>
+        /// Offset because a <see cref="ThreadStaticAttribute"/> field's initializer runs on one thread
+        /// only, so every other thread sees <see langword="default"/> whatever the initializer says. A
+        /// sentinel of -1 would therefore read as worker 0 on the mainloop and every network thread.
+        /// </remarks>
         [ThreadStatic]
-        private static int _currentWorker = -1;
+        private static int _currentWorkerPlusOne;
 
         /// <summary>
         /// Whether the calling thread is one of the arena workers.
@@ -68,7 +73,7 @@ namespace SS.Core.Modules
         /// can be answered without a broker or an arena in hand. That is what the generated callback
         /// assertions need, since they run wherever a callback is fired.
         /// </remarks>
-        public static bool IsArenaWorkerThread => _currentWorker >= 0;
+        public static bool IsArenaWorkerThread => _currentWorkerPlusOne > 0;
 
         /// <summary>
         /// The most work items allowed to wait in one worker's queue at once, or 0 for no limit.
@@ -217,7 +222,7 @@ namespace SS.Core.Modules
 
             Worker worker = GetWorker(arena);
 
-            if (_currentWorker == worker.Index)
+            if (_currentWorkerPlusOne == worker.Index + 1)
                 throw new InvalidOperationException("Cannot wait for an arena's work to drain from the thread that runs it.");
 
             worker.Drain();
@@ -227,7 +232,7 @@ namespace SS.Core.Modules
         {
             ArgumentNullException.ThrowIfNull(arena);
 
-            return _currentWorker >= 0 && _currentWorker == GetWorker(arena).Index;
+            return _currentWorkerPlusOne > 0 && _currentWorkerPlusOne == GetWorker(arena).Index + 1;
         }
 
         int IArenaLoop.WorkerCount => _workers.Length;
@@ -630,7 +635,7 @@ namespace SS.Core.Modules
 
             private void Run()
             {
-                _currentWorker = Index;
+                _currentWorkerPlusOne = Index + 1;
 
                 CancellationToken cancellationToken = _owner._cancellationTokenSource.Token;
 
