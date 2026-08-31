@@ -61,6 +61,16 @@ namespace SS.Core.Modules
         private static int _currentWorker = -1;
 
         /// <summary>
+        /// Whether the calling thread is one of the arena workers.
+        /// </summary>
+        /// <remarks>
+        /// Unlike <see cref="IArenaLoop.IsArenaThread(Arena)"/> this asks nothing about which arena, so it
+        /// can be answered without a broker or an arena in hand. That is what the generated callback
+        /// assertions need, since they run wherever a callback is fired.
+        /// </remarks>
+        public static bool IsArenaWorkerThread => _currentWorker >= 0;
+
+        /// <summary>
         /// The most work items allowed to wait in one worker's queue at once, or 0 for no limit.
         /// </summary>
         private int _maxQueueDepth;

@@ -48,7 +48,10 @@ namespace Foo.Bar
                 InvokeCallbacks(broker, callbacks, x, y, in z);
 
             if (broker.Parent is not null)
+            {
+                SS.Core.ThreadingAssert.CallbackReachesZoneWide(broker.Parent.GetCallback<MultipleParametersDelegate>() is not null, nameof(MultipleParametersDelegate));
                 Fire(broker.Parent, x, y, in z);
+            }
 
             // local helper (for recursion)
             static void InvokeCallbacks(IComponentBroker broker, MultipleParametersDelegate callbacks, int x, string y, ref readonly double z)

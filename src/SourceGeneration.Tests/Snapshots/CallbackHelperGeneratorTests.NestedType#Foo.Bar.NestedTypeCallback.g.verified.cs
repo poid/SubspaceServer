@@ -46,7 +46,10 @@ namespace Foo.Bar
                 InvokeCallbacks(broker, callbacks, x);
 
             if (broker.Parent is not null)
+            {
+                SS.Core.ThreadingAssert.CallbackReachesZoneWide(broker.Parent.GetCallback<NestedTypeDelegate>() is not null, nameof(NestedTypeDelegate));
                 Fire(broker.Parent, x);
+            }
 
             // local helper (for recursion)
             static void InvokeCallbacks(IComponentBroker broker, NestedTypeDelegate callbacks, global::Foo.Bar.NestedTypeCallback.MyNestedType x)

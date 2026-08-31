@@ -78,6 +78,39 @@ namespace SS.Core
         }
 
         /// <summary>
+        /// Asserts that a callback about to reach handlers registered above an arena is being fired from a
+        /// thread those handlers can tolerate.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// Called from the generated <c>Fire</c> methods, at the point where firing on an arena walks up to
+        /// the root broker. Handlers registered there are zone-wide infrastructure -- logging, stats,
+        /// replay, security -- and were written when the mainloop was the only thread that could reach
+        /// them. An arena thread reaching them is a silent hazard, which this turns into a failed
+        /// assertion naming the callback.
+        /// </para>
+        /// <para>
+        /// Deliberately not an assertion about arena threads in general. An arena firing a callback that
+        /// nothing registered zone-wide is fine, and so is one whose zone-wide handlers are thread-safe;
+        /// the first is why this takes <paramref name="hasZoneWideHandlers"/> rather than checking the
+        /// thread alone, and the second is what <see cref="ShardSafeAttribute"/> is for.
+        /// </para>
+        /// </remarks>
+        /// <param name="hasZoneWideHandlers">Whether any handler is actually registered above the arena.</param>
+        /// <param name="callbackName">The callback being fired, to name it in the failure.</param>
+        [Conditional("DEBUG")]
+        public static void CallbackReachesZoneWide(bool hasZoneWideHandlers, string callbackName)
+        {
+            if (!hasZoneWideHandlers)
+                return;
+
+            Debug.Assert(
+                !Modules.ArenaLoop.IsArenaWorkerThread,
+                $"{callbackName} was fired from an arena thread and reaches handlers registered zone-wide, which are not written to run there. " +
+                $"Fire it on the mainloop, or mark the callback [ShardSafe] if every handler it can reach really is thread-safe.");
+        }
+
+        /// <summary>
         /// Whether the mainloop has started running, so that there is a thread to compare against.
         /// </summary>
         /// <remarks>

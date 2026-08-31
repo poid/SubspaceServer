@@ -46,7 +46,10 @@ namespace Foo.Bar
                 InvokeCallbacks(broker, callbacks, arena);
 
             if (broker.Parent is not null)
+            {
+                SS.Core.ThreadingAssert.CallbackReachesZoneWide(broker.Parent.GetCallback<SingleArenaParameterFullyQualifiedDelegate>() is not null, nameof(SingleArenaParameterFullyQualifiedDelegate));
                 Fire(broker.Parent, arena);
+            }
 
             // local helper (for recursion)
             static void InvokeCallbacks(IComponentBroker broker, SingleArenaParameterFullyQualifiedDelegate callbacks, global::SS.Core.Arena arena)
