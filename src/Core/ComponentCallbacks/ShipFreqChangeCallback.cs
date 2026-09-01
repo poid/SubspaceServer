@@ -23,7 +23,11 @@
     /// <summary>
     /// Helper class for the <see cref="PreShipFreqChangeCallback"/> callback.
     /// </summary>
+    // Fired from the ship, freq and position packet handlers, which run on the player's arena thread when
+    // Net:HandlePacketsOnArenaThread is on. FreqManager is the only zone-wide handler, and it takes the
+    // global player lock for the whole of the work it does.
     [CallbackHelper]
+    [ShardSafe]
     public static partial class PreShipFreqChangeCallback
     {
         /// <summary>
@@ -44,7 +48,11 @@
     /// <summary>
     /// Helper class for the <see cref="ShipFreqChangeDelegate"/> callback.
     /// </summary>
+    // As for PreShipFreqChangeCallback. The zone-wide handlers are FreqManager, which takes the global
+    // player lock, and Balls and CarryFlags, which drop whatever the player was carrying in that player's
+    // own arena, under that arena's lock.
     [CallbackHelper]
+    [ShardSafe]
     public static partial class ShipFreqChangeCallback
     {
         /// <summary>

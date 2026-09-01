@@ -10,7 +10,9 @@
     /// </list>
     /// </summary>
     // TODO: Maybe rename this to BallPosessionLostCallback?
+    // As for BallGoalCallback: BasicStats alone, under the per-player lock that Stats takes.
     [CallbackHelper]
+    [ShardSafe]
     public static partial class BallShootCallback
     {
         public delegate void BallShootDelegate(Arena arena, Player player, byte ballId);
