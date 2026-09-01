@@ -3,7 +3,11 @@
     /// <summary>
     /// Helper class for the <see cref="StaticFlagClaimedDelegate"/> callback.
     /// </summary>
+    // Fired from the turf flag TouchFlag handler, which runs on the player's arena thread when
+    // Net:HandlePacketsOnArenaThread is on. BasicStats is the only zone-wide handler and it only
+    // increments a stat, which Stats does under the per-player lock.
     [CallbackHelper]
+    [ShardSafe]
     public static partial class StaticFlagClaimedCallback
     {
         /// <summary>

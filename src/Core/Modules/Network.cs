@@ -139,6 +139,24 @@ namespace SS.Core.Modules
         private bool _handlePacketsOnArenaThread;
 
         /// <summary>
+        /// Which packet types may be handled on the sending player's arena thread.
+        /// </summary>
+        /// <remarks>
+        /// Indexed by packet type. Opting in rather than out, so that a type nobody has thought about
+        /// stays on the mainloop: being wrong in that direction costs the mainloop some work, and being
+        /// wrong in the other runs zone-wide code on an arena thread.
+        /// <para>
+        /// What is absent matters as much as what is present. Entering and leaving an arena run the arena
+        /// state machine and can create and destroy arenas, which is zone-wide by definition and is the
+        /// one thing the arena threads must not do. Chat reaches players in other arenas, chat channels,
+        /// and the zone-wide staff list. The rest - logging in, the biller, file transfers, security
+        /// checks, server setting changes - are services the zone provides rather than anything happening
+        /// in one arena.
+        /// </para>
+        /// </remarks>
+        private static readonly bool[] _arenaScopedPacketTypes = CreateArenaScopedPacketTypes();
+
+        /// <summary>
         /// How many players are in each shard, so that a new connection can be given to the emptiest one
         /// without asking a <see cref="ConcurrentDictionary{TKey, TValue}"/> for its count, which takes
         /// all of its locks.
@@ -462,6 +480,40 @@ namespace SS.Core.Modules
             _oohandlers[19] = CorePacket_Special;        // 0x13 - cont key response
 
             _readOnlyListenData = _listenDataList.AsReadOnly();
+        }
+
+        /// <summary>
+        /// Builds the <see cref="_arenaScopedPacketTypes"/> lookup.
+        /// </summary>
+        /// <remarks>
+        /// Every type here is gameplay within the sending player's own arena. Each was checked for what it
+        /// reaches: none of them run the arena state machine, and the callbacks they fire either have no
+        /// handlers registered zone-wide or have handlers marked <see cref="ShardSafeAttribute"/> after
+        /// their zone-wide subscribers were read.
+        /// </remarks>
+        private static bool[] CreateArenaScopedPacketTypes()
+        {
+            bool[] types = new bool[byte.MaxValue + 1];
+
+            types[(int)C2SPacketType.Position] = true;
+            types[(int)C2SPacketType.Die] = true;
+            types[(int)C2SPacketType.Green] = true;
+            types[(int)C2SPacketType.SpecRequest] = true;
+            types[(int)C2SPacketType.SetFreq] = true;
+            types[(int)C2SPacketType.AttachTo] = true;
+            types[(int)C2SPacketType.TouchFlag] = true;
+            types[(int)C2SPacketType.TurretKickOff] = true;
+            types[(int)C2SPacketType.DropFlags] = true;
+            types[(int)C2SPacketType.SetShip] = true;
+            types[(int)C2SPacketType.Banner] = true;
+            types[(int)C2SPacketType.Brick] = true;
+            types[(int)C2SPacketType.CrownExpired] = true;
+            types[(int)C2SPacketType.ShootBall] = true;
+            types[(int)C2SPacketType.PickupBall] = true;
+            types[(int)C2SPacketType.Goal] = true;
+            types[(int)C2SPacketType.Damage] = true;
+
+            return types;
         }
 
         #region Module Members
@@ -4706,17 +4758,21 @@ namespace SS.Core.Modules
                 // already releases the buffer when refused.
                 bool queued;
 
-                // A packet for a player settled in an arena can be handled by that arena's thread, which
-                // is the whole point of having them: the mainloop stops being where every packet in the
-                // zone is processed. Anything else - logging in, changing arena, a chat client - stays on
-                // the mainloop, because it is not any one arena's business.
+                // A gameplay packet from a player settled in an arena can be handled by that arena's
+                // thread, which is the whole point of having them: the mainloop stops being where every
+                // packet in the zone is processed.
                 //
-                // Only while Playing. The states either side of it are where the player is being handed
+                // Both halves of the test are needed. The packet has to be one arena's business, which is
+                // what _arenaScopedPacketTypes says - the sender being in an arena does not make changing
+                // arena or sending a zone-wide chat message into arena work. And the sender has to be
+                // settled, because the states either side of Playing are where the player is being handed
                 // between the mainloop and the arena, and a packet handled during the handover could be
                 // running against either owner.
-                Arena? arena = _handlePacketsOnArenaThread && conn is PlayerConnection pc && pc.Player is Player p && p.Status == PlayerState.Playing
-                    ? p.Arena
-                    : null;
+                Arena? arena = _handlePacketsOnArenaThread
+                    && _arenaScopedPacketTypes[t1]
+                    && conn is PlayerConnection pc && pc.Player is Player p && p.Status == PlayerState.Playing
+                        ? p.Arena
+                        : null;
 
                 IArenaLoop? arenaLoop = _arenaLoop;
 

@@ -1685,6 +1685,12 @@ namespace SS.Core.Modules
 
         private void CompleteGo(Player player, ReadOnlySpan<char> requestName, ShipType ship, int xRes, int yRes, bool gfx, bool voices, bool obscene, int spawnX, int spawnY)
         {
+            // This finds or creates the destination arena and moves the player into it, which is arena
+            // life cycle rather than anything happening inside one arena, and belongs to the mainloop.
+            // Nothing enforced that before the arena threads existed, because there was nowhere else it
+            // could have run.
+            ThreadingAssert.OnMainloop(_mainloop);
+
             // status should be LoggedIn or Playing at this point
             if (player.Status != PlayerState.LoggedIn && player.Status != PlayerState.Playing && player.Status != PlayerState.LeavingArena)
             {
@@ -1888,6 +1894,9 @@ namespace SS.Core.Modules
 
         private void LeaveArena(Player player)
         {
+            // The other half of the life cycle, and the mainloop's for the same reason as CompleteGo.
+            ThreadingAssert.OnMainloop(_mainloop);
+
             bool notify;
             Arena? arena;
 

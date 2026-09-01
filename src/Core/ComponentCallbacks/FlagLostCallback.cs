@@ -46,7 +46,11 @@ namespace SS.Core.ComponentCallbacks
     /// <summary>
     /// Helper class for the <see cref="FlagLostDelegate"/> callback.
     /// </summary>
+    // Fired from the flag handlers, which run on the player's arena thread when
+    // Net:HandlePacketsOnArenaThread is on. BasicStats is the only zone-wide handler and it only
+    // adjusts stats, which Stats does under the per-player lock.
     [CallbackHelper]
+    [ShardSafe]
     public static partial class FlagLostCallback
     {
         /// <summary>

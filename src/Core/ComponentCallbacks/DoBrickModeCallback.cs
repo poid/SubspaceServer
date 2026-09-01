@@ -4,7 +4,11 @@ using static SS.Core.Modules.Bricks;
 
 namespace SS.Core.ComponentCallbacks
 {
+    // Fired from the Brick packet handler, which runs on the player's arena thread when
+    // Net:HandlePacketsOnArenaThread is on. Bricks is the only zone-wide handler and it reads map tiles,
+    // which are immutable once loaded, and writes only the list it is handed.
     [CallbackHelper]
+    [ShardSafe]
     public static partial class DoBrickModeCallback
     {
         /// <summary>

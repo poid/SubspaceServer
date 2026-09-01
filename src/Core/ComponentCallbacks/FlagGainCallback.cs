@@ -5,7 +5,9 @@ namespace SS.Core.ComponentCallbacks
     /// <summary>
     /// Helper class for the <see cref="FlagGainDelegate"/> callback.
     /// </summary>
+    // As for FlagLostCallback: BasicStats alone, under the per-player lock that Stats takes.
     [CallbackHelper]
+    [ShardSafe]
     public static partial class FlagGainCallback
     {
         /// <summary>

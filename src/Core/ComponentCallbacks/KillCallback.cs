@@ -5,7 +5,12 @@ namespace SS.Core.ComponentCallbacks
     /// <summary>
     /// Helper class for the <see cref="KillDelegate"/> callback.
     /// </summary>
+    // Fired from the Die packet handler, which runs on the killed player's arena thread when
+    // Net:HandlePacketsOnArenaThread is on. Registered zone-wide by BasicStats, Jackpot and Balls, and
+    // all three were read: the stats go through Stats, which takes the per-player lock on every path,
+    // and the other two touch only the killed player's own arena under that arena's lock.
     [CallbackHelper]
+    [ShardSafe]
     public static partial class KillCallback
     {
         /// <summary>

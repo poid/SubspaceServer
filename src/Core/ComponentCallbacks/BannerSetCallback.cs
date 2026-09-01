@@ -5,7 +5,11 @@ namespace SS.Core.ComponentCallbacks
     /// <summary>
     /// Callback for when a player's banner is set.
     /// </summary>
+    // Fired from the Banner packet handler, which runs on the player's arena thread when
+    // Net:HandlePacketsOnArenaThread is on. BillingUdp is the only zone-wide handler and it does all of
+    // its work, queuing the banner for upload to the biller, under its own lock.
     [CallbackHelper]
+    [ShardSafe]
     public static partial class BannerSetCallback
     {
         /// <summary>
