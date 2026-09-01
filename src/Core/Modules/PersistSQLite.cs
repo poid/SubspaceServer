@@ -172,6 +172,50 @@ namespace SS.Core.Modules
                 }
             }
 
+            if (!SetPragmas())
+                return false;
+
+            return true;
+        }
+
+        /// <summary>
+        /// Sets the durability settings the server wants, which are not SQLite's defaults.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// SQLite defaults to rolling back through a journal file and flushing to disk on every commit,
+        /// which is the right default for a library that cannot know what it is storing. This stores game
+        /// scores, and the cost of the default is paid on a path players wait on: loading a player's data
+        /// is a blocking step of entering an arena, so every commit is somebody standing still.
+        /// </para>
+        /// <para>
+        /// Write-ahead logging lets readers and the writer proceed together instead of excluding each
+        /// other, and NORMAL stops the fsync on every commit while keeping one at each checkpoint. What is
+        /// given up is the last few seconds of scores if the machine loses power, as opposed to the
+        /// process crashing, which WAL still survives intact. The server already accepts that trade: it
+        /// syncs everything on a timer precisely because it expects to lose whatever happened since.
+        /// </para>
+        /// </remarks>
+        private bool SetPragmas()
+        {
+            if (_connection is null)
+                return false;
+
+            try
+            {
+                using SqliteCommand command = _connection.CreateCommand();
+                command.CommandText = """
+                    PRAGMA journal_mode = WAL;
+                    PRAGMA synchronous = NORMAL;
+                    """;
+                command.ExecuteNonQuery();
+            }
+            catch (Exception ex)
+            {
+                LogException("Error setting database pragmas.", ex);
+                return false;
+            }
+
             return true;
         }
 

@@ -91,6 +91,37 @@ namespace SS.Core.ComponentInterfaces
         /// threads taking the read lock: a writer waits for every reader to finish.
         /// </summary>
         PlayerDataWriteLockWaitTicks,
+
+        /// <summary>Counter. Work items processed by the persist worker thread.</summary>
+        PersistWorkItemsProcessed,
+
+        /// <summary>
+        /// Counter. Stopwatch ticks the persist worker spent processing work items.
+        /// Divide by <see cref="PersistWorkItemsProcessed"/> for the mean cost of one.
+        /// </summary>
+        PersistWorkItemElapsedTicks,
+
+        /// <summary>
+        /// Gauge. Work items waiting in the persist queue.
+        /// <para>
+        /// The one to watch. Loading a player's data is a blocking step of entering an arena, so a queue
+        /// that grows is players waiting to get in, not merely scores being written late.
+        /// </para>
+        /// </summary>
+        PersistQueueDepth,
+
+        /// <summary>Counter. Database transactions committed by the persist worker.</summary>
+        PersistTransactions,
+
+        /// <summary>
+        /// Counter. Stopwatch ticks spent committing database transactions.
+        /// Separate from <see cref="PersistWorkItemElapsedTicks"/> because a commit is where the cost of
+        /// the durability settings shows up, and that is a configuration question rather than a code one.
+        /// </summary>
+        PersistCommitElapsedTicks,
+
+        /// <summary>Counter. Players written by a full sync.</summary>
+        PersistPlayersSynced,
     }
 
     /// <summary>

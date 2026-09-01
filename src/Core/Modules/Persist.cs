@@ -5,6 +5,7 @@ using SS.Utilities;
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Threading;
 using System.Threading.Tasks;
@@ -45,6 +46,9 @@ namespace SS.Core.Modules
         private TimeSpan _syncTimeSpan;
 
         private ArenaDataKey<ArenaData> _adKey;
+
+        // Optional dependency. Retrieved in LoadAsync, which is after the module that provides it.
+        private IServerMetrics? _serverMetrics;
 
         private static int _maxRecordLength = PersistSettings.MaxRecordLength.Default;
 
@@ -87,6 +91,8 @@ namespace SS.Core.Modules
             if (!await Task.Run(_persistDatastore.Open))
                 return false;
 
+            _serverMetrics = broker.GetInterface<IServerMetrics>();
+
             _adKey = _arenaManager.AllocateArenaData<ArenaData>();
             ArenaActionCallback.Register(broker, Callback_ArenaAction);
 
@@ -122,6 +128,11 @@ namespace SS.Core.Modules
 
             ArenaActionCallback.Unregister(broker, Callback_ArenaAction);
             _arenaManager.FreeArenaData(ref _adKey);
+
+            if (_serverMetrics is not null)
+            {
+                broker.ReleaseInterface(ref _serverMetrics);
+            }
 
             await Task.Run(_persistDatastore.Close);
 
@@ -374,6 +385,8 @@ namespace SS.Core.Modules
                         // we'd at least have the data that was saved since the last sync was committed.
                         _registrationSemaphore.Wait();
 
+                        long syncStart = Stopwatch.GetTimestamp();
+
                         try
                         {
                             bool startedTransaction = _persistDatastore.BeginTransaction();
@@ -385,13 +398,24 @@ namespace SS.Core.Modules
                             finally
                             {
                                 if (startedTransaction)
+                                {
+                                    long commitStart = Stopwatch.GetTimestamp();
                                     _persistDatastore.CommitTransaction();
+                                    _serverMetrics?.Add(ServerMetric.PersistCommitElapsedTicks, Stopwatch.GetTimestamp() - commitStart);
+                                    _serverMetrics?.Increment(ServerMetric.PersistTransactions);
+                                }
                             }
                         }
                         finally
                         {
                             _registrationSemaphore.Release();
                         }
+
+                        // Counted as a work item so that the periodic sync shows up in the mean cost of
+                        // one, which is where it belongs: it is by far the most expensive thing this
+                        // thread does and hiding it would flatter the average.
+                        _serverMetrics?.Add(ServerMetric.PersistWorkItemElapsedTicks, Stopwatch.GetTimestamp() - syncStart);
+                        _serverMetrics?.Increment(ServerMetric.PersistWorkItemsProcessed);
 
                         nextSync = DateTime.UtcNow + _syncTimeSpan;
                     }
@@ -401,6 +425,15 @@ namespace SS.Core.Modules
 
                 PlayerWorkItem? playerWorkItem;
                 ArenaWorkItem? arenaWorkItem;
+
+                // Sampled before the work is done, so it reads as the backlog this item was taken from
+                // rather than as whatever arrived while it ran.
+                IServerMetrics? metrics = _serverMetrics;
+                bool measuring = metrics is not null && metrics.IsEnabled;
+                long workItemStart = measuring ? Stopwatch.GetTimestamp() : 0;
+
+                if (measuring)
+                    metrics!.SetGauge(ServerMetric.PersistQueueDepth, _workQueue.Count);
 
                 _registrationSemaphore.Wait();
 
@@ -479,12 +512,30 @@ namespace SS.Core.Modules
                     finally
                     {
                         if (startedTransaction)
+                        {
+                            // Timed separately from the rest of the work item, because a commit is where
+                            // the durability settings show up and those are configuration rather than code.
+                            long commitStart = measuring ? Stopwatch.GetTimestamp() : 0;
+
                             _persistDatastore.CommitTransaction();
+
+                            if (measuring)
+                            {
+                                metrics!.Add(ServerMetric.PersistCommitElapsedTicks, Stopwatch.GetTimestamp() - commitStart);
+                                metrics.Increment(ServerMetric.PersistTransactions);
+                            }
+                        }
                     }
                 }
                 finally
                 {
                     _registrationSemaphore.Release();
+                }
+
+                if (measuring)
+                {
+                    metrics!.Add(ServerMetric.PersistWorkItemElapsedTicks, Stopwatch.GetTimestamp() - workItemStart);
+                    metrics.Increment(ServerMetric.PersistWorkItemsProcessed);
                 }
 
                 if (!_mainloop.QueueMainWorkItem(_mainloopWorkItem_ExecuteCallbacksAndDispose, workItem)
@@ -715,6 +766,10 @@ namespace SS.Core.Modules
                             PutOnePlayer(player, player.Arena); // per-arena player data
                         }
                     }
+
+                    // Reported once for the whole sweep rather than per player, since the interesting
+                    // quantity is how much one sync has to get through.
+                    _serverMetrics?.SetGauge(ServerMetric.PersistPlayersSynced, players.Count);
                 }
                 finally
                 {

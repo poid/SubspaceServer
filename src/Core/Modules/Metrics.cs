@@ -451,6 +451,13 @@ namespace SS.Core.Modules
                 sb.Append($"  player lock: {Read(ServerMetric.PlayerDataReadLocks) / seconds:F0} read/s, {Read(ServerMetric.PlayerDataWriteLocks) / seconds:F0} write/s, write held {TotalMilliseconds(Read(ServerMetric.PlayerDataWriteLockHeldTicks)):F1}ms, write waited {TotalMilliseconds(Read(ServerMetric.PlayerDataWriteLockWaitTicks)):F1}ms");
                 Emit(sb, player);
 
+                // Queue depth is the one that matters: loading a player's data is a blocking step of
+                // entering an arena, so a depth that keeps growing is players waiting to get in.
+                long persistWorkItems = Read(ServerMetric.PersistWorkItemsProcessed);
+                long persistTransactions = Read(ServerMetric.PersistTransactions);
+                sb.Append($"  persist: {persistWorkItems / seconds:F0} item/s, {MeanMilliseconds(Read(ServerMetric.PersistWorkItemElapsedTicks), persistWorkItems):F2}ms/item, {Read(ServerMetric.PersistQueueDepth)} queued, {persistTransactions / seconds:F0} txn/s, {MeanMilliseconds(Read(ServerMetric.PersistCommitElapsedTicks), persistTransactions):F2}ms/commit, {Read(ServerMetric.PersistPlayersSynced)} synced");
+                Emit(sb, player);
+
                 // Sustained allocation here means the object pools have stopped keeping up, since the
                 // server is written to avoid allocating in steady state.
                 sb.Append($"  gc: {(GC.GetTotalAllocatedBytes() - _windowStartAllocatedBytes) / seconds / 1024d:F0} KB/s allocated, gen0 {GC.CollectionCount(0) - _windowStartGen0}, gen1 {GC.CollectionCount(1) - _windowStartGen1}, gen2 {GC.CollectionCount(2) - _windowStartGen2}");
