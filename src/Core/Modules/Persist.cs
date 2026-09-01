@@ -22,6 +22,7 @@ namespace SS.Core.Modules
         private readonly IComponentBroker _broker;
         private readonly IArenaManager _arenaManager;
         private readonly IConfigManager _configManager;
+        private readonly ILogManager _logManager;
         private readonly IMainloop _mainloop;
         private readonly IObjectPoolManager _objectPoolManager;
         private readonly IPersistDatastore _persistDatastore;
@@ -50,6 +51,16 @@ namespace SS.Core.Modules
         // Optional dependency. Retrieved in LoadAsync, which is after the module that provides it.
         private IServerMetrics? _serverMetrics;
 
+        /// <summary>
+        /// The most work items to put through one database transaction.
+        /// </summary>
+        /// <remarks>
+        /// A bound rather than a target. Only work already waiting is ever taken, so this is reached only
+        /// when the queue is genuinely deep, and it exists so that one transaction cannot grow without
+        /// limit and so that the callbacks for the first item in a batch are not held up by the last.
+        /// </remarks>
+        private const int MaxWorkItemBatch = 128;
+
         private static int _maxRecordLength = PersistSettings.MaxRecordLength.Default;
 
         private readonly Action<PersistWorkItem> _mainloopWorkItem_ExecuteCallbacksAndDispose;
@@ -58,6 +69,7 @@ namespace SS.Core.Modules
             IComponentBroker broker,
             IArenaManager arenaManager,
             IConfigManager configManager,
+            ILogManager logManager,
             IMainloop mainloop,
             IObjectPoolManager objectPoolManager,
             IPersistDatastore persistDatastore,
@@ -66,6 +78,7 @@ namespace SS.Core.Modules
             _broker = broker;
             _arenaManager = arenaManager ?? throw new ArgumentNullException(nameof(arenaManager));
             _configManager = configManager ?? throw new ArgumentNullException(nameof(configManager));
+            _logManager = logManager ?? throw new ArgumentNullException(nameof(logManager));
             _mainloop = mainloop ?? throw new ArgumentNullException(nameof(mainloop));
             _objectPoolManager = objectPoolManager ?? throw new ArgumentNullException(nameof(objectPoolManager));
             _persistDatastore = persistDatastore ?? throw new ArgumentNullException(nameof(persistDatastore));
@@ -362,6 +375,9 @@ namespace SS.Core.Modules
         {
             DateTime nextSync = DateTime.UtcNow + _syncTimeSpan;
 
+            // Reused for every batch. Only this thread ever touches it.
+            List<PersistWorkItem> batch = new(MaxWorkItemBatch);
+
             while (true)
             {
                 TimeSpan waitTimeSpan = nextSync - DateTime.UtcNow;
@@ -426,14 +442,29 @@ namespace SS.Core.Modules
                 PlayerWorkItem? playerWorkItem;
                 ArenaWorkItem? arenaWorkItem;
 
-                // Sampled before the work is done, so it reads as the backlog this item was taken from
+                // Sampled before the work is done, so it reads as the backlog this batch was taken from
                 // rather than as whatever arrived while it ran.
                 IServerMetrics? metrics = _serverMetrics;
                 bool measuring = metrics is not null && metrics.IsEnabled;
-                long workItemStart = measuring ? Stopwatch.GetTimestamp() : 0;
+                long batchStart = measuring ? Stopwatch.GetTimestamp() : 0;
 
                 if (measuring)
                     metrics!.SetGauge(ServerMetric.PersistQueueDepth, _workQueue.Count);
+
+                // Take whatever else is already waiting and do it in the same transaction. Only what is
+                // already there: nothing is ever waited for in the hope that more arrives, so a quiet
+                // server still does one item per transaction and nobody waits longer than they did.
+                //
+                // It is the busy case this is for. Entering and leaving an arena each wait on their work
+                // item, so a burst of players arriving is a burst of people standing still, and what they
+                // were waiting for was mostly the commits.
+                batch.Clear();
+                batch.Add(workItem);
+
+                while (batch.Count < MaxWorkItemBatch && _workQueue.TryTake(out PersistWorkItem? queuedWorkItem))
+                {
+                    batch.Add(queuedWorkItem);
+                }
 
                 _registrationSemaphore.Wait();
 
@@ -443,70 +474,85 @@ namespace SS.Core.Modules
 
                     try
                     {
-                        switch (workItem.Command)
+                        foreach (PersistWorkItem batchItem in batch)
                         {
-                            case PersistCommand.Null:
-                                break;
-
-                            case PersistCommand.GetPlayer:
-                                playerWorkItem = workItem as PlayerWorkItem;
-                                if (playerWorkItem is not null && playerWorkItem.Player is not null)
+                            // Nothing here used to be guarded, so anything that threw took the whole
+                            // persist thread with it and left every player after that waiting forever on
+                            // a sync that would never call back. The datastore swallows its own errors,
+                            // but the modules that serialize their data are called from here and are not
+                            // obliged to. One record failing costs that record.
+                            try
+                            {
+                                switch (batchItem.Command)
                                 {
-                                    GetOnePlayer(playerWorkItem.Player, playerWorkItem.Arena);
+                                    case PersistCommand.Null:
+                                        break;
+
+                                    case PersistCommand.GetPlayer:
+                                        playerWorkItem = batchItem as PlayerWorkItem;
+                                        if (playerWorkItem is not null && playerWorkItem.Player is not null)
+                                        {
+                                            GetOnePlayer(playerWorkItem.Player, playerWorkItem.Arena);
+                                        }
+                                        break;
+
+                                    case PersistCommand.PutPlayer:
+                                        playerWorkItem = batchItem as PlayerWorkItem;
+                                        if (playerWorkItem is not null && playerWorkItem.Player is not null)
+                                        {
+                                            PutOnePlayer(playerWorkItem.Player, playerWorkItem.Arena);
+                                        }
+                                        break;
+
+                                    case PersistCommand.GetArena:
+                                        arenaWorkItem = batchItem as ArenaWorkItem;
+                                        if (arenaWorkItem is not null)
+                                        {
+                                            GetOneArena(arenaWorkItem.Arena);
+                                        }
+                                        break;
+
+                                    case PersistCommand.PutArena:
+                                        arenaWorkItem = batchItem as ArenaWorkItem;
+                                        if (arenaWorkItem is not null)
+                                        {
+                                            PutOneArena(arenaWorkItem.Arena);
+                                        }
+                                        break;
+
+                                    case PersistCommand.PutAll:
+                                        DoPutAll();
+                                        nextSync = DateTime.UtcNow + _syncTimeSpan;
+                                        break;
+
+                                    case PersistCommand.EndInterval:
+                                        if (batchItem is IntervalWorkItem intervalWorkItem && intervalWorkItem.ArenaGroup is not null)
+                                        {
+                                            DoEndInterval(intervalWorkItem.Interval, intervalWorkItem.ArenaGroup);
+                                        }
+                                        break;
+
+                                    case PersistCommand.ResetGameInterval:
+                                        if (batchItem is ResetGameIntervalWorkItem resetIntervalWorkItem && resetIntervalWorkItem.Arena is not null)
+                                        {
+                                            DoResetGameInterval(resetIntervalWorkItem.Arena);
+                                        }
+                                        break;
+
+                                    //case PersistCommand.GetGeneric:
+                                    //    break;
+
+                                    //case PersistCommand.PutGeneric:
+                                    //    break;
+
+                                    default:
+                                        break;
                                 }
-                                break;
-
-                            case PersistCommand.PutPlayer:
-                                playerWorkItem = workItem as PlayerWorkItem;
-                                if (playerWorkItem is not null && playerWorkItem.Player is not null)
-                                {
-                                    PutOnePlayer(playerWorkItem.Player, playerWorkItem.Arena);
-                                }
-                                break;
-
-                            case PersistCommand.GetArena:
-                                arenaWorkItem = workItem as ArenaWorkItem;
-                                if (arenaWorkItem is not null)
-                                {
-                                    GetOneArena(arenaWorkItem.Arena);
-                                }
-                                break;
-
-                            case PersistCommand.PutArena:
-                                arenaWorkItem = workItem as ArenaWorkItem;
-                                if (arenaWorkItem is not null)
-                                {
-                                    PutOneArena(arenaWorkItem.Arena);
-                                }
-                                break;
-
-                            case PersistCommand.PutAll:
-                                DoPutAll();
-                                nextSync = DateTime.UtcNow + _syncTimeSpan;
-                                break;
-
-                            case PersistCommand.EndInterval:
-                                if (workItem is IntervalWorkItem intervalWorkItem && intervalWorkItem.ArenaGroup is not null)
-                                {
-                                    DoEndInterval(intervalWorkItem.Interval, intervalWorkItem.ArenaGroup);
-                                }
-                                break;
-
-                            case PersistCommand.ResetGameInterval:
-                                if (workItem is ResetGameIntervalWorkItem resetIntervalWorkItem && resetIntervalWorkItem.Arena is not null)
-                                {
-                                    DoResetGameInterval(resetIntervalWorkItem.Arena);
-                                }
-                                break;
-
-                            //case PersistCommand.GetGeneric:
-                            //    break;
-
-                            //case PersistCommand.PutGeneric:
-                            //    break;
-
-                            default:
-                                break;
+                            }
+                            catch (Exception ex)
+                            {
+                                _logManager.LogM(LogLevel.Error, nameof(Persist), $"Caught an exception processing a {batchItem.Command} work item. {ex}");
+                            }
                         }
                     }
                     finally
@@ -534,17 +580,22 @@ namespace SS.Core.Modules
 
                 if (measuring)
                 {
-                    metrics!.Add(ServerMetric.PersistWorkItemElapsedTicks, Stopwatch.GetTimestamp() - workItemStart);
-                    metrics.Increment(ServerMetric.PersistWorkItemsProcessed);
+                    metrics!.Add(ServerMetric.PersistWorkItemElapsedTicks, Stopwatch.GetTimestamp() - batchStart);
+                    metrics.Add(ServerMetric.PersistWorkItemsProcessed, batch.Count);
                 }
 
-                if (!_mainloop.QueueMainWorkItem(_mainloopWorkItem_ExecuteCallbacksAndDispose, workItem)
-                    && workItem.Command == PersistCommand.PutAll)
+                // Callbacks only after the commit, so that whatever they let happen next is happening
+                // against data that is already durable. In batch order, which is queue order.
+                foreach (PersistWorkItem batchItem in batch)
                 {
-                    // Couldn't queue a mainloop workitem. This will happen when the server is shutting down.
-                    // When the mainloop exits, that thread requests that we save everything by adding a PutAll request, and it waits for us to execute the callback.
-                    // Do the callback on worker thread.
-                    MainloopWorkItem_ExecuteCallbacksAndDispose(workItem);
+                    if (!_mainloop.QueueMainWorkItem(_mainloopWorkItem_ExecuteCallbacksAndDispose, batchItem)
+                        && batchItem.Command == PersistCommand.PutAll)
+                    {
+                        // Couldn't queue a mainloop workitem. This will happen when the server is shutting down.
+                        // When the mainloop exits, that thread requests that we save everything by adding a PutAll request, and it waits for us to execute the callback.
+                        // Do the callback on worker thread.
+                        MainloopWorkItem_ExecuteCallbacksAndDispose(batchItem);
+                    }
                 }
             }
 
