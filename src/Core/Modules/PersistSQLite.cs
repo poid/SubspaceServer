@@ -28,6 +28,46 @@ namespace SS.Core.Modules
         private SqliteTransaction? _batchTransaction;
         private readonly Dictionary<string, SqliteCommand> _commandDictionary = [];
 
+        /// <summary>
+        /// The row id each player name has in the Player table.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// Every read or write of a player's data starts by turning their name into this id, which was a
+        /// query against the Player table each time. Since nothing ever deletes from that table and a row
+        /// keeps the id it was given, the answer cannot go stale and is worth remembering.
+        /// </para>
+        /// <para>
+        /// That no row is ever removed from the Player table is the assumption this rests on, so anything
+        /// added later that does remove one has to clear this. It would announce itself rather than
+        /// corrupt anything if it were missed: the connection runs with foreign keys enforced, so writing
+        /// player data against an id that no longer exists fails the constraint instead of quietly
+        /// attaching one player's scores to another.
+        /// </para>
+        /// <para>
+        /// Compared ordinally although the column is COLLATE NOCASE, so the two disagree about names
+        /// differing only in case. That way round is safe: the cache misses, the query answers, and both
+        /// spellings end up here pointing at the one id. Matching case-insensitively in .NET would fold
+        /// more aggressively than SQLite does and could hand back one player's id for another's name.
+        /// </para>
+        /// </remarks>
+        private readonly Dictionary<string, int> _persistPlayerIdCache = new(StringComparer.Ordinal);
+
+        /// <summary>
+        /// The interval that is current for each arena group.
+        /// </summary>
+        /// <remarks>
+        /// The other lookup every read and write begins with. This one can change, when an interval ends
+        /// and a new one becomes current, so it is written afresh at the one place that does that.
+        /// </remarks>
+        private readonly Dictionary<(string ArenaGroup, PersistInterval Interval), int> _arenaGroupIntervalIdCache = [];
+
+        /// <summary>
+        /// The most names to remember before starting over, so that a long-lived server does not hold one
+        /// entry for every player it has ever seen. Passing it costs a query per name once.
+        /// </summary>
+        private const int MaxCachedPlayerIds = 65536;
+
         private const string Error_NoConnection = "No connection. Use IPersistDatastore.Open first.";
 
         #region Module methods
@@ -230,6 +270,8 @@ namespace SS.Core.Modules
             }
 
             _commandDictionary.Clear();
+            _persistPlayerIdCache.Clear();
+            _arenaGroupIntervalIdCache.Clear();
 
             _connection.Dispose();
             _connection = null;
@@ -849,6 +891,10 @@ namespace SS.Core.Modules
                 throw new Exception($"Error inserting into the CurrentArenaGroupInterval table for ArenaGroup '{arenaGroup}', Interval '{interval}'.", ex);
             }
 
+            // This is the only thing that changes which interval is current, so it is the only place the
+            // cached answer can go stale, and it has the new answer in hand.
+            _arenaGroupIntervalIdCache[(arenaGroup, interval)] = arenaGroupIntervalId;
+
             return arenaGroupIntervalId;
         }
 
@@ -907,10 +953,17 @@ namespace SS.Core.Modules
 
         private int DbGetOrCreateCurrentArenaGroupIntervalId(SqliteTransaction transaction, string arenaGroup, PersistInterval interval)
         {
+            if (_arenaGroupIntervalIdCache.TryGetValue((arenaGroup, interval), out int cachedArenaGroupIntervalId))
+                return cachedArenaGroupIntervalId;
+
             int? arenaGroupIntervalId = DbGetCurrentArenaGroupIntervalId(transaction, arenaGroup, interval);
             if (arenaGroupIntervalId != null)
+            {
+                _arenaGroupIntervalIdCache[(arenaGroup, interval)] = arenaGroupIntervalId.Value;
                 return arenaGroupIntervalId.Value;
+            }
 
+            // Creating one writes the cache itself, since that is also the path an interval ending takes.
             return DbCreateArenaGroupIntervalAndSetCurrent(transaction, arenaGroup, interval);
         }
 
@@ -919,11 +972,14 @@ namespace SS.Core.Modules
             if (_connection is null)
                 throw new InvalidOperationException(Error_NoConnection);
 
+            if (_persistPlayerIdCache.TryGetValue(playerName, out int cachedPersistPlayerId))
+                return cachedPersistPlayerId;
+
             try
             {
                 const string sql = """
-					SELECT PersistPlayerId 
-					FROM Player 
+					SELECT PersistPlayerId
+					FROM Player
 					WHERE PlayerName = @PlayerName
 					""";
 
@@ -946,7 +1002,7 @@ namespace SS.Core.Modules
                     object? persistPlayerIdObj = command.ExecuteScalar();
                     if (persistPlayerIdObj != null && persistPlayerIdObj != DBNull.Value)
                     {
-                        return Convert.ToInt32(persistPlayerIdObj);
+                        return CachePersistPlayerId(playerName, Convert.ToInt32(persistPlayerIdObj));
                     }
                 }
                 finally
@@ -986,7 +1042,7 @@ namespace SS.Core.Modules
                     object? persistPlayerIdObj = command.ExecuteScalar();
                     if (persistPlayerIdObj != null && persistPlayerIdObj != DBNull.Value)
                     {
-                        return Convert.ToInt32(persistPlayerIdObj);
+                        return CachePersistPlayerId(playerName, Convert.ToInt32(persistPlayerIdObj));
                     }
                     else
                     {
@@ -1002,6 +1058,26 @@ namespace SS.Core.Modules
             {
                 throw new Exception($"Error inserting into the Player table for player name '{playerName}'.", ex);
             }
+        }
+
+        /// <summary>
+        /// Remembers the row id a player name has, and returns it.
+        /// </summary>
+        /// <remarks>
+        /// Safe to remember an id that was just created as well as one that was read, because nothing here
+        /// ever rolls a transaction back: the worker commits in a finally, so a row that has been inserted
+        /// is a row that will exist.
+        /// </remarks>
+        private int CachePersistPlayerId(string playerName, int persistPlayerId)
+        {
+            // Cleared wholesale rather than evicted one at a time. Which name is worth keeping is not
+            // knowable here, the cost of being wrong is one query, and a server reaching this many
+            // distinct names has been running long enough that a rebuild is nothing.
+            if (_persistPlayerIdCache.Count >= MaxCachedPlayerIds)
+                _persistPlayerIdCache.Clear();
+
+            _persistPlayerIdCache[playerName] = persistPlayerId;
+            return persistPlayerId;
         }
 
         private bool DbGetPlayerData(SqliteTransaction transaction, string playerName, string arenaGroup, PersistInterval interval, int persistKey, Stream outStream)
