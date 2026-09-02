@@ -61,6 +61,20 @@ namespace SS.Core.Modules
         /// </remarks>
         private const int MaxWorkItemBatch = 128;
 
+        /// <summary>
+        /// How many players a periodic sync writes before committing and letting anything waiting through.
+        /// </summary>
+        /// <remarks>
+        /// Measured at ten thousand players, one sweep took 5.2 seconds. Entering an arena waits on this
+        /// thread, so that was every player arriving during a sync waiting for all of it. At roughly half
+        /// a millisecond per player this keeps one chunk near a tenth of a second.
+        /// <para>
+        /// Smaller is not automatically better: each chunk is a commit, and commits are the expensive part
+        /// of a sync, so cutting it finer trades total sync time for how long any one player waits.
+        /// </para>
+        /// </remarks>
+        private const int SyncPlayersPerChunk = 256;
+
         private static int _maxRecordLength = PersistSettings.MaxRecordLength.Default;
 
         private readonly Action<PersistWorkItem> _mainloopWorkItem_ExecuteCallbacksAndDispose;
@@ -271,6 +285,7 @@ namespace SS.Core.Modules
             workItem.Arena = arena;
             workItem.Callback = callback;
 
+            workItem.QueuedTimestamp = Stopwatch.GetTimestamp();
             _workQueue.Add(workItem);
         }
 
@@ -287,6 +302,7 @@ namespace SS.Core.Modules
             workItem.Arena = arena;
             workItem.Callback = callback;
 
+            workItem.QueuedTimestamp = Stopwatch.GetTimestamp();
             _workQueue.Add(workItem);
         }
 
@@ -310,6 +326,7 @@ namespace SS.Core.Modules
             workItem.Interval = interval;
             workItem.ArenaGroup = arenaGroup;
 
+            workItem.QueuedTimestamp = Stopwatch.GetTimestamp();
             _workQueue.Add(workItem);
         }
 
@@ -322,6 +339,7 @@ namespace SS.Core.Modules
             workItem.Arena = arena;
             workItem.Callback = callback;
 
+            workItem.QueuedTimestamp = Stopwatch.GetTimestamp();
             _workQueue.Add(workItem);
         }
 
@@ -331,6 +349,7 @@ namespace SS.Core.Modules
             workItem.Command = PersistCommand.PutAll;
             workItem.Callback = completed;
 
+            workItem.QueuedTimestamp = Stopwatch.GetTimestamp();
             _workQueue.Add(workItem);
         }
 
@@ -375,8 +394,15 @@ namespace SS.Core.Modules
         {
             DateTime nextSync = DateTime.UtcNow + _syncTimeSpan;
 
-            // Reused for every batch. Only this thread ever touches it.
+            // Reused for every batch. Only this thread ever touches them.
             List<PersistWorkItem> batch = new(MaxWorkItemBatch);
+
+            // Work drawn part way through a sync that is not safe to run there, kept until it finishes.
+            List<PersistWorkItem> deferred = [];
+
+            // Whether the periodic sync has a transaction open. It opens and closes several, so this
+            // cannot be a local of the block that starts it.
+            bool syncTransactionOpen = false;
 
             while (true)
             {
@@ -405,21 +431,17 @@ namespace SS.Core.Modules
 
                         try
                         {
-                            bool startedTransaction = _persistDatastore.BeginTransaction();
+                            BeginSyncTransaction();
 
                             try
                             {
-                                DoPutAll();
+                                // Interleaved, so that the sweep lets whatever is waiting through as it
+                                // goes rather than making all of it wait for the whole thing.
+                                DoPutAll(interleave: true);
                             }
                             finally
                             {
-                                if (startedTransaction)
-                                {
-                                    long commitStart = Stopwatch.GetTimestamp();
-                                    _persistDatastore.CommitTransaction();
-                                    _serverMetrics?.Add(ServerMetric.PersistCommitElapsedTicks, Stopwatch.GetTimestamp() - commitStart);
-                                    _serverMetrics?.Increment(ServerMetric.PersistTransactions);
-                                }
+                                CommitSyncTransaction();
                             }
                         }
                         finally
@@ -434,22 +456,22 @@ namespace SS.Core.Modules
                         _serverMetrics?.Increment(ServerMetric.PersistWorkItemsProcessed);
 
                         nextSync = DateTime.UtcNow + _syncTimeSpan;
+
+                        // Whatever the sync drew but would not run part way through.
+                        if (deferred.Count > 0)
+                        {
+                            batch.Clear();
+                            batch.AddRange(deferred);
+                            deferred.Clear();
+                            RunBatch();
+                        }
                     }
 
                     continue;
                 }
 
-                PlayerWorkItem? playerWorkItem;
-                ArenaWorkItem? arenaWorkItem;
-
-                // Sampled before the work is done, so it reads as the backlog this batch was taken from
-                // rather than as whatever arrived while it ran.
-                IServerMetrics? metrics = _serverMetrics;
-                bool measuring = metrics is not null && metrics.IsEnabled;
-                long batchStart = measuring ? Stopwatch.GetTimestamp() : 0;
-
-                if (measuring)
-                    metrics!.SetGauge(ServerMetric.PersistQueueDepth, _workQueue.Count);
+                batch.Clear();
+                batch.Add(workItem);
 
                 // Take whatever else is already waiting and do it in the same transaction. Only what is
                 // already there: nothing is ever waited for in the hope that more arrives, so a quiet
@@ -458,12 +480,36 @@ namespace SS.Core.Modules
                 // It is the busy case this is for. Entering and leaving an arena each wait on their work
                 // item, so a burst of players arriving is a burst of people standing still, and what they
                 // were waiting for was mostly the commits.
-                batch.Clear();
-                batch.Add(workItem);
-
                 while (batch.Count < MaxWorkItemBatch && _workQueue.TryTake(out PersistWorkItem? queuedWorkItem))
                 {
                     batch.Add(queuedWorkItem);
+                }
+
+                RunBatch();
+            }
+
+            // Runs everything currently in batch through one transaction, then lets the callbacks go.
+            void RunBatch()
+            {
+                // Sampled before the work is done, so it reads as the backlog this batch was taken from
+                // rather than as whatever arrived while it ran.
+                IServerMetrics? metrics = _serverMetrics;
+                bool measuring = metrics is not null && metrics.IsEnabled;
+                long batchStart = measuring ? Stopwatch.GetTimestamp() : 0;
+
+                if (measuring)
+                {
+                    metrics!.SetGauge(ServerMetric.PersistQueueDepth, _workQueue.Count);
+
+                    // How long each item sat in the queue. Depth is only a proxy for this, and a poor one
+                    // read as a gauge: a backlog that builds behind a long sync and drains before the
+                    // window ends leaves the gauge showing the quiet moment at the end.
+                    long now = Stopwatch.GetTimestamp();
+
+                    foreach (PersistWorkItem batchItem in batch)
+                    {
+                        metrics.Add(ServerMetric.PersistWaitElapsedTicks, now - batchItem.QueuedTimestamp);
+                    }
                 }
 
                 _registrationSemaphore.Wait();
@@ -476,91 +522,15 @@ namespace SS.Core.Modules
                     {
                         foreach (PersistWorkItem batchItem in batch)
                         {
-                            // Nothing here used to be guarded, so anything that threw took the whole
-                            // persist thread with it and left every player after that waiting forever on
-                            // a sync that would never call back. The datastore swallows its own errors,
-                            // but the modules that serialize their data are called from here and are not
-                            // obliged to. One record failing costs that record.
-                            try
-                            {
-                                switch (batchItem.Command)
-                                {
-                                    case PersistCommand.Null:
-                                        break;
-
-                                    case PersistCommand.GetPlayer:
-                                        playerWorkItem = batchItem as PlayerWorkItem;
-                                        if (playerWorkItem is not null && playerWorkItem.Player is not null)
-                                        {
-                                            GetOnePlayer(playerWorkItem.Player, playerWorkItem.Arena);
-                                        }
-                                        break;
-
-                                    case PersistCommand.PutPlayer:
-                                        playerWorkItem = batchItem as PlayerWorkItem;
-                                        if (playerWorkItem is not null && playerWorkItem.Player is not null)
-                                        {
-                                            PutOnePlayer(playerWorkItem.Player, playerWorkItem.Arena);
-                                        }
-                                        break;
-
-                                    case PersistCommand.GetArena:
-                                        arenaWorkItem = batchItem as ArenaWorkItem;
-                                        if (arenaWorkItem is not null)
-                                        {
-                                            GetOneArena(arenaWorkItem.Arena);
-                                        }
-                                        break;
-
-                                    case PersistCommand.PutArena:
-                                        arenaWorkItem = batchItem as ArenaWorkItem;
-                                        if (arenaWorkItem is not null)
-                                        {
-                                            PutOneArena(arenaWorkItem.Arena);
-                                        }
-                                        break;
-
-                                    case PersistCommand.PutAll:
-                                        DoPutAll();
-                                        nextSync = DateTime.UtcNow + _syncTimeSpan;
-                                        break;
-
-                                    case PersistCommand.EndInterval:
-                                        if (batchItem is IntervalWorkItem intervalWorkItem && intervalWorkItem.ArenaGroup is not null)
-                                        {
-                                            DoEndInterval(intervalWorkItem.Interval, intervalWorkItem.ArenaGroup);
-                                        }
-                                        break;
-
-                                    case PersistCommand.ResetGameInterval:
-                                        if (batchItem is ResetGameIntervalWorkItem resetIntervalWorkItem && resetIntervalWorkItem.Arena is not null)
-                                        {
-                                            DoResetGameInterval(resetIntervalWorkItem.Arena);
-                                        }
-                                        break;
-
-                                    //case PersistCommand.GetGeneric:
-                                    //    break;
-
-                                    //case PersistCommand.PutGeneric:
-                                    //    break;
-
-                                    default:
-                                        break;
-                                }
-                            }
-                            catch (Exception ex)
-                            {
-                                _logManager.LogM(LogLevel.Error, nameof(Persist), $"Caught an exception processing a {batchItem.Command} work item. {ex}");
-                            }
+                            ProcessWorkItem(batchItem);
                         }
                     }
                     finally
                     {
                         if (startedTransaction)
                         {
-                            // Timed separately from the rest of the work item, because a commit is where
-                            // the durability settings show up and those are configuration rather than code.
+                            // Timed separately from the rest of the work, because a commit is where the
+                            // durability settings show up and those are configuration rather than code.
                             long commitStart = measuring ? Stopwatch.GetTimestamp() : 0;
 
                             _persistDatastore.CommitTransaction();
@@ -584,8 +554,13 @@ namespace SS.Core.Modules
                     metrics.Add(ServerMetric.PersistWorkItemsProcessed, batch.Count);
                 }
 
-                // Callbacks only after the commit, so that whatever they let happen next is happening
-                // against data that is already durable. In batch order, which is queue order.
+                DispatchCallbacks();
+            }
+
+            // Hands each work item's callback back to the mainloop. Only ever after a commit, so that
+            // whatever a callback allows to happen next happens against data that is already durable.
+            void DispatchCallbacks()
+            {
                 foreach (PersistWorkItem batchItem in batch)
                 {
                     if (!_mainloop.QueueMainWorkItem(_mainloopWorkItem_ExecuteCallbacksAndDispose, batchItem)
@@ -597,6 +572,176 @@ namespace SS.Core.Modules
                         MainloopWorkItem_ExecuteCallbacksAndDispose(batchItem);
                     }
                 }
+            }
+
+            // Does one work item. Assumes a transaction is already open.
+            void ProcessWorkItem(PersistWorkItem batchItem)
+            {
+                // Nothing here used to be guarded, so anything that threw took the whole persist thread
+                // with it and left every player after that waiting forever on a sync that would never
+                // call back. The datastore swallows its own errors, but the modules that serialize their
+                // data are called from here and are not obliged to. One record failing costs that record.
+                try
+                {
+                    switch (batchItem.Command)
+                    {
+                        case PersistCommand.Null:
+                            break;
+
+                        case PersistCommand.GetPlayer:
+                            if (batchItem is PlayerWorkItem getPlayerWorkItem && getPlayerWorkItem.Player is not null)
+                            {
+                                GetOnePlayer(getPlayerWorkItem.Player, getPlayerWorkItem.Arena);
+                            }
+                            break;
+
+                        case PersistCommand.PutPlayer:
+                            if (batchItem is PlayerWorkItem putPlayerWorkItem && putPlayerWorkItem.Player is not null)
+                            {
+                                PutOnePlayer(putPlayerWorkItem.Player, putPlayerWorkItem.Arena);
+                            }
+                            break;
+
+                        case PersistCommand.GetArena:
+                            if (batchItem is ArenaWorkItem getArenaWorkItem)
+                            {
+                                GetOneArena(getArenaWorkItem.Arena);
+                            }
+                            break;
+
+                        case PersistCommand.PutArena:
+                            if (batchItem is ArenaWorkItem putArenaWorkItem)
+                            {
+                                PutOneArena(putArenaWorkItem.Arena);
+                            }
+                            break;
+
+                        case PersistCommand.PutAll:
+                            // Not interleaved. This is what a caller asking for everything to be saved
+                            // gets, including the mainloop on its way out, and it waits on the callback,
+                            // so the whole sweep belongs in one transaction that is done when it says.
+                            DoPutAll(interleave: false);
+                            nextSync = DateTime.UtcNow + _syncTimeSpan;
+                            break;
+
+                        case PersistCommand.EndInterval:
+                            if (batchItem is IntervalWorkItem intervalWorkItem && intervalWorkItem.ArenaGroup is not null)
+                            {
+                                DoEndInterval(intervalWorkItem.Interval, intervalWorkItem.ArenaGroup);
+                            }
+                            break;
+
+                        case PersistCommand.ResetGameInterval:
+                            if (batchItem is ResetGameIntervalWorkItem resetIntervalWorkItem && resetIntervalWorkItem.Arena is not null)
+                            {
+                                DoResetGameInterval(resetIntervalWorkItem.Arena);
+                            }
+                            break;
+
+                        //case PersistCommand.GetGeneric:
+                        //    break;
+
+                        //case PersistCommand.PutGeneric:
+                        //    break;
+
+                        default:
+                            break;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logManager.LogM(LogLevel.Error, nameof(Persist), $"Caught an exception processing a {batchItem.Command} work item. {ex}");
+                }
+            }
+
+            void BeginSyncTransaction()
+            {
+                syncTransactionOpen = _persistDatastore.BeginTransaction();
+            }
+
+            void CommitSyncTransaction()
+            {
+                if (!syncTransactionOpen)
+                    return;
+
+                long commitStart = Stopwatch.GetTimestamp();
+
+                _persistDatastore.CommitTransaction();
+
+                _serverMetrics?.Add(ServerMetric.PersistCommitElapsedTicks, Stopwatch.GetTimestamp() - commitStart);
+                _serverMetrics?.Increment(ServerMetric.PersistTransactions);
+
+                syncTransactionOpen = false;
+            }
+
+            // Whether a command can be run part way through a sync.
+            static bool IsInterleavable(PersistCommand command)
+            {
+                return command is PersistCommand.Null
+                    or PersistCommand.GetPlayer
+                    or PersistCommand.PutPlayer
+                    or PersistCommand.GetArena
+                    or PersistCommand.PutArena;
+            }
+
+            // Called between chunks of a sync. Closes the chunk, lets whatever is waiting through, and
+            // opens the next one. The registration semaphore is already held by the sync, and is not
+            // reentrant, so this must not try to take it again.
+            void YieldDuringSync()
+            {
+                if (_workQueue.Count <= 0)
+                    return;
+
+                CommitSyncTransaction();
+
+                batch.Clear();
+
+                while (batch.Count < MaxWorkItemBatch && _workQueue.TryTake(out PersistWorkItem? queuedWorkItem))
+                {
+                    if (IsInterleavable(queuedWorkItem.Command))
+                    {
+                        batch.Add(queuedWorkItem);
+                    }
+                    else
+                    {
+                        // Ending an interval, or saving everything, is not something to run half way
+                        // through a sync, and there is no putting it back. It waits until the sync is
+                        // finished, which is what would have happened without any of this.
+                        deferred.Add(queuedWorkItem);
+                        break;
+                    }
+                }
+
+                if (batch.Count > 0)
+                {
+                    bool startedTransaction = _persistDatastore.BeginTransaction();
+
+                    try
+                    {
+                        foreach (PersistWorkItem batchItem in batch)
+                        {
+                            ProcessWorkItem(batchItem);
+                        }
+                    }
+                    finally
+                    {
+                        if (startedTransaction)
+                        {
+                            long commitStart = Stopwatch.GetTimestamp();
+
+                            _persistDatastore.CommitTransaction();
+
+                            _serverMetrics?.Add(ServerMetric.PersistCommitElapsedTicks, Stopwatch.GetTimestamp() - commitStart);
+                            _serverMetrics?.Increment(ServerMetric.PersistTransactions);
+                        }
+                    }
+
+                    _serverMetrics?.Add(ServerMetric.PersistWorkItemsProcessed, batch.Count);
+
+                    DispatchCallbacks();
+                }
+
+                BeginSyncTransaction();
             }
 
             void DoResetGameInterval(Arena arena)
@@ -774,7 +919,13 @@ namespace SS.Core.Modules
                 _persistDatastore.CreateArenaGroupIntervalAndMakeCurrent(arenaGroup, interval);
             }
 
-            void DoPutAll()
+            // Writes everything currently in memory to the database.
+            //
+            // With interleave, the sweep is broken into chunks with a commit between them and whatever is
+            // waiting let through in the gap. At ten thousand players one sweep took over five seconds,
+            // and entering an arena waits on this thread, so without that every player arriving during a
+            // sync waits for the whole of it.
+            void DoPutAll(bool interleave)
             {
                 // The following logic uses temporary, pooled collections of players and arenas since
                 // we don't want to hold onto the player data lock or arena lock while doing the actual processing.
@@ -809,12 +960,20 @@ namespace SS.Core.Modules
                     }
 
                     // Process the players.
+                    int sinceYield = 0;
+
                     foreach (Player player in players)
                     {
                         PutOnePlayer(player, null); // global player data
                         if (player.Arena is not null)
                         {
                             PutOnePlayer(player, player.Arena); // per-arena player data
+                        }
+
+                        if (interleave && ++sinceYield >= SyncPlayersPerChunk)
+                        {
+                            sinceYield = 0;
+                            YieldDuringSync();
                         }
                     }
 
@@ -1105,6 +1264,11 @@ namespace SS.Core.Modules
         {
             protected PersistCommand _command;
             public abstract PersistCommand Command { get; set; }
+
+            /// <summary>
+            /// When the item was queued, for measuring how long it then waited.
+            /// </summary>
+            public long QueuedTimestamp { get; set; }
 
             public virtual void ExecuteCallback()
             {

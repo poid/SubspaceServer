@@ -122,6 +122,18 @@ namespace SS.Core.ComponentInterfaces
 
         /// <summary>Counter. Players written by a full sync.</summary>
         PersistPlayersSynced,
+
+        /// <summary>
+        /// Counter. Stopwatch ticks that work items spent waiting in the persist queue.
+        /// Divide by <see cref="PersistWorkItemsProcessed"/> for the mean wait.
+        /// <para>
+        /// The measure of the harm, where queue depth is only a proxy for it. Entering an arena waits on
+        /// its work item, so this is how long a player stood still. Depth read as a gauge cannot show it:
+        /// a backlog that builds behind a long sync and drains before the window ends leaves the gauge
+        /// reading zero, having sampled only the quiet moment at the end.
+        /// </para>
+        /// </summary>
+        PersistWaitElapsedTicks,
     }
 
     /// <summary>

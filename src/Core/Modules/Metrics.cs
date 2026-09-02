@@ -455,7 +455,7 @@ namespace SS.Core.Modules
                 // entering an arena, so a depth that keeps growing is players waiting to get in.
                 long persistWorkItems = Read(ServerMetric.PersistWorkItemsProcessed);
                 long persistTransactions = Read(ServerMetric.PersistTransactions);
-                sb.Append($"  persist: {persistWorkItems / seconds:F0} item/s, {MeanMilliseconds(Read(ServerMetric.PersistWorkItemElapsedTicks), persistWorkItems):F2}ms/item, {Read(ServerMetric.PersistQueueDepth)} queued, {persistTransactions / seconds:F0} txn/s, {MeanMilliseconds(Read(ServerMetric.PersistCommitElapsedTicks), persistTransactions):F2}ms/commit, {Read(ServerMetric.PersistPlayersSynced)} synced");
+                sb.Append($"  persist: {persistWorkItems / seconds:F0} item/s, {MeanMilliseconds(Read(ServerMetric.PersistWorkItemElapsedTicks), persistWorkItems):F2}ms/item, {MeanMilliseconds(Read(ServerMetric.PersistWaitElapsedTicks), persistWorkItems):F1}ms waited, {Read(ServerMetric.PersistQueueDepth)} queued, {persistTransactions / seconds:F0} txn/s, {MeanMilliseconds(Read(ServerMetric.PersistCommitElapsedTicks), persistTransactions):F2}ms/commit, {Read(ServerMetric.PersistPlayersSynced)} synced");
                 Emit(sb, player);
 
                 // Sustained allocation here means the object pools have stopped keeping up, since the
