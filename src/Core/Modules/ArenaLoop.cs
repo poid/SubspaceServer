@@ -119,14 +119,19 @@ namespace SS.Core.Modules
             if (workerCount <= 0)
             {
                 // Deliberately a small fraction of the machine, because more workers is not better here
-                // and measurably worse past a point. The work they do reads player state under a lock
-                // shared with the mainloop and the send threads, so every extra worker adds contention on
-                // it rather than capacity.
+                // and measurably worse past a point. Spreading the same work over more of them costs
+                // more processor time to do it, and the cost is not small: measured at four thousand
+                // players over forty arenas with the work per packet held identical -- same candidates
+                // scanned, same recipients, same sends -- one worker used 76% of a core, two used 92%
+                // between them, and four used 120%. Repeated on a second set of runs: 75%, 91%, 119%.
                 //
-                // Measured at two thousand players over twenty arenas: two workers cost 1.94 cores in
-                // total and left the mainloop at 10%, four cost 2.56, and sixteen cost 4.84 and pushed
-                // the mainloop back up to 30% through that contention. Sixteen threads each doing a
-                // sixteenth of the work still each pay the per pass overhead.
+                // Why is not known. It is not the player lock these threads share with the mainloop and
+                // the send threads, which was the original explanation here: the read acquisitions were
+                // later reduced by about ninety-six percent and the penalty did not move. It is also not
+                // the per recipient statistics, the send path, uneven loading across the workers, or the
+                // performance and efficiency cores of a hybrid processor. Until it is understood, the
+                // safe reading is that a worker earns its place only when there is enough work to keep
+                // it busy, so start few and raise it only if ?metrics shows the workers are the limit.
                 workerCount = Math.Clamp(Environment.ProcessorCount / 8, 2, 8);
             }
 
