@@ -95,6 +95,12 @@ wait_for_listening() {
 # Deliberately not the last window, nor the one before it. When a few thousand clients disconnect at
 # once the tail of the log is shutdown rather than steady state, and reading it once turned a clear
 # improvement into an apparent regression. The third from last is safely inside the hold.
+#
+# The leading windows are dropped as well, and for the mirror image of that reason: clients arrive
+# over the first part of the run and the load is not yet what was asked for. On a long run the two
+# rules never meet, but on a short one they do -- a thirty second hold produces three windows, so
+# "third from last" is the first of them, which is the one where half the clients had not yet reached
+# an arena. That read as the server broadcasting half its offered load.
 extract_window() {
     python3 - "$SERVER_LOG" "$LABEL" <<'PY'
 import sys, re
@@ -103,7 +109,24 @@ blocks = re.split(r"I <Metrics> metrics over ", open(log, errors="replace").read
 if not blocks:
     print(f"{label}\tNO DATA (is Metrics:ReportInterval set, and the Metrics module loaded?)")
     sys.exit()
-block = blocks[-3] if len(blocks) >= 3 else blocks[0]
+
+def position_rate(text):
+    match = re.search(r"position: ([\d.]+) pkt/s", text)
+    return float(match.group(1)) if match else 0.0
+
+# Only leading windows are dropped. A run that peaks and then degrades keeps its degraded windows,
+# because that is a result rather than a ramp.
+rates = [position_rate(b) for b in blocks]
+peak = max(rates)
+first = 0
+while first < len(blocks) - 1 and rates[first] < peak * 0.9:
+    first += 1
+settled = blocks[first:]
+
+if len(settled) < 3:
+    print(f"WARNING: only {len(settled)} settled window(s) after {first} of ramp. Hold for longer.", file=sys.stderr)
+
+block = settled[-3] if len(settled) >= 3 else settled[-1]
 
 def field(pattern, default="-"):
     match = re.search(pattern, block)
@@ -177,6 +200,33 @@ ASSERTIONS="$(grep -c 'Assertion failed' "$SERVER_LOG")"
 ERRORS="$(grep -c '^E <' "$SERVER_LOG")"
 echo
 echo "Assertion failures: $ASSERTIONS    Errors logged: $ERRORS"
+
+# The number this script reports is what the server broadcast, not what the clients offered, and the
+# two can differ by a lot without anything failing visibly. The known way is lag: a player specced for
+# ping is still connected and still sending, but "spectators don't get their position sent to anyone"
+# (Game.HandlePositionPacket), so they contribute nothing to the measurement. A run that specced half
+# its clients reports half the throughput and looks perfectly stable doing it.
+#
+# This is not hypothetical. Two runs of the same configuration differed twofold for exactly this
+# reason, and the difference was read as a threading defect for some time before anyone counted the
+# specced players. So report the ratio every time, whatever the cause: a run that broadcast markedly
+# less than it was offered is not comparable with one that broadcast all of it.
+SPECCED="$(grep -c 'specced for' "$SERVER_LOG")"
+OFFERED="$(grep -oE 'These clients sent [0-9]+' "$CLIENT_LOG" | grep -oE '[0-9]+$' | tail -1)"
+MEASURED="$(tail -1 "$RESULTS" | cut -f2 | cut -d. -f1)"
+
+echo "Specced for lag:    $SPECCED of $CLIENTS"
+
+if [[ "$OFFERED" =~ ^[0-9]+$ ]] && [[ "$MEASURED" =~ ^[0-9]+$ ]] && [ "$OFFERED" -gt 0 ]; then
+    PERCENT=$((MEASURED * 100 / OFFERED))
+    echo "Offered vs measured: $OFFERED pkt/s offered, $MEASURED broadcast (${PERCENT}%)"
+    if [ "$PERCENT" -lt 90 ]; then
+        echo "WARNING: the server broadcast only ${PERCENT}% of the load the clients offered, so this run"
+        echo "         measured less than it asked for and is NOT comparable with one that did not."
+        echo "         Check the specced count above first - it is the usual cause, and it usually means"
+        echo "         the load generator could not keep up rather than that the server is slow."
+    fi
+fi
 echo "Logs: $SERVER_LOG"
 echo "      $CLIENT_LOG"
 echo "Results: $RESULTS"
