@@ -531,13 +531,78 @@ inflating the result, so it was reverted and re-run alone: 34,407 packets a seco
 33,079 with it, which is the wrong way round and inside the run to run spread. It was worth nothing
 and was dropped. All of the improvement is the skip.
 
+## The arena workers do not scale backwards. This machine does.
+
+The per worker efficiency loss survived removing the lock traffic, so it was measured properly. The
+unit is scans per arena-core-second — players examined by the fan-out, divided by the processor time
+the arena workers used — which normalises for how many recipients each packet has and for how hard
+the workers are being driven.
+
+| run | players | arenas | workers | busy | scans per core-second |
+|---|---|---|---|---|---|
+| half-w2 | 2,000 | 20 | 2 | 56% | 1.787M |
+| lk-w2 | 4,000 | 40 | 2 | 99% | 1.671M |
+| sat-w2 | 4,000 | 20 | 2 | 102% | 1.622M |
+| lk-w4 | 4,000 | 40 | 4 | 78% | 1.278M |
+| sat-w4 | 4,000 | 20 | 4 | 77% | 1.296M |
+
+Efficiency depends on the number of workers and on nothing else in that table. Two workers give about
+1.65M whether they are 56% busy or 102% busy and whether the players sit in twenty arenas or forty;
+four give about 1.29M under the same variations. At identical work per packet, doubling the workers
+raised throughput from 16,541 packets a second to 20,078 — 1.21 times for twice the threads.
+
+Three candidate causes were tested and all three were wrong.
+
+**Not the per recipient atomics.** Removing both the `SendToOne` counter and the bandwidth priority
+statistic — the two shared fields each recipient touches — moved the two-to-four loss from 23.5% to
+23.4% and absolute efficiency by under 2%.
+
+**Not the send path at all.** Spreading the players across the whole map cut recipients per packet
+from 89 to 20 while leaving the scan untouched. If anything done once per recipient were responsible,
+the loss would have fallen with it. It did not move: 23.5% at 89 recipients, 23.4% at 20.
+
+**Not thin loading of each worker.** The idea that a worker handling fewer items pays more per item in
+wakeups predicts that equal items per worker should cost the same. It does not: at 10,000 items a
+second per worker either way, two workers managed 1.787M scans per core-second and four managed
+1.278M, 28% apart.
+
+What is left is thread count itself, and the progression starts at the first thread added, with the
+same total work throughout:
+
+| workers | scans per core-second | against one worker |
+|---|---|---|
+| 1 | 5.263M | |
+| 2 | 4.353M | -17.3% |
+| 4 | 3.333M | -36.7% |
+
+**This machine is an i9-13900K**, which does not have equal cores: eight performance cores with two
+threads each, and sixteen efficiency cores. A penalty that appears with the first extra thread, is
+the same proportion whatever the code is doing, and is the same whether the workers are idle or
+saturated, is what running on a slower core looks like. It is not what contention looks like —
+contention scales with the number of operations on the contended thing, and cutting those by four and
+a half changed nothing.
+
+This has to be stated as strongly supported rather than proven, because WSL2 virtualises the topology
+as a flat sixteen cores of two threads and hides which physical core anything ran on. Confirming it
+needs either processor pinning or a homogeneous server processor.
+
+**What this means for everything measured here.** `ArenaLoop:Workers` was tuned on this box and the
+tuning found four best, with eight clearly worse. That number is this processor's, not the server's. A
+deployment on a homogeneous machine should re-run the two, four and eight worker comparison before
+trusting it, and would plausibly find that more workers keep helping for longer. The same caution
+applies to the send thread count, which is chosen the same way.
+
 ## What to watch next
 
-- **Why the arena workers scale backwards**, still unexplained after removing the lock traffic. Three
-  things in the fan-out touch a process-wide field once per recipient: the `SendToOne` metric counter,
-  which the metrics interface's own rules say should be tallied locally at this rate; the bandwidth
-  priority statistic, where every position packet lands on the same array slot; and the two object
-  pools the buffers come from. Those are the remaining suspects.
+- **Re-tuning the worker and send thread counts on a homogeneous processor.** Both defaults were
+  chosen from measurements on a machine whose cores are not equal, and the per worker efficiency loss
+  those measurements found is very likely the processor rather than the server. Until that is
+  repeated somewhere with uniform cores, treat both defaults as this desktop's answer.
+- **The `SendToOne` metric counter**, which is an ungated interlocked increment per recipient,
+  around four million a second, against the metrics interface's own documented rule that a loop at
+  that rate must tally locally and report once. It measured as costing about two percent here, which
+  is not why the workers scale as they do, but it is still the wrong shape and
+  `PositionRecipientsInView` already reports nearly the same quantity properly.
 - **The periodic persist sync**, 5.2 seconds at ten thousand players with 2.3 of it in the commit.
   Chunking it stops it blocking logins for the whole sweep, but the cost itself scales with how much
   data is written, and only dirty records need writing.
