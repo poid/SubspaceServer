@@ -531,7 +531,7 @@ inflating the result, so it was reverted and re-run alone: 34,407 packets a seco
 33,079 with it, which is the wrong way round and inside the run to run spread. It was worth nothing
 and was dropped. All of the improvement is the skip.
 
-## The arena workers do not scale backwards. This machine does.
+## The arena workers scale backwards, and the processor is not the reason
 
 The per worker efficiency loss survived removing the lock traffic, so it was measured properly. The
 unit is scans per arena-core-second — players examined by the fan-out, divided by the processor time
@@ -576,28 +576,58 @@ same total work throughout:
 | 4 | 3.333M | -36.7% |
 
 **This machine is an i9-13900K**, which does not have equal cores: eight performance cores with two
-threads each, and sixteen efficiency cores. A penalty that appears with the first extra thread, is
-the same proportion whatever the code is doing, and is the same whether the workers are idle or
-saturated, is what running on a slower core looks like. It is not what contention looks like —
-contention scales with the number of operations on the contended thing, and cutting those by four and
-a half changed nothing.
+threads each, and sixteen efficiency cores. That looked like the answer, and it was written up here as
+such. It is wrong, and the correction is worth more than the original claim.
 
-This has to be stated as strongly supported rather than proven, because WSL2 virtualises the topology
-as a flat sixteen cores of two threads and hides which physical core anything ran on. Confirming it
-needs either processor pinning or a homogeneous server processor.
+Measured natively on Windows, where processor affinity is real and logical processor numbers map to
+the hardware — inside WSL2 they do not, and every subset of vCPUs there benchmarks within 3% of every
+other, which is what hid this. A fixed loop pinned to one processor at a time:
 
-**What this means for everything measured here.** `ArenaLoop:Workers` was tuned on this box and the
-tuning found four best, with eight clearly worse. That number is this processor's, not the server's. A
-deployment on a homogeneous machine should re-run the two, four and eight worker comparison before
-trusting it, and would plausibly find that more workers keep helping for longer. The same caution
-applies to the send thread count, which is chosen the same way.
+| processors | time | |
+|---|---|---|
+| 0, 1, 2, 8, 14, 15 | 2,850-3,021 ms | performance cores |
+| 16, 17, 20, 24, 30, 31 | 7,083-7,635 ms | efficiency cores, 2.5x slower |
+
+So the machine is heterogeneous, comfortably enough to explain a 20-30% penalty. But pinning the
+server to eight distinct performance cores and the load client to the efficiency cores — which also
+removes the load generator from competing with the server, a confound in every earlier number here —
+the penalty survives. At the same delivered throughput, four thousand players over twenty arenas:
+
+| configuration | cores per 1,000 packets |
+|---|---|
+| 1 worker, 8 performance cores | 0.249 |
+| 2 workers, 8 performance cores | 0.276, 0.285 |
+| 2 workers, 16 performance cores | 0.282, 0.313 |
+
+Eleven to twenty six percent more processor time for exactly the same work, with every core identical
+and nothing else running on them. Whatever this is, it is not the cores being unequal.
+
+Treat that as preliminary rather than settled. The Windows runs did not reach a steady state inside
+two minutes: throughput ramps, peaks, then falls to a floor near twenty thousand packets a second in
+every configuration, so the window the harness picks lands in a different phase depending on the run.
+Read at their peaks instead of at the floor, two workers beat one. The comparison above is taken at
+the floor, where all configurations deliver the same amount and only the cost differs, which is the
+one place they are comparable — but it rests on a single window for the one worker case.
+
+**What this means for everything measured here.** `ArenaLoop:Workers` was tuned on this box and found
+four best with eight clearly worse. That number should still be re-measured on the machine the server
+will actually run on, but the reason is no longer that this processor is unusual. It is that the
+number is a property of the machine and the load, and nobody has yet explained why more workers cost
+more.
 
 ## What to watch next
 
-- **Re-tuning the worker and send thread counts on a homogeneous processor.** Both defaults were
-  chosen from measurements on a machine whose cores are not equal, and the per worker efficiency loss
-  those measurements found is very likely the processor rather than the server. Until that is
-  repeated somewhere with uniform cores, treat both defaults as this desktop's answer.
+- **Why more arena workers cost more processor time for the same work**, still open. Not the per
+  recipient atomics, not the send path, not thin loading, and not unequal cores - the penalty survives
+  on eight identical performance cores with the load generator pinned away from the server. What is
+  left to look at is the queueing between the mainloop and the workers, and the pooled objects that
+  cross that boundary.
+- **A load test that reaches a steady state at high fan-out.** The Windows runs above ramp, peak and
+  then fall to a common floor rather than settling, which makes any single window unsafe to compare.
+  Longer runs, or a load the client can sustain, before trusting any more scaling numbers.
+- **Re-measuring `ArenaLoop:Workers` and the send thread count on the machine the server will run
+  on.** Both are properties of the hardware and the load, not of the code, and the value found here
+  should not be assumed to travel.
 - **The `SendToOne` metric counter**, which is an ungated interlocked increment per recipient,
   around four million a second, against the metrics interface's own documented rule that a loop at
   that rate must tally locally and report once. It measured as costing about two percent here, which
