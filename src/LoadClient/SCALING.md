@@ -533,6 +533,12 @@ and was dropped. All of the improvement is the skip.
 
 ## The arena workers scale backwards, and the processor is not the reason
 
+> **Read [Load that went missing](#load-that-went-missing) before trusting this section.** Every two
+> worker run in the table below carried measurably less load than the four worker run it is compared
+> with, for a reason nothing in the output mentioned. The finding is not disproved, but it is no
+> longer supported by these numbers, and the section is kept for the reasoning and for the three
+> causes it did rule out.
+
 The per worker efficiency loss survived removing the lock traffic, so it was measured properly. The
 unit is scans per arena-core-second — players examined by the fan-out, divided by the processor time
 the arena workers used — which normalises for how many recipients each packet has and for how hard
@@ -615,13 +621,100 @@ will actually run on, but the reason is no longer that this processor is unusual
 number is a property of the machine and the load, and nobody has yet explained why more workers cost
 more.
 
+## Load that went missing
+
+Two runs of the same configuration — four thousand clients, forty arenas, two arena workers, nothing
+different between them — settled at 18,554 packets a second and 37,677. Both perfectly steady for the
+whole run. That looks like a threading defect, because half throughput is what one of two workers
+doing nothing looks like.
+
+It was not. Per worker counters showed both workers retiring identical numbers of items with their
+queues nearly empty, so nothing was stalled and nothing was backing up. Only half as much work was
+ever queued. The reason was in the log the whole time, in a category nobody was reading:
+
+```
+I <LagAction> {7} [Load3767] specced for: ping
+I <Game>      {7} [Load3767] Changed ship/freq to ship Spec, freq 8025.
+```
+
+LagAction had specced 2,144 of the 4,000 clients for high ping, and `Game.HandlePositionPacket` says
+plainly what that costs:
+
+```csharp
+// spectators don't get their position sent to anyone
+if (player.Ship != ShipType.Spec)
+```
+
+A specced player is still connected and still sending ten position packets a second. Every one of
+them is received, checksummed, lag-collected and dispatched — and then produces no broadcast at all.
+The metric that this document calls throughput counts broadcasts.
+
+That is visible in the numbers once you know to look. `mainloop work` sat at 40,000 a second in every
+run, degraded or not, because every packet really did arrive. Only `arena work` moved:
+
+| run | workers | specced | mainloop work | arena work / pkt/s |
+|---|---|---|---|---|
+| f1 | 1 | 0 | 40,012 | 39,993 |
+| d1 | 2 | 0 | 40,054 | 40,005 |
+| d3 | 2 | 171 | 40,132 | 38,285 |
+| f2r | 2 | 231 | 40,027 | 37,677 |
+| d2 | 2 | 2,009 | 40,161 | 19,924 |
+| f2 | 2 | 2,144 | 40,053 | 18,554 |
+
+`(4000 − specced) × 10` predicts the measured rate on every one of those rows to within a tenth of a
+percent. There is nothing left to explain.
+
+### What it does to the rest of this document
+
+The specced count was never equal between the two sides of a comparison, and it ran consistently
+against the two worker runs:
+
+| pair | 2 workers | 4 workers |
+|---|---|---|
+| first worker sweep | 538 specced | 337 specced |
+| after the lock skip | 1,259 specced | 233 specced |
+| the A/B repeat | 1,058 specced | 127 specced |
+
+So each of those pairs compared a lighter load against a heavier one and read the difference as
+scaling. The throughput comparison the worker count was tuned on does not survive that.
+
+The efficiency table in the section above is hurt less, because scans per core-second divides work by
+the processor time spent on it and both fall together — but it is not clean either. The two worker
+runs were saturated at 99–102% and the four worker runs were not, at 77–78%, and that split lines up
+exactly with the spec contamination. Comparing a thread that is pinned against one that is waiting is
+a different measurement from comparing two thread counts.
+
+### And a second leak, still unexplained
+
+The saturated pair had **zero** clients specced and still broadcast far less than was offered: 40,374
+mainloop work items a second against 16,541 broadcasts at two workers, and 39,808 against 20,078 at
+four. Packets arrived, were dispatched, and produced nothing, with no spec involved and only about
+thirty malicious-packet lines in the entire log.
+
+The remaining ways out of `HandlePositionPacket` are a bad checksum, a post-death `(-1, -1)`, and a
+timestamp that is not newer than the last one recorded. The third is the plausible one: the load
+generator shares the machine, these are the runs where it works hardest, and a client whose send loop
+bursts can put two packets in the same ten millisecond tick, the second of which the server correctly
+discards. That is a guess, and it is the next thing to measure rather than something to build on.
+
+### What the harness does now
+
+It reports the specced count and the ratio of broadcast to offered on every run, and warns when the
+second falls below ninety percent — whatever the cause, spec or otherwise. It already reported
+assertion failures and error counts, and this belongs beside them for the same reason: a run that
+quietly measures three quarters of the load it asked for produces a number that looks entirely
+plausible and means nothing.
+
 ## What to watch next
 
-- **Why more arena workers cost more processor time for the same work**, still open. Not the per
-  recipient atomics, not the send path, not thin loading, and not unequal cores - the penalty survives
-  on eight identical performance cores with the load generator pinned away from the server. What is
-  left to look at is the queueing between the mainloop and the workers, and the pooled objects that
-  cross that boundary.
+- **Whether more arena workers cost more processor time for the same work at all.** Reopened, not
+  merely open: every pair the claim rested on turned out to be comparing unequal loads. Four causes
+  were ruled out along the way and stay ruled out — the per recipient atomics, the send path, thin
+  worker loading, and unequal cores — but the effect itself now has to be re-established on runs where
+  the harness confirms both sides broadcast what they were offered.
+- **Where the load goes in the saturated runs**, where nothing is specced and half the offered packets
+  still produce no broadcast. A counter on each early return in `HandlePositionPacket` would say in
+  one run which of the three it is, and the timestamp check is the one to expect.
 - **A load test that reaches a steady state at high fan-out.** The Windows runs above ramp, peak and
   then fall to a common floor rather than settling, which makes any single window unsafe to compare.
   Longer runs, or a load the client can sustain, before trusting any more scaling numbers.
