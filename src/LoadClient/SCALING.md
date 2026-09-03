@@ -533,11 +533,12 @@ and was dropped. All of the improvement is the skip.
 
 ## The arena workers scale backwards, and the processor is not the reason
 
-> **Read [Load that went missing](#load-that-went-missing) before trusting this section.** Every two
-> worker run in the table below carried measurably less load than the four worker run it is compared
-> with, for a reason nothing in the output mentioned. The finding is not disproved, but it is no
-> longer supported by these numbers, and the section is kept for the reasoning and for the three
-> causes it did rule out.
+> **The numbers in this section are contaminated; the conclusion is not.** Every two worker run in
+> the table below carried measurably less load than the four worker run it is compared with, for a
+> reason nothing in the output mentioned — see [Load that went missing](#load-that-went-missing). The
+> effect was afterwards re-established on runs verified clean, and reproduced twice: see
+> [The same work, more processor time](#the-same-work-more-processor-time). This section is kept for
+> the reasoning and for the causes it ruled out, which stand.
 
 The per worker efficiency loss survived removing the lock traffic, so it was measured properly. The
 unit is scans per arena-core-second — players examined by the fan-out, divided by the processor time
@@ -705,13 +706,67 @@ assertion failures and error counts, and this belongs beside them for the same r
 quietly measures three quarters of the load it asked for produces a number that looks entirely
 plausible and means nothing.
 
+## The same work, more processor time
+
+The load that went missing invalidated the runs the worker scaling claim rested on, so it had to be
+established again on runs the harness could vouch for. The configuration to do it with was already in
+the document: the players spread across the whole map, which cuts recipients per packet to about
+twenty and leaves the candidate scan as the bulk of what a worker does. Three runs, one variable.
+
+| workers | offered → broadcast | specced | scanned/pkt | in-view | read locks/s | arena worker cores |
+|---|---|---|---|---|---|---|
+| 1 | 40,000 → 39,997 | 158 | 100.0 | 19.9 | 161,321 | **76%** |
+| 2 | 39,998 → 40,046 | 176 | 100.0 | 19.9 | 161,541 | **92%** |
+| 4 | 40,001 → 39,996 | 172 | 100.0 | 19.9 | 161,399 | **120%** |
+
+Every run broadcast everything it was offered, so all three carried the same load. The work per
+packet is identical to a tenth of a recipient, the total is identical to a tenth of a percent, and the
+player lock rate — the thing this used to be blamed on — is identical to a fifth of a percent. The
+only thing that differs is how many threads it was spread over, and four of them need **1.59 times**
+the processor time that one does to do it.
+
+Repeated later on a second set of three runs: 75%, 91%, 119%. Within a point at every worker count.
+Whatever this is, it is not noise and it is not the measurement.
+
+### What it is not
+
+Adding to the list, because eliminating a suspect is worth as much as finding one:
+
+**Not the cost of blocking on an empty queue.** A worker takes one item at a time from a
+`BlockingCollection`, and the blocking form is expensive when the queue is empty — it builds a linked
+cancellation source and registers on the one every worker shares. That scales exactly the wrong way:
+four workers each get a quarter of the same work, so each finds its queue empty far more often than
+one worker does. It fits the shape of the problem well enough to be worth trying.
+
+It was wrong. Blocking once and then draining everything already queued, up to a batch of 128, moved
+one worker from 76% to 75%, two from 92% to 91%, and four from 120% to 119%. Nothing, at any worker
+count, so the change was reverted rather than kept for the tidiness of it.
+
+### What is left
+
+The mainloop also gets more expensive across the same three runs — 18%, 22%, 23% — and its work per
+packet does not change at all. It receives the packet, takes a `PositionBroadcast` from a pool, fills
+it in and queues it. So whatever this is, it is paid on both sides of that handoff, which points at
+the handoff itself rather than at anything either side does.
+
+The pooled object is the remaining suspect with that shape. It is rented on the mainloop and returned
+on a worker, so a recycled one is written by one core and then read by another; with four workers it
+comes back from four different cores in turn instead of always the same one. That is a cache line
+travelling further for the same work, which is precisely a cost that grows with the number of
+consumers while the instruction count stays flat.
+
+The test is cheap and decisive: stop pooling it. A freshly allocated object is written by the
+mainloop, read once by a worker and then dies, which is what a generation zero allocation is good at,
+and forty thousand small objects a second is a few megabytes. If the penalty collapses, it was the
+pool.
+
 ## What to watch next
 
-- **Whether more arena workers cost more processor time for the same work at all.** Reopened, not
-  merely open: every pair the claim rested on turned out to be comparing unequal loads. Four causes
-  were ruled out along the way and stay ruled out — the per recipient atomics, the send path, thin
-  worker loading, and unequal cores — but the effect itself now has to be re-established on runs where
-  the harness confirms both sides broadcast what they were offered.
+- **Why more arena workers cost more processor time for the same work.** The effect is established
+  and reproduced on clean runs, at 1.59 times the processor time for four workers against one, and
+  five causes are ruled out: the per recipient atomics, the send path, thin worker loading, unequal
+  cores, and the cost of blocking on an empty queue. The pooled `PositionBroadcast` that crosses from
+  the mainloop to a worker is the next one to test, by not pooling it.
 - **Where the load goes in the saturated runs**, where nothing is specced and half the offered packets
   still produce no broadcast. A counter on each early return in `HandlePositionPacket` would say in
   one run which of the three it is, and the timestamp check is the one to expect.
