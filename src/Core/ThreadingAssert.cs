@@ -117,6 +117,12 @@ namespace SS.Core
         /// <summary>
         /// Asserts that the caller holds the global player lock, in any of its forms.
         /// </summary>
+        /// <remarks>
+        /// Asks the thread-local depth rather than the three lock properties. Those each take the lock's
+        /// own internal spin lock, and this is called from <see cref="Arena.Players"/>, so on a debug
+        /// build it ran three times per position packet and made debug measurements not worth comparing
+        /// with release ones.
+        /// </remarks>
         /// <param name="playerData">The player data service.</param>
         /// <param name="caller">Filled in by the compiler, to name what was missing the lock.</param>
         [Conditional("DEBUG")]
@@ -126,7 +132,7 @@ namespace SS.Core
                 return;
 
             Debug.Assert(
-                playerData.IsReadLockHeld || playerData.IsWriteLockHeld || playerData.IsUpgradeableReadLockHeld,
+                !playerData.HoldsNoPlayerLock,
                 $"{caller} requires the global player lock, and the calling thread does not hold it.");
         }
 
@@ -144,6 +150,38 @@ namespace SS.Core
             Debug.Assert(
                 playerData.IsWriteLockHeld,
                 $"{caller} changes shared player state and requires the global player write lock, and the calling thread does not hold it.");
+        }
+
+        /// <summary>
+        /// Asserts that the calling thread is not still holding a player lock from whatever it did last.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// For the top of a worker's loop. A leaked hold has always been serious -- it stops every writer
+        /// for good -- but it used to be merely a hang. Now that a nested acquisition is skipped when the
+        /// thread already holds one, a leak also means the work that runs next believes it is protected
+        /// when it is not, which is a wrong answer instead of a stall.
+        /// </para>
+        /// <para>
+        /// Unlike the rest of this class this is not compiled out, because the assertions that would
+        /// catch it are, and the measurement runs are release builds. It costs a thread-local read.
+        /// </para>
+        /// </remarks>
+        /// <param name="playerData">The player data service.</param>
+        /// <param name="logManager">Used to report a leak on a release build, where asserting does nothing.</param>
+        /// <param name="what">Names the loop that found it.</param>
+        /// <returns><see langword="true"/> if a lock was leaked.</returns>
+        public static bool WarnIfPlayerLockLeaked(IPlayerData? playerData, ILogManager? logManager, string what)
+        {
+            if (playerData is null || playerData.HoldsNoPlayerLock)
+                return false;
+
+            Debug.Fail($"{what} still held the global player lock from its previous iteration.");
+
+            logManager?.LogM(LogLevel.Error, nameof(ThreadingAssert),
+                $"{what} still held the global player lock from its previous iteration, on '{Thread.CurrentThread.Name ?? "unnamed"}'. This is a bug and player state may have been read unprotected.");
+
+            return true;
         }
 
         /// <summary>

@@ -34,11 +34,31 @@ namespace SS.Core.ComponentInterfaces
         void WriteUnlock();
 
         /// <summary>
+        /// Whether the calling thread holds no player lock at all, in any of its forms.
+        /// </summary>
+        /// <remarks>
+        /// For a worker to check at the top of its loop that whatever it ran last did not leave a lock
+        /// behind. A leaked hold would stop every writer forever, and now that a nested acquisition is
+        /// skipped when the thread already holds one, it would also let later work read player state
+        /// holding nothing.
+        /// <para>
+        /// Unlike <see cref="IsReadLockHeld"/> this is a thread-local field read, so it is cheap enough
+        /// to check on a hot loop.
+        /// </para>
+        /// </remarks>
+        bool HoldsNoPlayerLock { get; }
+
+        /// <summary>
         /// Whether the calling thread holds the global player lock for reading.
         /// </summary>
         /// <remarks>
         /// For asserting that a caller has taken the lock its contract requires. Not for deciding
         /// whether to take it: code that has to ask does not know who owns the data it is touching.
+        /// <para>
+        /// Not usable on a hot path either. It reads the lock's recursion bookkeeping, which takes that
+        /// lock's internal spin lock, so testing with it and skipping costs what the skip would save.
+        /// Use <see cref="HoldsNoPlayerLock"/> where the answer is needed rather than asserted.
+        /// </para>
         /// </remarks>
         bool IsReadLockHeld { get; }
 
