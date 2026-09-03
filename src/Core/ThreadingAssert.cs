@@ -132,7 +132,7 @@ namespace SS.Core
                 return;
 
             Debug.Assert(
-                !playerData.HoldsNoPlayerLock,
+                playerData.IsReadLockHeld || playerData.IsWriteLockHeld || playerData.IsUpgradeableReadLockHeld,
                 $"{caller} requires the global player lock, and the calling thread does not hold it.");
         }
 
