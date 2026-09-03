@@ -728,6 +728,11 @@ the processor time that one does to do it.
 Repeated later on a second set of three runs: 75%, 91%, 119%. Within a point at every worker count.
 Whatever this is, it is not noise and it is not the measurement.
 
+One caveat on the first triple, found afterwards and worth stating: its settled windows varied by up
+to 36%, so a single window out of it was not safe to compare. The repeat runs varied by 2-3% and the
+pinned pair below by 0-3%, and they agree with it — but that is luck rather than method, which is why
+the harness now reports the spread on every run.
+
 ### What it is not
 
 Adding to the list, because eliminating a suspect is worth as much as finding one:
@@ -742,31 +747,60 @@ It was wrong. Blocking once and then draining everything already queued, up to a
 one worker from 76% to 75%, two from 92% to 91%, and four from 120% to 119%. Nothing, at any worker
 count, so the change was reverted rather than kept for the tidiness of it.
 
+**Not the pooled object crossing the handoff.** The mainloop also gets more expensive across the same
+three runs — 18%, 22%, 23% — while its work per packet does not change at all, which points at the
+handoff between them rather than at either side. Two pooled objects cross it per position packet: the
+`PositionBroadcast` and the work item carrying it, both rented on the mainloop and returned on a
+worker. With one worker a recycled object shuttles between two cores; with four it comes back from
+four in turn. That is a cache line travelling further for the same work, and it grows with the number
+of consumers while the instruction count stays flat.
+
+Allocating both instead of pooling them, so that each is written once, read once and dies, left one
+worker at 76% and four at 120% — the pooled figures to the point. It cost 11.8 MB/s of allocation
+against 4.9, and gen0 collections roughly doubled, so the pool is earning its place; it is simply not
+what this is.
+
+**Not the load generator competing for cores.** The generator shares this machine and is the larger
+consumer, so four runnable threads asking a contended scheduler for time is not the same experiment
+as one. Per-thread counters made that look promising: from one worker to four, voluntary parking
+roughly doubled per thread, but *involuntary* switches — the scheduler taking the core away mid-work,
+each one resuming on a cold cache — went from 4-76 per ten seconds to eight and twelve thousand.
+
+Pinning the server to CPUs 16-31 and the generator to 0-15, so neither can preempt the other, made it
+slightly worse rather than better:
+
+| | 1 worker | 4 workers | ratio |
+|---|---|---|---|
+| sharing the machine | 75% | 119% | 1.59 |
+| opposite halves | **74%** | **124%** | **1.68** |
+
+So the preemption is a symptom of the workers running dry, not the cause of the cost. (`taskset`
+inside WSL2 pins to virtual processors the hypervisor still places as it likes, so this is weaker
+evidence than pinning on real hardware would be. It is enough to rule the generator out, because
+removing the competition did not remove the penalty.)
+
 ### What is left
 
-The mainloop also gets more expensive across the same three runs — 18%, 22%, 23% — and its work per
-packet does not change at all. It receives the packet, takes a `PositionBroadcast` from a pool, fills
-it in and queues it. So whatever this is, it is paid on both sides of that handoff, which points at
-the handoff itself rather than at anything either side does.
+Eight causes eliminated, none confirmed. What has not been tried is giving each worker a processor
+nothing else touches — the runs above isolate the server from the generator but leave the workers
+sharing sixteen CPUs with the send threads, the mainloop and the receive thread. That is the last
+environmental explanation: a thread that works in bursts and idles between them resumes on a core
+whose cache something else has since used, and four threads at thirty percent duty do that far more
+often than one at seventy-five.
 
-The pooled object is the remaining suspect with that shape. It is rented on the mainloop and returned
-on a worker, so a recycled one is written by one core and then read by another; with four workers it
-comes back from four different cores in turn instead of always the same one. That is a cache line
-travelling further for the same work, which is precisely a cost that grows with the number of
-consumers while the instruction count stays flat.
-
-The test is cheap and decisive: stop pooling it. A freshly allocated object is written by the
-mainloop, read once by a worker and then dies, which is what a generation zero allocation is good at,
-and forty thousand small objects a second is a few megabytes. If the penalty collapses, it was the
-pool.
+If that is also ruled out, what remains is that the work itself is not as parallel as it looks, and
+the next thing to measure is not a hypothesis but the hardware counters — cache misses per packet at
+one worker against four would say in a single run whether these are the same instructions running
+slower, or more instructions.
 
 ## What to watch next
 
 - **Why more arena workers cost more processor time for the same work.** The effect is established
-  and reproduced on clean runs, at 1.59 times the processor time for four workers against one, and
-  five causes are ruled out: the per recipient atomics, the send path, thin worker loading, unequal
-  cores, and the cost of blocking on an empty queue. The pooled `PositionBroadcast` that crosses from
-  the mainloop to a worker is the next one to test, by not pooling it.
+  and reproduced on clean runs, at 1.59 to 1.68 times the processor time for four workers against
+  one, and eight causes are ruled out: the per recipient atomics, the send path, thin worker loading,
+  unequal cores, the shared player lock, the cost of blocking on an empty queue, the pooled objects
+  crossing the handoff, and the load generator competing for cores. Next is a processor per worker
+  that nothing else touches, and after that the hardware counters rather than another hypothesis.
 - **Where the load goes in the saturated runs**, where nothing is specced and half the offered packets
   still produce no broadcast. A counter on each early return in `HandlePositionPacket` would say in
   one run which of the three it is, and the timestamp check is the one to expect.
