@@ -126,6 +126,22 @@ settled = blocks[first:]
 if len(settled) < 3:
     print(f"WARNING: only {len(settled)} settled window(s) after {first} of ramp. Hold for longer.", file=sys.stderr)
 
+# One window is only worth reporting if the others agree with it. A run that swings between windows
+# has a number for every argument and supports none of them, and reading one window out of it looks
+# exactly like reading one out of a steady run. This is reported every time rather than only when it
+# is bad, so that a comparison between two runs can be checked rather than assumed.
+settled_rates = rates[first:]
+mean = sum(settled_rates) / len(settled_rates)
+low, high = min(settled_rates), max(settled_rates)
+spread = (high - low) / mean * 100 if mean else 0.0
+print(f"Settled windows:     {len(settled)} after {first} of ramp, "
+      f"mean {mean:,.0f} pkt/s, spread {spread:.0f}%", file=sys.stderr)
+
+if spread > 10:
+    print(f"WARNING: the settled windows range from {low:,.0f} to {high:,.0f} pkt/s. One window out of"
+          f"\n         that is not a measurement, whichever one is picked. Find what is making the run"
+          f"\n         lumpy before comparing these numbers with anything.", file=sys.stderr)
+
 block = settled[-3] if len(settled) >= 3 else settled[-1]
 
 def field(pattern, default="-"):
@@ -184,7 +200,10 @@ wait_for_listening || exit 1
     --protocol game --clients "$CLIENTS" --arenas "$ARENAS" --duration "$DURATION" "$@" > "$CLIENT_LOG" 2>&1 )
 
 sleep 3
-extract_window >> "$RESULTS"
+
+# The row goes to the results file and the notes about which window it came from are kept for the
+# report below, so that they appear beside the other checks rather than ahead of the run's output.
+WINDOW_NOTES="$(extract_window 2>&1 >> "$RESULTS")"
 
 echo
 echo "--- what the load client saw ---"
@@ -225,8 +244,16 @@ if [[ "$OFFERED" =~ ^[0-9]+$ ]] && [[ "$MEASURED" =~ ^[0-9]+$ ]] && [ "$OFFERED"
         echo "         measured less than it asked for and is NOT comparable with one that did not."
         echo "         Check the specced count above first - it is the usual cause, and it usually means"
         echo "         the load generator could not keep up rather than that the server is slow."
+    elif [ "$PERCENT" -gt 110 ]; then
+        # Over the offered load means the window caught a burst rather than a steady state, since the
+        # server cannot broadcast more position packets than were sent to it.
+        echo "WARNING: the server appears to have broadcast ${PERCENT}% of what was offered, which it"
+        echo "         cannot do. The window caught a burst rather than a steady state - see the settled"
+        echo "         window spread below."
     fi
 fi
+
+[ -n "$WINDOW_NOTES" ] && echo "$WINDOW_NOTES"
 echo "Logs: $SERVER_LOG"
 echo "      $CLIENT_LOG"
 echo "Results: $RESULTS"
