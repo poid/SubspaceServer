@@ -76,7 +76,15 @@ namespace SS.Core.ComponentInterfaces
         /// <summary>Gauge. What fraction of its interval the busiest send thread spent working, as a percentage.</summary>
         SendThreadBusiestPercent,
 
-        /// <summary>Counter. Read locks taken on the global player data lock.</summary>
+        /// <summary>
+        /// Counter. Read locks taken on the global player data lock.
+        /// <para>
+        /// Counts the outermost acquisition only. A thread that already holds the lock skips taking it
+        /// again, so this is the number of distinct regions over which the lock was held rather than the
+        /// number of calls to acquire it. The two used to be the same and were not: the send path alone
+        /// re-entered around four million times a second at four thousand players.
+        /// </para>
+        /// </summary>
         PlayerDataReadLocks,
 
         /// <summary>Counter. Write locks taken on the global player data lock.</summary>

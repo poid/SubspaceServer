@@ -27,6 +27,7 @@ namespace SS.Core.Modules
         private readonly IConfigManager _configManager;
         private readonly ILogManager _logManager;
         private readonly IObjectPoolManager _objectPoolManager;
+        private readonly IPlayerData _playerData;
 
         private InterfaceRegistrationToken<IArenaLoop>? _iArenaLoopToken;
         private InterfaceRegistrationToken<IArenaTimer>? _iArenaTimerToken;
@@ -84,12 +85,14 @@ namespace SS.Core.Modules
             IComponentBroker broker,
             IConfigManager configManager,
             ILogManager logManager,
-            IObjectPoolManager objectPoolManager)
+            IObjectPoolManager objectPoolManager,
+            IPlayerData playerData)
         {
             _broker = broker ?? throw new ArgumentNullException(nameof(broker));
             _configManager = configManager ?? throw new ArgumentNullException(nameof(configManager));
             _logManager = logManager ?? throw new ArgumentNullException(nameof(logManager));
             _objectPoolManager = objectPoolManager ?? throw new ArgumentNullException(nameof(objectPoolManager));
+            _playerData = playerData ?? throw new ArgumentNullException(nameof(playerData));
         }
 
         #region Module Members
@@ -664,6 +667,10 @@ namespace SS.Core.Modules
                             {
                                 serverMetrics.Increment(ServerMetric.ArenaLoopWorkItemsProcessed);
                             }
+
+                            // Arena work runs whatever a module registered, so this is where a hold left
+                            // behind would go unnoticed and be inherited by the next item.
+                            ThreadingAssert.WarnIfPlayerLockLeaked(_owner._playerData, _owner._logManager, $"{nameof(ArenaLoop)}-{Index}");
                         }
 
                         ProcessTimers();

@@ -3230,6 +3230,10 @@ namespace SS.Core.Modules
             {
                 long start = Stopwatch.GetTimestamp();
 
+                // This thread runs reliable callbacks, which are module code, so a hold left behind by
+                // one would be inherited by the next pass rather than noticed.
+                ThreadingAssert.WarnIfPlayerLockLeaked(_playerData, _logManager, $"{nameof(SendThread)}-{shard}");
+
                 //
                 // Players
                 //
@@ -4197,6 +4201,10 @@ namespace SS.Core.Modules
 
             while (!_stopToken.IsCancellationRequested)
             {
+                // This thread dispatches incoming reliable packets to their handlers, which are module
+                // code, so a hold left behind by one would be inherited by the next connection it picks up.
+                ThreadingAssert.WarnIfPlayerLockLeaked(_playerData, _logManager, nameof(RelThread));
+
                 switch (WaitHandle.WaitAny(waitHandles))
                 {
                     case 0:
