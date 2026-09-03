@@ -495,8 +495,52 @@ undercounted updates by about five times — and the bytes per update that came 
 the same factor in the other direction. After the fix the client's count agrees with the server's own
 `SendToOne` counter to within noise, which is the check that says both are now right.
 
+## The global player lock was taken once per recipient, and it was redundant
+
+Attributing the lock by caller found the send path taking the global player read lock 4,325,895 times
+a second at four thousand players. At two thousand the breakdown was `SendOrBufferPacket` 1,789,546 a
+second and `SendRaw` 179,967, against everything else taking it once per packet. The arithmetic named
+the source exactly — 20,001 packets a second times 89.4 recipients in view is 1,788,089 — and the
+source turned out to be re-entry. The position fan-out takes the lock once around its whole recipient
+loop and then calls `SendToOne` per recipient, and the send thread holds it across its entire pass;
+both then reached code that took it again, for a check the outer hold had already made safe.
+
+Skipping the acquisition when the calling thread already holds it, measured at four thousand players
+over forty arenas with connections arriving throughout, at the same offered load each time:
+
+| | processed pkt/s | workers busy | cores | read locks/s | cores per 1k pkt |
+|---|---|---|---|---|---|
+| 2 workers, before | 27,823 | 99% | 6.67 | 3,005,009 | 0.2397 |
+| 2 workers, after | 33,079 / 34,407 | 100% | 6.70 | 154,748 | 0.2025 |
+| 4 workers, before | 42,628 | 90-91% | 10.13 | 4,325,895 | 0.2376 |
+| 4 workers, after | 40,011 | 79-80% | 8.67 | 161,663 | 0.2167 |
+
+Read the four worker row carefully, because the lower number is the better result. 42,628 was a
+saturated server draining a backlog inside the sampled window, above the 39,677 a second the clients
+were actually sending. Afterwards the server tracks the offered load exactly, at 79% of four workers
+instead of 90%, for 8.67 cores instead of 10.13. Where the workers genuinely were the limit, at two,
+throughput rose about a fifth for the same processor time.
+
+**It did not change how the workers scale, which is what it was built to test.** Per worker core, the
+drop from two workers to four was 14,050 to 10,875 before and 16,540 to 12,582 after: 22.6% against
+23.9%. Everything became about a sixth more efficient and the shape of the curve did not move. Lock
+acquisition count is a real cost and is not the reason adding arena workers loses throughput.
+
+One measurement note. A debug-only assertion change was included at first and looked like it might be
+inflating the result, so it was reverted and re-run alone: 34,407 packets a second without it against
+33,079 with it, which is the wrong way round and inside the run to run spread. It was worth nothing
+and was dropped. All of the improvement is the skip.
+
 ## What to watch next
 
+- **Why the arena workers scale backwards**, still unexplained after removing the lock traffic. Three
+  things in the fan-out touch a process-wide field once per recipient: the `SendToOne` metric counter,
+  which the metrics interface's own rules say should be tallied locally at this rate; the bandwidth
+  priority statistic, where every position packet lands on the same array slot; and the two object
+  pools the buffers come from. Those are the remaining suspects.
+- **The periodic persist sync**, 5.2 seconds at ten thousand players with 2.3 of it in the commit.
+  Chunking it stops it blocking logins for the whole sweep, but the cost itself scales with how much
+  data is written, and only dirty records need writing.
 - **The receive thread**, at 20% of a core at six thousand and climbing faster than anything else.
   It is a single thread, and sharding it is the plan's Phase 7.
 - **The global player write lock**, held 6.5 ms, 14.7 ms and 19.9 ms per ten second window at 3,000,
