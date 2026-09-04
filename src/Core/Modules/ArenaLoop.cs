@@ -596,7 +596,15 @@ namespace SS.Core.Modules
                 if (milliseconds <= 0)
                     return 0;
 
-                return (int)double.Min(milliseconds, int.MaxValue);
+                // Rounded up rather than truncated, because truncating turns a short wait into a busy
+                // one. A timer due in a fraction of a millisecond truncates to a wait of zero, so the
+                // take returns immediately, the timer is still not due when the timers are next
+                // checked, and the worker goes round again as fast as the processor allows until it is.
+                // With a periodic timer per arena there is nearly always one due inside the next
+                // millisecond, so a worker spent all of its idle time doing this: measured at four
+                // thousand players over forty arenas, 2.4 million iterations every ten seconds against
+                // 400,000 items of real work, and 4.4 million across four workers.
+                return (int)double.Ceiling(double.Min(milliseconds, int.MaxValue));
             }
 
             /// <summary>
