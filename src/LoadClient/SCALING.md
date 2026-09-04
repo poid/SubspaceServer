@@ -809,28 +809,83 @@ pooling removed the *recycling* of an object between cores; it did not remove th
 freshly allocated broadcast is still written on the mainloop and read on a worker. Only one mechanism
 was eliminated, not the suspect.
 
-### What is left
+## Timing the loop directly, after a profiler lied about it
 
-Nine causes eliminated and one positive signal: whatever this is, it grows with the distance between
-the threads, not with how often they are interrupted.
+Nine hypotheses had been eliminated without confirming anything, so the next step was to stop guessing
+and measure where the worker's own time went. Two attempts, and the first was worse than useless.
 
-The next measurement is not another hypothesis. `perf` is unavailable and WSL2 exposes no PMU, so
-cache misses cannot be counted directly — but the worker's own time budget can be split in software.
-A pair of `Stopwatch` timestamps around the candidate scan, against the time spent outside it, costs
-tens of nanoseconds on a path that runs forty thousand times a second and answers the question
-directly: if the scan itself is slower at four workers, these are the same instructions waiting on
-memory; if the scan is unchanged and the time is outside it, the cost is per item and belongs to the
-handoff.
+**A sampling profiler cannot answer this.** `dotnet-trace` reported, with no ambiguity, that 95% of
+the arena worker's time was `DateTime.UtcNow`. It is not: a clock read costs 14 ns on this machine,
+so the two million of them in the sampled window account for 28 ms, not the 18 seconds attributed.
+The managed sampler suspends threads at garbage collection safe points, so it reports the call that
+happens to carry a poll rather than the code burning the cycles, and a tight loop with a poll every
+iteration collects all of it. The give-away was in the stacks — `Thread.PollGCWorker` sitting under
+`get_UtcNow` — but the check that caught it was arithmetic, not the tool.
+
+**Timing the loop by hand did answer it,** and found a defect worth more than the investigation. The
+wait handed to the queue take is how long until the next timer is due, and it was truncated to whole
+milliseconds. A timer due in a fraction of one became a wait of zero: the take returns immediately,
+the timer is still not due, and the worker goes round again as fast as the processor allows until it
+is. With a periodic timer per arena there is nearly always something due inside the next millisecond.
+
+Per ten seconds, at four thousand players over forty arenas:
+
+| | one worker | four workers |
+|---|---|---|
+| items of real work | 400,000 | 400,000 |
+| loop iterations, before | **2,800,000** | **4,800,000** |
+| loop iterations, after | 400,077 | 400,349 |
+| arena worker processor time | 76% → **72%** | 121% → **102%** |
+
+Four workers gained the most because the spin fills whatever idle time a worker has, and four workers
+at a quarter of the load each have three times as much of it. Rounding the wait up instead of
+truncating it is the whole fix.
+
+This had been inflating every arena worker measurement since the timers were added, and inflating it
+more the more workers were running — so every figure earlier in this document overstates the penalty.
+It does not remove it. The eliminations survive, because both sides of each comparison carried the
+same spin, but the batch drain result is now explained rather than merely negative: with one iteration
+per item there is never anything queued behind the item being taken, so batching the take had nothing
+to batch.
+
+### What is left is real, and it is the work itself
+
+With the spin gone, the time spent in the fan-out is measured directly, and it is not the same on
+both sides:
+
+| | one worker | four workers |
+|---|---|---|
+| work per item, before the fix | 15.6 µs | 22.5 µs |
+| work per item, after the fix | **15.7 µs** | **21.1 µs** |
+| total fan-out time | 63% of a core | 85% of a core |
+
+Same 400,000 items, same 100.0 candidates scanned, same 19.9 recipients, same player lock rate — and
+a third more processor time per packet to do it. That is the answer to the question this section
+started with: it is not queueing, not scheduling, not overhead around the work. The same instructions
+run slower, which is what memory-bound work spread across more cores looks like, and it fits the one
+positive signal already found — that separating the workers onto their own processors makes it worse
+rather than better.
+
+The remaining question is narrower than the one it replaces: which part of the fan-out. The candidate
+scan reads player state that belongs to the worker's own arenas, but every send writes into a
+connection owned by whichever send thread has it, so the two halves have very different sharing. The
+same `Stopwatch` treatment applied inside `BroadcastPosition`, splitting the scan from the sends,
+would say which.
 
 ## What to watch next
 
-- **Why more arena workers cost more processor time for the same work.** Established and reproduced
-  on clean runs at 1.59 to 1.73 times the processor time for four workers against one. Nine causes
-  ruled out: the per recipient atomics, the send path, thin worker loading, unequal cores, the shared
-  player lock, blocking on an empty queue, recycling the pooled objects, the load generator competing
-  for cores, and cold caches from preemption. The one positive signal is that isolating the workers
-  onto separate processors makes it *worse*, so it grows with the distance between the threads. Next
-  is splitting the worker's own time budget between the candidate scan and everything else.
+- **Which half of the fan-out gets slower with more workers.** Answered so far: the work itself does,
+  at 15.7 µs a packet on one worker against 21.1 µs on four, for identical work. Not queueing, not
+  scheduling, not overhead — the same instructions running slower. What is not known is whether that
+  is the candidate scan, which reads state belonging to the worker's own arenas, or the sends, which
+  write into connections owned by whichever send thread holds them. Splitting `BroadcastPosition` the
+  same way the worker loop was split would say.
+- **Re-measuring the worker scaling numbers on the fixed build.** Every figure in this document from
+  the arena workers predates the busy wait fix and overstates the penalty, the more so the more
+  workers were running. The direction and the eliminations hold; the magnitudes need redoing.
+- **Whether isolating the workers still makes it worse.** That result was measured with the spin
+  present, and an uncontended core is exactly where a spin costs most, so it is the one earlier
+  finding that could be an artefact rather than a clue.
 - **Where the load goes in the saturated runs**, where nothing is specced and half the offered packets
   still produce no broadcast. A counter on each early return in `HandlePositionPacket` would say in
   one run which of the three it is, and the timestamp check is the one to expect.
