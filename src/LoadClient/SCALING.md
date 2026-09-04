@@ -779,28 +779,58 @@ inside WSL2 pins to virtual processors the hypervisor still places as it likes, 
 evidence than pinning on real hardware would be. It is enough to rule the generator out, because
 removing the competition did not remove the penalty.)
 
+### Isolating the workers makes it worse, which is the first real clue
+
+The obvious remaining explanation was that a worker at thirty percent duty keeps losing its core to
+something else and resumes on a cold cache, where one at seventy-five percent holds on to it. Giving
+each worker a processor nothing else in the server touches should then have closed most of the gap —
+mainloop, send threads and receive thread confined to CPUs 16-27, the workers alone on 28, 29, 30 and
+31, and the load generator on 0-15.
+
+It went the other way, and consistently:
+
+| | 1 worker | 4 workers | ratio |
+|---|---|---|---|
+| sharing the machine with the generator | 75% | 119% | 1.59 |
+| server and generator on opposite halves | 74% | 124% | 1.68 |
+| one dedicated processor per worker | 77% | **133%** | **1.73** |
+
+One worker costs the same however it is isolated, which is expected — almost nothing about its
+situation changes. Four workers cost more the further apart they are put. That kills the cold cache
+explanation, which predicts the opposite, and it kills scheduling with it.
+
+What grows when threads are pushed onto separate cores is the distance data has to travel between
+them. Pinning the mainloop to one group of processors and the workers to another guarantees that
+every work item and everything it points at crosses between them, where a free scheduler can put a
+producer and its consumer on cores that share a cache.
+
+That also means the pool result above proves less than it looked like proving. Allocating instead of
+pooling removed the *recycling* of an object between cores; it did not remove the *crossing*, since a
+freshly allocated broadcast is still written on the mainloop and read on a worker. Only one mechanism
+was eliminated, not the suspect.
+
 ### What is left
 
-Eight causes eliminated, none confirmed. What has not been tried is giving each worker a processor
-nothing else touches — the runs above isolate the server from the generator but leave the workers
-sharing sixteen CPUs with the send threads, the mainloop and the receive thread. That is the last
-environmental explanation: a thread that works in bursts and idles between them resumes on a core
-whose cache something else has since used, and four threads at thirty percent duty do that far more
-often than one at seventy-five.
+Nine causes eliminated and one positive signal: whatever this is, it grows with the distance between
+the threads, not with how often they are interrupted.
 
-If that is also ruled out, what remains is that the work itself is not as parallel as it looks, and
-the next thing to measure is not a hypothesis but the hardware counters — cache misses per packet at
-one worker against four would say in a single run whether these are the same instructions running
-slower, or more instructions.
+The next measurement is not another hypothesis. `perf` is unavailable and WSL2 exposes no PMU, so
+cache misses cannot be counted directly — but the worker's own time budget can be split in software.
+A pair of `Stopwatch` timestamps around the candidate scan, against the time spent outside it, costs
+tens of nanoseconds on a path that runs forty thousand times a second and answers the question
+directly: if the scan itself is slower at four workers, these are the same instructions waiting on
+memory; if the scan is unchanged and the time is outside it, the cost is per item and belongs to the
+handoff.
 
 ## What to watch next
 
-- **Why more arena workers cost more processor time for the same work.** The effect is established
-  and reproduced on clean runs, at 1.59 to 1.68 times the processor time for four workers against
-  one, and eight causes are ruled out: the per recipient atomics, the send path, thin worker loading,
-  unequal cores, the shared player lock, the cost of blocking on an empty queue, the pooled objects
-  crossing the handoff, and the load generator competing for cores. Next is a processor per worker
-  that nothing else touches, and after that the hardware counters rather than another hypothesis.
+- **Why more arena workers cost more processor time for the same work.** Established and reproduced
+  on clean runs at 1.59 to 1.73 times the processor time for four workers against one. Nine causes
+  ruled out: the per recipient atomics, the send path, thin worker loading, unequal cores, the shared
+  player lock, blocking on an empty queue, recycling the pooled objects, the load generator competing
+  for cores, and cold caches from preemption. The one positive signal is that isolating the workers
+  onto separate processors makes it *worse*, so it grows with the distance between the threads. Next
+  is splitting the worker's own time budget between the candidate scan and everything else.
 - **Where the load goes in the saturated runs**, where nothing is specced and half the offered packets
   still produce no broadcast. A counter on each early return in `HandlePositionPacket` would say in
   one run which of the three it is, and the timestamp check is the one to expect.
