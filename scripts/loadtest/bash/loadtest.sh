@@ -103,9 +103,26 @@ wait_for_listening() {
 # an arena. That read as the server broadcasting half its offered load.
 extract_window() {
     python3 - "$SERVER_LOG" "$LABEL" <<'PY'
-import sys, re
+import sys, re, time
 log, label = sys.argv[1], sys.argv[2]
-blocks = re.split(r"I <Metrics> metrics over ", open(log, errors="replace").read())[1:]
+
+# The zone directory usually lives on a mount that occasionally fails a read outright - a run was
+# lost to "OSError: [Errno 61] No data available" on a log that was perfectly readable a second
+# later. Worth a couple of retries before giving up on a run that has already taken minutes.
+text = None
+for attempt in range(3):
+    try:
+        text = open(log, errors="replace").read()
+        break
+    except OSError as error:
+        print(f"WARNING: could not read {log} ({error}). Retrying.", file=sys.stderr)
+        time.sleep(2)
+
+if text is None:
+    print(f"{label}\tCOULD NOT READ THE SERVER LOG")
+    sys.exit()
+
+blocks = re.split(r"I <Metrics> metrics over ", text)[1:]
 if not blocks:
     print(f"{label}\tNO DATA (is Metrics:ReportInterval set, and the Metrics module loaded?)")
     sys.exit()
@@ -201,9 +218,24 @@ wait_for_listening || exit 1
 
 sleep 3
 
-# The row goes to the results file and the notes about which window it came from are kept for the
-# report below, so that they appear beside the other checks rather than ahead of the run's output.
-WINDOW_NOTES="$(extract_window 2>&1 >> "$RESULTS")"
+# The row is held rather than appended straight away, so that a failed extraction cannot leave the
+# report reading the previous run's row out of the results file and presenting it as this one's.
+# That is not hypothetical: a transient read error on the server log produced exactly that, and the
+# offered-versus-measured check passed because the previous run's number happened to be close.
+NOTES_FILE="$(mktemp)"
+ROW="$(extract_window 2>"$NOTES_FILE")"
+WINDOW_NOTES="$(cat "$NOTES_FILE")"
+rm -f "$NOTES_FILE"
+
+if [ -n "$ROW" ] && [ "${ROW%%$'\t'*}" = "$LABEL" ]; then
+    printf '%s\n' "$ROW" >> "$RESULTS"
+else
+    echo
+    echo "FAILED: no metrics window could be read for '$LABEL', so nothing was written to the results"
+    echo "        file. The server log is still there and can be re-read by hand; what must not happen"
+    echo "        is this run being reported with the last run's numbers."
+    ROW=""
+fi
 
 echo
 echo "--- what the load client saw ---"
@@ -211,7 +243,7 @@ grep -E "Connected|survived|clients sent|Server sent" "$CLIENT_LOG"
 
 echo
 echo "--- what the server did ---"
-tail -1 "$RESULTS"
+[ -n "$ROW" ] && printf '%s\n' "$ROW"
 
 # Worth checking every time. An assertion failure means a debug build caught the server doing something
 # its own threading contract forbids, which no timing number will tell you about.
@@ -232,7 +264,7 @@ echo "Assertion failures: $ASSERTIONS    Errors logged: $ERRORS"
 # less than it was offered is not comparable with one that broadcast all of it.
 SPECCED="$(grep -c 'specced for' "$SERVER_LOG")"
 OFFERED="$(grep -oE 'These clients sent [0-9]+' "$CLIENT_LOG" | grep -oE '[0-9]+$' | tail -1)"
-MEASURED="$(tail -1 "$RESULTS" | cut -f2 | cut -d. -f1)"
+MEASURED="$(printf '%s' "$ROW" | cut -f2 | cut -d. -f1)"
 
 echo "Specced for lag:    $SPECCED of $CLIENTS"
 
