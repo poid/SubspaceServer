@@ -940,6 +940,33 @@ here is not overhead to be removed or split up, it is what keeps the working set
 in cache. The remaining candidates in the send path are the connection lock and the outgoing queue
 themselves — real work rather than bookkeeping, and not obviously removable.
 
+## Tallying the per-recipient counters locally
+
+Not a fix for any of the above, and worth recording for the shape of the result rather than its size.
+Two things were counted on every send to every recipient: the `SendToOne` metric, and a shared array
+slot for bytes at that bandwidth priority which every position packet adds to at the same index. Both
+are single cache lines written by every thread that sends, at several million a second in the default
+configuration — the rate `IServerMetrics` itself says must be accumulated locally rather than reported
+per operation.
+
+Each thread now keeps its own counts and adds them to the shared ones every thousand sends:
+
+| | before | after |
+|---|---|---|
+| one worker | 72% | 73% |
+| four workers | **104%** | **100%** |
+| ratio | 1.44 | **1.37** |
+| whole server | 3.09 cores | **2.94 cores** |
+
+Nothing at one worker — slightly worse, in fact, because three thread-local accesses cost about what
+the two uncontended interlocked operations they replaced did. Four points at four workers, where those
+lines are genuinely bouncing between cores. That is the shape to expect from removing contention
+rather than removing work, and it is worth knowing that the *earlier* figure for this, four points at
+one worker, came from a build carrying the fan-out instrumentation and did not survive being measured
+on a clean one.
+
+The reported figures stay right: 796,111 sends a second against 796,083 before.
+
 ## What to watch next
 
 - **What is left in the send path is the connection lock and the outgoing queue**, which is real work
@@ -947,10 +974,11 @@ themselves — real work rather than bookkeeping, and not obviously removable.
   workers cost 1.44 times one for the same work, that the extra is in the sends rather than the scan,
   and that nothing removable has been found to account for it. The clean figures on the fixed build
   are 72% of a core at one worker and 104% at four.
-- **The two shared per-recipient counters**, which cost four points of a core at one worker and are
-  not what scales. Worth removing anyway: the metrics interface's own rule says a loop at that rate
-  must tally locally and report once, and `PositionRecipientsInView` already reports nearly the same
-  quantity properly.
+- **Saturation, which none of these runs reach.** Every figure here holds the load at forty thousand
+  packets a second and varies the worker count, which answers what a worker costs but not what a
+  worker can carry. One worker is at 73% at this load, so the interesting question — whether four
+  workers deliver four times the throughput or 1.37 times less than that — has not been measured.
+  That is the number capacity planning actually needs.
 - **Re-measuring the worker scaling numbers on the fixed build.** Every figure in this document from
   the arena workers predates the busy wait fix and overstates the penalty, the more so the more
   workers were running. The direction and the eliminations hold; the magnitudes need redoing.
