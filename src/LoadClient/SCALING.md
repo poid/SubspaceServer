@@ -866,20 +866,68 @@ run slower, which is what memory-bound work spread across more cores looks like,
 positive signal already found — that separating the workers onto their own processors makes it worse
 rather than better.
 
-The remaining question is narrower than the one it replaces: which part of the fan-out. The candidate
-scan reads player state that belongs to the worker's own arenas, but every send writes into a
-connection owned by whichever send thread has it, so the two halves have very different sharing. The
-same `Stopwatch` treatment applied inside `BroadcastPosition`, splitting the scan from the sends,
-would say which.
+### It is the sends, and the scan gets faster
+
+Splitting `BroadcastPosition` the same way, with the four `SendToOne` calls timed individually and
+everything else counted as the scan:
+
+| | 1 worker | 4 workers | |
+|---|---|---|---|
+| per send | 0.455 µs | 0.599 µs | **+31%** |
+| per candidate scanned | 0.147 µs | 0.125 µs | **−13%** |
+
+Both movements are consistent across all four workers and both windows, and they go in opposite
+directions, which is what makes them worth trusting: a measurement artefact such as blocking on the
+player lock would inflate both.
+
+That is the sharing, laid out. The candidate scan reads player state belonging to the worker's own
+arenas, so it is private to that worker and its working set shrinks from four thousand players to one
+thousand — and it gets cheaper, by an eighth. Every send writes into a connection owned by whichever
+*send thread* holds it, which has nothing to do with arenas, so four workers write into the same set
+of connections from four cores instead of one — and that costs a third more per send.
+
+**Not the shared per-recipient counters**, re-tested because the original test predated the busy wait
+fix and the harness checks. Two of them are written once per recipient, about 800,000 times a second
+here: the `SendToOne` metric and the bandwidth priority statistic, which every position packet adds to
+the same array slot. Removing both:
+
+| arena worker processor time | counters in | counters out |
+|---|---|---|
+| one worker | 78% | 74% |
+| four workers | 123% | 121% |
+
+Four points at one worker and two at four. They are a real fixed cost on a hot path — worth removing
+on their own merits, and the metrics interface's own rule already says a loop at that rate should
+tally locally — but they are not what scales. The ratio is unchanged at 1.6, so the earlier
+elimination was right, for better reasons than it had at the time.
+
+### What is left
+
+Two pooled objects are taken per *recipient* rather than per packet, inside the connection lock in
+`SendOrBufferPacket`: a `SubspaceBuffer` and the linked list node that carries it. Both come from a
+process-wide `Pool<T>` over a `ConcurrentQueue`, both at around 800,000 a second, and both are rented
+on an arena worker and returned on a send thread once the packet has gone out.
+
+That is the same cross-core recycling that was tested on the broadcast object and found to be nothing
+— at twenty times the rate. The broadcast object is taken once per packet, forty thousand times a
+second; these are taken once per recipient. With one worker there is a single thread dequeuing; with
+four there are four, on the same queue head, each handed memory last written by a different core.
+
+It is the only remaining thing in the send path that scales with the number of workers rather than
+with the amount of work, and it is testable by giving each worker its own pool: `PooledObject` already
+records which pool it came from, so returns from the send threads would find their way back without
+any bookkeeping.
 
 ## What to watch next
 
-- **Which half of the fan-out gets slower with more workers.** Answered so far: the work itself does,
-  at 15.7 µs a packet on one worker against 21.1 µs on four, for identical work. Not queueing, not
-  scheduling, not overhead — the same instructions running slower. What is not known is whether that
-  is the candidate scan, which reads state belonging to the worker's own arenas, or the sends, which
-  write into connections owned by whichever send thread holds them. Splitting `BroadcastPosition` the
-  same way the worker loop was split would say.
+- **The two pooled objects taken per recipient in the send path**, a `SubspaceBuffer` and its list
+  node, about 800,000 a second each, rented on an arena worker and returned on a send thread. The
+  last thing left in the send path that scales with the number of workers rather than the work. Give
+  each worker its own pool and re-measure.
+- **The two shared per-recipient counters**, which cost four points of a core at one worker and are
+  not what scales. Worth removing anyway: the metrics interface's own rule says a loop at that rate
+  must tally locally and report once, and `PositionRecipientsInView` already reports nearly the same
+  quantity properly.
 - **Re-measuring the worker scaling numbers on the fixed build.** Every figure in this document from
   the arena workers predates the busy wait fix and overstates the penalty, the more so the more
   workers were running. The direction and the eliminations hold; the magnitudes need redoing.
