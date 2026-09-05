@@ -915,15 +915,38 @@ four there are four, on the same queue head, each handed memory last written by 
 
 It is the only remaining thing in the send path that scales with the number of workers rather than
 with the amount of work, and it is testable by giving each worker its own pool: `PooledObject` already
-records which pool it came from, so returns from the send threads would find their way back without
-any bookkeeping.
+records which pool it came from, so returns from the send threads find their way back without any
+bookkeeping.
+
+**Tested, and it is not that either — the sharing was helping.** One pool per renting thread, which
+cycles correctly (allocation stayed at 4.9 MB/s, against the 11.8 MB/s of the run that bypassed a
+pool entirely):
+
+| | shared pool | one pool per thread |
+|---|---|---|
+| one worker | 72% | **69%** |
+| four workers | **104%** | **113%** |
+| ratio | 1.44 | 1.64 |
+| whole server | 3.09 cores | 3.47 cores |
+| working set | 336 MB | 373 MB |
+
+Three points better at one worker and nine worse at four, so the scaling it was meant to fix got
+worse. The working set says why: splitting the pool four ways puts four times as many distinct
+buffers in circulation, and each worker gets back memory a send thread wrote last. One shared pool
+keeps a smaller, hotter set cycling, and that is worth more than the queue contention it costs.
+
+Which is the same lesson as the broadcast object, arrived at from the opposite direction: pooling
+here is not overhead to be removed or split up, it is what keeps the working set small enough to stay
+in cache. The remaining candidates in the send path are the connection lock and the outgoing queue
+themselves — real work rather than bookkeeping, and not obviously removable.
 
 ## What to watch next
 
-- **The two pooled objects taken per recipient in the send path**, a `SubspaceBuffer` and its list
-  node, about 800,000 a second each, rented on an arena worker and returned on a send thread. The
-  last thing left in the send path that scales with the number of workers rather than the work. Give
-  each worker its own pool and re-measure.
+- **What is left in the send path is the connection lock and the outgoing queue**, which is real work
+  rather than bookkeeping. Ten causes have now been ruled out and the honest summary is that four
+  workers cost 1.44 times one for the same work, that the extra is in the sends rather than the scan,
+  and that nothing removable has been found to account for it. The clean figures on the fixed build
+  are 72% of a core at one worker and 104% at four.
 - **The two shared per-recipient counters**, which cost four points of a core at one worker and are
   not what scales. Worth removing anyway: the metrics interface's own rule says a loop at that rate
   must tally locally and report once, and `PositionRecipientsInView` already reports nearly the same
