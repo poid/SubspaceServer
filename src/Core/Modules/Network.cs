@@ -270,6 +270,17 @@ namespace SS.Core.Modules
         private const int MICROSECONDS_PER_MILLISECOND = 1000;
 
         /// <summary>
+        /// The most packets to take from one socket before looking at the others again.
+        /// </summary>
+        /// <remarks>
+        /// Only a fairness bound. It exists so that a game socket carrying the whole zone cannot hold
+        /// the receive thread away from the ping socket beside it, not to limit throughput: a socket
+        /// with more waiting than this is picked up again on the next pass, which is immediate,
+        /// because a readable socket makes the next Select return at once.
+        /// </remarks>
+        private const int MaxReceiveDrain = 64;
+
+        /// <summary>
         /// Queue for processing incoming reliable data.
         /// </summary>
         /// <remarks>
@@ -2327,6 +2338,10 @@ namespace SS.Core.Modules
                 socketList.Add(_clientSocket);
             }
 
+            // Set by the handlers below when they actually took a packet off a socket, so that the
+            // drain loop can tell "there was one" from "the socket is empty now".
+            bool receivedPacket = false;
+
             while (true)
             {
                 try
@@ -2342,18 +2357,42 @@ namespace SS.Core.Modules
                     if (_stopToken.IsCancellationRequested)
                         return;
 
+                    // Take everything a readable socket has, rather than one packet and back to
+                    // Select. Select is the expensive half of receiving: it rebuilds and walks the
+                    // socket list on every call, so a packet a call made the whole zone's incoming
+                    // traffic cost two system calls each. That is what limited this thread to about
+                    // 41,000 packets a second while it sat at 15% of a core - short of packets per
+                    // call rather than short of processor - and the kernel discarded the rest.
+                    //
+                    // Bounded so that a busy game socket cannot starve the ping socket or the client
+                    // socket beside it, in the same way the mainloop bounds its own drain.
                     foreach (Socket socket in checkReadList)
                     {
                         if (endpointLookup.TryGetValue(socket.LocalEndPoint!, out var tuple))
                         {
-                            if (tuple.Type == 'G')
-                                HandleGamePacketReceived(tuple.ListenData);
-                            else if (tuple.Type == 'P')
-                                HandlePingPacketReceived(tuple.ListenData);
+                            for (int drained = 0; drained < MaxReceiveDrain; drained++)
+                            {
+                                receivedPacket = false;
+
+                                if (tuple.Type == 'G')
+                                    HandleGamePacketReceived(tuple.ListenData);
+                                else if (tuple.Type == 'P')
+                                    HandlePingPacketReceived(tuple.ListenData);
+
+                                if (!receivedPacket)
+                                    break;
+                            }
                         }
                         else if (socket == _clientSocket)
                         {
-                            HandleClientPacketReceived();
+                            for (int drained = 0; drained < MaxReceiveDrain; drained++)
+                            {
+                                receivedPacket = false;
+                                HandleClientPacketReceived();
+
+                                if (!receivedPacket)
+                                    break;
+                            }
                         }
                     }
                 }
@@ -2375,6 +2414,12 @@ namespace SS.Core.Modules
                 {
                     bytesReceived = ld.GameSocket.ReceiveFrom(_receiveBuffer, SocketFlags.None, receivedAddress);
                 }
+                catch (SocketException ex) when (ex.SocketErrorCode == SocketError.WouldBlock)
+                {
+                    // The socket is empty, which is how the drain loop above finds its end. Expected
+                    // once per pass rather than an error, so it is not logged.
+                    return;
+                }
                 catch (SocketException ex)
                 {
                     _logManager.LogM(LogLevel.Error, nameof(Network), $"SocketException with error code {ex.ErrorCode} when receiving from game socket {ld.GameSocket.LocalEndPoint}. {ex}");
@@ -2390,6 +2435,10 @@ namespace SS.Core.Modules
                 {
                     return;
                 }
+
+                // Took one, so there may be another behind it. Everything past here is handling what
+                // was received and does not change that.
+                receivedPacket = true;
 
                 Span<byte> data = _receiveBuffer.AsSpan(0, bytesReceived);
 
@@ -2579,6 +2628,11 @@ namespace SS.Core.Modules
                 {
                     numBytes = ld.PingSocket.ReceiveFrom(_receiveBuffer, SocketFlags.None, receivedAddress);
                 }
+                catch (SocketException ex) when (ex.SocketErrorCode == SocketError.WouldBlock)
+                {
+                    // The socket is empty, which is how the drain loop finds its end.
+                    return;
+                }
                 catch (SocketException ex)
                 {
                     _logManager.LogM(LogLevel.Error, nameof(Network), $"SocketException with error code {ex.ErrorCode} when receiving from ping socket {ld.PingSocket.LocalEndPoint}. {ex}");
@@ -2589,6 +2643,10 @@ namespace SS.Core.Modules
                     _logManager.LogM(LogLevel.Error, nameof(Network), $"Exception when receiving from ping socket {ld.PingSocket.LocalEndPoint}. {ex}");
                     return;
                 }
+
+                // Set before the size check, because a packet of the wrong size still came off the
+                // socket and there may be another behind it.
+                receivedPacket = true;
 
                 if (numBytes != 4 && numBytes != 8)
                     return;
@@ -2833,6 +2891,11 @@ namespace SS.Core.Modules
                 {
                     bytesReceived = _clientSocket.ReceiveFrom(_receiveBuffer, SocketFlags.None, receivedAddress);
                 }
+                catch (SocketException ex) when (ex.SocketErrorCode == SocketError.WouldBlock)
+                {
+                    // The socket is empty, which is how the drain loop finds its end.
+                    return;
+                }
                 catch (SocketException ex)
                 {
                     _logManager.LogM(LogLevel.Error, nameof(Network), $"SocketException with error code {ex.ErrorCode} when receiving from client socket {_clientSocket.LocalEndPoint}. {ex}");
@@ -2848,6 +2911,9 @@ namespace SS.Core.Modules
                 {
                     return;
                 }
+
+                // Took one, so there may be another behind it.
+                receivedPacket = true;
 
                 Span<byte> data = _receiveBuffer.AsSpan(0, bytesReceived);
 
