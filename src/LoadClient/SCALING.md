@@ -779,7 +779,15 @@ inside WSL2 pins to virtual processors the hypervisor still places as it likes, 
 evidence than pinning on real hardware would be. It is enough to rule the generator out, because
 removing the competition did not remove the penalty.)
 
-### Isolating the workers makes it worse, which is the first real clue
+### Isolating the workers makes it worse — but the experiment was broken
+
+> **Retracted.** The processors given to the workers were not four cores. CPUs 28 and 29 are threads
+> of one core and 30 and 31 are threads of another, so "one dedicated processor each" put two workers
+> on each physical core with their execution units shared. That accounts for the numbers below
+> without any theory about distance, and the conclusion drawn from them — that the cost grows with
+> how far apart the threads are put — does not follow. Kept because the reasoning is where the error
+> is, and because the same mistake is easy to repeat: `lscpu` reports this machine as sixteen cores
+> of two threads, which is not its real shape either.
 
 The obvious remaining explanation was that a worker at thirty percent duty keeps losing its core to
 something else and resumes on a cold cache, where one at seventy-five percent holds on to it. Giving
@@ -998,13 +1006,54 @@ treating that as coincidence: at four workers the arena workers are not limited 
 instruction stream. They are waiting, and removing instructions from a thread that is waiting changes
 nothing.
 
-Which puts the weight back on a result recorded earlier and flagged as doubtful. Giving each worker a
-processor nothing else touched made things worse rather than better, and that was measured while the
-timer busy wait was still there — an uncontended core being exactly where a spin costs most. That
-test needs redoing on the fixed build, because "each worker is idle three quarters of the time, wakes
-with nothing in cache, and spends its time waiting on memory" accounts for every result here,
-including why the scan got faster with more workers while the sends got slower: the scan's working set
-is small and private to the worker, the connection data the sends touch is neither.
+The obvious explanation was that each worker is idle three quarters of the time, wakes with nothing in
+cache, and spends its time waiting on memory. Giving each worker a processor nothing else touched
+should then have helped, and the earlier attempt at that had been discounted because it ran with the
+timer busy wait still present.
+
+Redone on the fixed build it still went the wrong way — 73% to 68% at one worker, 100% to 110% at
+four — and the reason turned out to have nothing to do with caches. **The four processors were two
+cores.** CPUs 28 and 29 are threads of one core, 30 and 31 of another, so four workers on 28 through
+31 is two workers per core sharing execution units, which is the opposite of the isolation intended.
+One worker on CPU 28 did have a whole core, with its sibling idle, which is why that side improved.
+
+Both isolation results, this one and the earlier 133%, say only that two threads on one core are
+slower than one. The experiment has to be run one thread per *physical* core to mean anything, and
+`lscpu` will not help: it reports this machine as sixteen cores of two threads, which is not the shape
+of a processor with eight performance cores and sixteen efficiency cores either. The sibling lists
+under `/sys/devices/system/cpu/*/topology` are what to read.
+
+Run properly — workers on CPUs 24, 26, 28 and 30, which are four separate cores with their sibling
+threads left idle, the rest of the server on 16-23 and the generator on 0-15 — it gives the same
+answer for a good reason instead of a bad one:
+
+| | unpinned | one physical core each |
+|---|---|---|
+| one worker | 73% | **67%** |
+| four workers | 100% | **104%** |
+
+A single worker gains six points from owning a core. Four gain nothing, which is what kills the
+explanation: idle three quarters of the time is exactly the case a private core should rescue, and it
+does not.
+
+So the table above gains two more rows and the same signature. Five interventions — remove the shared
+counters, split the buffer pool, drop the node pool, dedicate cores, dedicate them correctly — and
+every one helps a single worker while none helps four. Each worker costs about 26% of a core for ten
+thousand packets a second, and that figure has not moved for anything tried against it.
+
+### What none of them touched
+
+Every run in this document has `Net:HandlePacketsOnArenaThread` off. The mainloop is therefore what
+writes `playerData.Position` for all forty thousand packets a second, and the workers read that same
+player state while scanning — a hundred candidates a packet. Writer and readers are on different cores
+by construction, and nothing done to the reader can change that. It is the one sharing relationship
+that survives every experiment above, because every experiment above was aimed at the reader.
+
+The setting exists to move the write onto the thread that does the reading. Its own documentation says
+to try it on a debug build first, since every packet handler in the server was written when the
+mainloop was the only thread that ran them, and the threading assertions are there to find whichever
+of them is not ready for that. That is the next measurement, and unlike the last five it changes what
+is shared rather than how much work is done.
 
 ## What one worker can carry, and why the ratios are not capacity
 
