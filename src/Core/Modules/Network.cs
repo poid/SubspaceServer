@@ -270,6 +270,17 @@ namespace SS.Core.Modules
         private const int MICROSECONDS_PER_MILLISECOND = 1000;
 
         /// <summary>
+        /// How many connections a send thread handles before letting go of the player lock and taking
+        /// it again, so that a writer waiting on it gets a turn.
+        /// </summary>
+        /// <remarks>
+        /// Small enough that the wait a writer sees is a few connections' worth of sending rather than
+        /// a whole pass, and large enough that letting go costs nothing measurable: an uncontended
+        /// acquisition is tens of nanoseconds against the sending either side of it.
+        /// </remarks>
+        private const int PlayersPerLockHold = 64;
+
+        /// <summary>
         /// The most packets to take from one socket before looking at the others again.
         /// </summary>
         /// <remarks>
@@ -3268,7 +3279,17 @@ namespace SS.Core.Modules
                 // guarding connection status comes before OutLock, and because ProcessLagout and
                 // ProcessDisconnect read player state. Readers do not block each other, so the send
                 // threads do not contend with one another for it.
+                //
+                // It is let go and taken again every so often through the pass, though, because a
+                // reader that never lets go starves the writers. Sending is not quick - this holds the
+                // lock across a socket write per connection - so a pass over a large share is long, and
+                // with several send threads overlapping there was never a moment when none of them held
+                // it. The mainloop needs it to write for every connect, and at nine thousand players it
+                // waited eleven seconds in a ten second window, stopped keeping up, and did not
+                // recover. Letting go periodically is enough to fix that on its own: once a writer is
+                // waiting the lock stops admitting new readers, so the readers drain and it gets in.
                 long now = Stopwatch.GetTimestamp();
+                int sinceLockReleased = 0;
 
                 _playerData.Lock();
 
@@ -3276,6 +3297,18 @@ namespace SS.Core.Modules
                 {
                     foreach (Player player in shardPlayers.Values)
                     {
+                        if (++sinceLockReleased >= PlayersPerLockHold)
+                        {
+                            sinceLockReleased = 0;
+
+                            // Safe to let go here because nothing is held across it. A player being
+                            // freed needs the write lock and its object is quarantined for seconds
+                            // before being reused, so it cannot come back as somebody else within one
+                            // pass; the status check below covers it having gone.
+                            _playerData.Unlock();
+                            _playerData.Lock();
+                        }
+
                         if (player.Status < PlayerState.Connected || !IsOurs(player))
                             continue;
 
