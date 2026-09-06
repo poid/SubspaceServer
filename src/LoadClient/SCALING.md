@@ -1120,7 +1120,42 @@ failed cannot be compared with each other, so there is no throughput comparison 
 scale — the thirteen percent above is a positions-only figure and should not be quoted for anything
 else.
 
-## The workers cannot be saturated here, because something else runs out first
+## One packet per Select was the ceiling, and it was not the buffer
+
+Chasing where the missing quarter of the load went: the listening socket's own drop counter, from
+`/proc/net/udp`, moved **1,136,376** in one six thousand client run, which is the 6,900 a second that
+never reached the mainloop. Worth noting against an earlier section of this document, which concluded
+the server was never the one losing packets because its receive *queue* read empty at every sample —
+the drops are bursty, and only the cumulative counter catches them.
+
+**Not the buffer.** Raising the receive buffer to the system maximum, four times the default, left
+throughput identical at ~41,000 packets a second and simply queued more before dropping it. More
+clients connected so more was offered, and the drops rose to match. That is a throughput limit, not a
+buffering one, and no amount of configuration fixes it.
+
+**One packet per system call was the limit.** The receive thread called `Socket.Select`, took a single
+packet, and went back to `Select` — which rebuilds and walks its socket list every call, so the whole
+zone's incoming traffic cost two system calls a packet. That also explains the shape of it: the thread
+sat at 15% of a core while its socket overflowed, because it was short of packets per call rather than
+short of processor.
+
+Draining each readable socket instead, bounded at 64 so a game socket carrying the zone cannot starve
+the ping socket beside it:
+
+| | one packet per Select | drain per wake |
+|---|---|---|
+| connected | 4,844 of 6,000 | **6,000 of 6,000** |
+| broadcast | 41,509 pkt/s | **55,069 pkt/s** |
+| socket drops | 1,136,376 | **115,137** |
+| specced for lag | 54 | **0** |
+| arena worker | 69% | **111%** |
+
+A third more throughput, every client connecting rather than one in five losing its attempt, ninety
+percent fewer drops — and the arena worker is now the limit, at 111%. That is the first time anything
+here has driven a worker to the wall, which is the condition the parked worker question was waiting
+for.
+
+## Before that: the workers could not be saturated, because something else ran out first
 
 The ceilings below are extrapolated from cost at a fixed load, so the obvious thing to do was measure
 them: offer one worker and then two about ten percent more than each was predicted to carry, and see
@@ -1214,11 +1249,12 @@ than better. That measurement needs a second machine.
   the send path is the connection lock and the outgoing queue, which is real work rather than
   bookkeeping.
 
-  Parked deliberately rather than abandoned. Nothing here can deliver enough packets to make the
-  workers the constraint — they had 38% and 55% of themselves spare while a quarter of the offered
-  load was going missing upstream — so the tax currently costs processor time on a machine with plenty
-  spare, not capacity. It becomes worth chasing again when the receive path no longer runs out first
-  and a worker can actually be driven to the wall. **Come back to this after Phase 7.**
+  Parked when nothing here could deliver enough packets to make the workers the constraint — they had
+  38% and 55% of themselves spare while a quarter of the offered load went missing upstream.
+  **Draining the receive socket has since changed that**: a single worker now runs at 111% and is the
+  limit, so the condition this was waiting on is met and it is ready to pick up again. The next thing
+  it needs is the saturation comparison that could not be run before — what one worker carries against
+  what two carry, both driven to the wall.
 - **The rest of the arena-thread packet path still.** Weapons and deaths have now been run through it
   and found two defects, both fixed, with a sustained combat run clean afterwards. Ship and freq
   changes, flags, balls, and above all switching arena while packets are in flight — which is what the
