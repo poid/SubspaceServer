@@ -1120,6 +1120,34 @@ failed cannot be compared with each other, so there is no throughput comparison 
 scale — the thirteen percent above is a positions-only figure and should not be quoted for anything
 else.
 
+## The workers cannot be saturated here, because something else runs out first
+
+The ceilings below are extrapolated from cost at a fixed load, so the obvious thing to do was measure
+them: offer one worker and then two about ten percent more than each was predicted to carry, and see
+what each actually retires. Spread out, so that a packet costs the worker a hundred candidate scans
+while costing the generator only twenty recipients to receive — which is what makes loading the server
+possible without loading the generator.
+
+Neither got close:
+
+| | offered | reached the mainloop | broadcast | arena workers | headroom |
+|---|---|---|---|---|---|
+| one worker, 6,000 clients | 48,069 | 37,056 | 36,988 | 62% of 100% | 38% |
+| two workers, 10,000 clients | 62,777 | 47,061 | 46,442 | 145% of 200% | 55% |
+
+About a quarter of what the clients sent never reached the mainloop's work queue, which drops nothing
+itself — so it was lost before that, in the receive path or on the way there. The connections tell the
+same story: 4,848 of 6,000 and 6,853 of 10,000 clients ever connected, which is the connection init
+dropping under burst arrival that this document already records.
+
+**So worker capacity is not measurable on this machine.** Not because the workers are too fast to
+load, but because nothing here can deliver enough packets to them: they still had 38% and 55% of
+themselves spare at the point where a quarter of the offered load was already going missing. The
+figures in the table below stay extrapolations.
+
+That is worth more than the measurement it failed to make. At every load this setup can produce, the
+arena workers are not the constraint — the receive path is, and it is a single thread.
+
 ## What a worker costs, and what it buys
 
 Filling in the two worker case on the current build completes the picture, and it is less bleak than
