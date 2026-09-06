@@ -967,6 +967,45 @@ on a clean one.
 
 The reported figures stay right: 796,111 sends a second against 796,083 before.
 
+## Removing work stops helping once there are four workers
+
+The node pool was the last shared object on the send path that had not been tested — a
+`DefaultObjectPool` whose fast path is a single field settled by an interlocked compare-exchange,
+taken from once per recipient. Replacing it with plain allocation, which removes it from the path
+entirely at the cost of 42 MB/s of very short lived objects against 4.9:
+
+| | pooled | allocated |
+|---|---|---|
+| one worker | 73% | **67%** |
+| four workers | 100% | 101% |
+
+Six points better at one worker, nothing at four. Worth knowing on its own that the pool is losing to
+the allocator even uncontended — a generation zero allocation is close to a pointer bump, while the
+pool costs at least an interlocked compare-exchange and an array scan when it misses — but the ratio
+got worse, so it is not what scales.
+
+Put beside the two experiments before it, that is the useful result:
+
+| what was removed | at one worker | at four workers |
+|---|---|---|
+| the shared per-recipient counters | −4 points | −0 points |
+| the shared buffer pool, split per thread | −3 points | **+9 points** |
+| the node pool, replaced by allocation | **−6 points** | +1 point |
+
+**Every change that takes work out of the path helps at one worker and does nothing at four.** Four
+workers sit between 100% and 104% whatever is removed. Three independent attempts is enough to stop
+treating that as coincidence: at four workers the arena workers are not limited by their own
+instruction stream. They are waiting, and removing instructions from a thread that is waiting changes
+nothing.
+
+Which puts the weight back on a result recorded earlier and flagged as doubtful. Giving each worker a
+processor nothing else touched made things worse rather than better, and that was measured while the
+timer busy wait was still there — an uncontended core being exactly where a spin costs most. That
+test needs redoing on the fixed build, because "each worker is idle three quarters of the time, wakes
+with nothing in cache, and spends its time waiting on memory" accounts for every result here,
+including why the scan got faster with more workers while the sends got slower: the scan's working set
+is small and private to the worker, the connection data the sends touch is neither.
+
 ## What one worker can carry, and why the ratios are not capacity
 
 Everything above holds the load constant and varies the worker count, which says what a worker costs
