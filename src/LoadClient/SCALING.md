@@ -1207,12 +1207,18 @@ than better. That measurement needs a second machine.
 
 ## What to watch next
 
-- **The four worker floor, which nothing has moved.** Six interventions, each helping one worker and
-  none helping four, which sits between 100% and 112% whatever is done to it. The honest summary is
-  that the extra cost is in the sends rather than the scan, that it is not the work being done, not
-  the objects being shared, not the processors being shared, and not the mainloop writing what the
-  workers read. What is left in the send path is the connection lock and the outgoing queue, which is
-  real work rather than bookkeeping.
+- **The four worker floor — deferred until the receive path is fixed, then revisit.** Spreading the
+  same work over four workers costs 37% more processor time than one, and six interventions have each
+  helped one worker and none helped four. It is not the work being done, not the objects being shared,
+  not the processors being shared, and not the mainloop writing what the workers read; what is left in
+  the send path is the connection lock and the outgoing queue, which is real work rather than
+  bookkeeping.
+
+  Parked deliberately rather than abandoned. Nothing here can deliver enough packets to make the
+  workers the constraint — they had 38% and 55% of themselves spare while a quarter of the offered
+  load was going missing upstream — so the tax currently costs processor time on a machine with plenty
+  spare, not capacity. It becomes worth chasing again when the receive path no longer runs out first
+  and a worker can actually be driven to the wall. **Come back to this after Phase 7.**
 - **The rest of the arena-thread packet path still.** Weapons and deaths have now been run through it
   and found two defects, both fixed, with a sustained combat run clean afterwards. Ship and freq
   changes, flags, balls, and above all switching arena while packets are in flight — which is what the
