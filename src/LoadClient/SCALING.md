@@ -1079,10 +1079,46 @@ is one arena worker with packets handled on it: forty thousand packets a second 
 against 2.94 to 2.97 for every four worker arrangement tried. More workers have not been worth their
 cost at any load this machine can produce.
 
-One caveat on the assertions. This exercises one of the seventeen arena-scoped packet types, in a run
-that is positions only. Weapons, deaths, ship and freq changes, flags, balls and arena switching are
-untested on that path, and they are where the risk is: a handler that touches zone-wide state is
-exactly what the assertions exist to catch, and none of them ran.
+### Sending weapons and deaths through it found two real defects
+
+The positions-only run was clean, which said less than it looked like saying: one of the seventeen
+arena-scoped packet types, and none of the paths where the risk actually is. Twenty percent weapon
+fire and six deaths a client a minute found two concurrency defects, neither of which can happen while
+the mainloop handles packets, because the mainloop is also what changes the state they race against.
+
+**A packet can outlive the routing decision that placed it.** Which thread handles a packet is decided
+when it arrives, from the sender's arena at that moment. The sender can leave before the arena's
+worker gets to it, and the worker then runs a handler for a player whose state it no longer owns,
+beside whichever thread now does — the one thing a single thread per arena exists to prevent. The
+assertion caught it and took the server down with it:
+
+```
+MainloopWork_CallPacketHandlers must run on the mainloop or on the thread owning
+arena '(none)', but ran on 'ArenaLoop-0'.
+```
+
+Fixed by dropping the packet. Everything routed this way is that arena's business, so one for an arena
+the sender has left has nothing to act on, and handing it to the mainloop instead would let it
+overtake packets that went there directly while the player was leaving.
+
+**The sender's ship was read twice around an array bound.** The position handler tests `player.Ship`
+against spectator and then reads it again, four times, to index an array with one entry per ship —
+which spectator is not. The mainloop can spec a player between the test and the index; LagAction does
+it for ping and so does a death. Six `IndexOutOfRangeException` in one run, on six different players.
+Fixed by reading it once into a local.
+
+With both fixed, a sustained combat run — a thousand clients over ten arenas, 7,463 deaths, nothing
+specced — held 9,991 packets a second of the 10,001 offered, steady to within a percent across every
+window, with no assertion failures and no errors.
+
+### What combat cannot measure here
+
+At four thousand clients the same combat load collapses, and on both code paths. With packets on the
+arena thread LagAction specced 3,949 of the 4,000 and throughput fell to ten packets a second; with
+them on the mainloop it collapsed too, from something else, with only 230 specced. Two runs that both
+failed cannot be compared with each other, so there is no throughput comparison for combat at that
+scale — the thirteen percent above is a positions-only figure and should not be quoted for anything
+else.
 
 ## What one worker can carry, and why the ratios are not capacity
 
@@ -1125,11 +1161,13 @@ than better. That measurement needs a second machine.
   the objects being shared, not the processors being shared, and not the mainloop writing what the
   workers read. What is left in the send path is the connection lock and the outgoing queue, which is
   real work rather than bookkeeping.
-- **Exercising the rest of the arena-thread packet path.** Turning `HandlePacketsOnArenaThread` on was
-  assertion-clean, but only positions were sent. Weapons, deaths, ship and freq changes, flags, balls
-  and arena switching all route the same way and none of them ran. That wants `--weapons` and
-  `--deaths` on a debug build before the setting is trusted, and it is worth doing because the setting
-  is worth thirteen percent of the server at one worker.
+- **The rest of the arena-thread packet path still.** Weapons and deaths have now been run through it
+  and found two defects, both fixed, with a sustained combat run clean afterwards. Ship and freq
+  changes, flags, balls, and above all switching arena while packets are in flight — which is what the
+  first defect was — are still untested, and arena switching is the one the load generator cannot
+  currently produce.
+- **A combat load this machine can sustain at four thousand clients.** Both code paths collapse there,
+  so nothing about combat can be compared at that scale.
 - **What four workers can carry**, which cannot be measured on this machine. One worker saturates at
   about 27,300 packets a second at ninety recipients each; four would need something near four times
   that, and at ninety recipients that is eight million updates a second back to the load generator,
