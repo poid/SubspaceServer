@@ -1155,7 +1155,54 @@ percent fewer drops — and the arena worker is now the limit, at 111%. That is 
 here has driven a worker to the wall, which is the condition the parked worker question was waiting
 for.
 
-## Around nine thousand players the write lock starves and the server stops recovering
+## Letting the send thread's lock go fixes it, and ten thousand players work
+
+The send thread held the player read lock for its whole pass, across a socket write per connection, and
+with several of them on overlapping schedules there was never a moment when none held it. A
+`ReaderWriterLockSlim` stops admitting readers once a writer waits, but that only helps if the readers
+already inside let go, and these did not until the pass ended.
+
+Letting it go every 64 connections and taking it again is the entire fix. Ten thousand clients over a
+hundred arenas, staggered, five minute hold:
+
+| | collapsing | after |
+|---|---|---|
+| connected | 9,328 of 10,000 in 118s | **10,000 of 10,000 in 48s** |
+| broadcast | 11,052 pkt/s | **48,856 pkt/s** |
+| write waited | 11,605 ms | **0.0 ms** |
+| mainloop | 14% of a core, queue 19,061 | 53%, queue 4,602 |
+| arena workers | 12% each | **110% and 109%** |
+| specced for lag | 370 | **0** |
+
+Four times the throughput, every client connecting in a third of the time, and the arena workers are
+the limit again rather than sitting idle behind a blocked mainloop.
+
+### And with that, the comparison this document has wanted all along
+
+Both worker counts can now be driven to the wall at the same load, which was impossible while the
+receive path, the connect burst, and then the write lock each ran out first. Same ten thousand clients,
+same hundred arenas, same 46 recipients a packet, and only the worker count differing:
+
+| workers | saturated at | against one |
+|---|---|---|
+| 1 | ~27,400 pkt/s (110%) | 1.00 |
+| 2 | 48,856 pkt/s (110% + 109%) | **1.78** |
+
+So the tax is real and it does cost capacity: two workers carry about 1.78 times one, not two. Roughly
+a ninth of the second worker is lost to whatever the thirty-seven percent penalty is, which is the
+first time that has been measured rather than extrapolated.
+
+**The one worker figure is approximate.** Its windows ranged from 18,890 to 35,443 — a sixty percent
+spread — because saturating one worker means offering it nearly four times what it can take, and there
+is nothing to refuse the excess. `ArenaLoop:MaxQueueDepth` defaults to no limit, so the overflow queues
+instead: two gigabytes of managed heap in that run, and the swings are collections on it rather than
+anything about throughput. The two worker run is clean at five percent.
+
+That missing backpressure is worth fixing on its own account. A server that is offered more than it can
+carry should refuse the excess, which is what the setting exists for, rather than growing a queue until
+the collector notices.
+
+## Before the fix: around nine thousand players the write lock starved and the server stopped recovering
 
 The saturation comparison still could not be made, and this time the reason is worth more than the
 comparison would have been. Two workers need about nine thousand players to reach the wall, and at
@@ -1337,12 +1384,16 @@ than better. That measurement needs a second machine.
   data is written, and only dirty records need writing.
 - **The receive thread**, at 20% of a core at six thousand and climbing faster than anything else.
   It is a single thread, and sharding it is the plan's Phase 7.
-- **The global player write lock, which is now the ceiling.** Held 6.5 ms, 14.7 ms and 19.9 ms per ten
-  second window at 3,000, 4,500 and 6,000 players — and *waited* eleven seconds per ten second window
-  at nine thousand, where the server stops recovering. Readers starve it: the send threads hold the
-  read lock across a pass, and a pass over nine thousand connections is long, while the mainloop needs
-  the write lock for every connect. This is the next thing to fix, and it is what stands between the
-  server and the populations it is being built for.
+- **Backpressure, which the server does not currently apply.** Offered more than it can carry, it
+  queues the excess instead of refusing it: two gigabytes of managed heap in a run offered four times
+  what one worker could take, and throughput swinging by sixty percent as the collector works through
+  it. `ArenaLoop:MaxQueueDepth` and `Mainloop:MaxQueueDepth` both default to no limit and both exist
+  precisely for this. Turning them on is what makes an overloaded server degrade rather than thrash,
+  and it is also what would make the one worker figure above measurable properly.
+- **What four workers carry**, now that saturating one and two is possible. The 1.78 measured between
+  one and two says the penalty costs capacity; whether it keeps costing the same at four is not known,
+  and four workers need about a hundred thousand packets a second to reach the wall — which is what
+  the generator can now just about offer.
 - **Connection bursts.** Only 4,909 of 6,000 clients connected, staggered 3 ms apart. The receive
   thread drops connection inits under burst arrival, which is a known limit and unrelated to steady
   state, but it will matter for a zone that fills quickly.
