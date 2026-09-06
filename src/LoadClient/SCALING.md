@@ -1155,6 +1155,50 @@ percent fewer drops — and the arena worker is now the limit, at 111%. That is 
 here has driven a worker to the wall, which is the condition the parked worker question was waiting
 for.
 
+## Around nine thousand players the write lock starves and the server stops recovering
+
+The saturation comparison still could not be made, and this time the reason is worth more than the
+comparison would have been. Two workers need about nine thousand players to reach the wall, and at
+that population the server enters a state it does not come out of.
+
+Ten thousand clients over a hundred arenas, connections staggered three milliseconds apart, a five
+minute hold. 9,328 connected, and then:
+
+| | |
+|---|---|
+| offered | 44,260 pkt/s |
+| broadcast | **11,052 pkt/s**, a quarter of it |
+| mainloop | 75 iterations a second, 13 ms each — but **14% of a core** |
+| mainloop queue | **19,061 deep** |
+| player lock | write held 118 ms, **write waited 11,605 ms** |
+| whole server | 1.91 cores of 32 |
+
+The mainloop is busy in elapsed time and idle in processor time, which means it is blocked rather than
+working, and the lock figures say on what. Readers hold the player lock: the send threads take it
+across a whole pass, and at nine thousand connections a pass is long. The mainloop is a writer — every
+connect and player state change needs it — and it waited eleven seconds out of ten. Its queue grows
+past nineteen thousand, packets pile up behind it, and the arena workers sit at 12% each with almost
+nothing reaching them. The server does not shut down afterwards either; both runs had to be killed.
+
+**Not caused by draining the receive socket**, which was the obvious suspect since that change removed
+the packet loss that had been throttling the input. The identical load on the build immediately before
+it collapses the same way:
+
+| | before the drain change | after |
+|---|---|---|
+| connected | 9,323 of 10,000 | 9,328 of 10,000 |
+| broadcast | 11,427 pkt/s | 11,052 pkt/s |
+| arena workers | 12% + 12% | 12% + 12% |
+| mainloop | 14% of a core | 14% of a core |
+| write waited | 7,698 ms | 11,605 ms |
+
+Same collapse, same mechanism, one commit apart. The drain change lets the server reach this point
+rather than causing it.
+
+This is the ceiling that matters now, and it is not the arena workers — they are barely awake through
+it. It is the one figure this document has been watching grow for a while: the global player write
+lock, 6.5 ms of wait at three thousand players, 19.9 ms at six thousand, and eleven seconds at nine.
+
 ## Before that: the workers could not be saturated, because something else ran out first
 
 The ceilings below are extrapolated from cost at a fixed load, so the obvious thing to do was measure
@@ -1293,9 +1337,12 @@ than better. That measurement needs a second machine.
   data is written, and only dirty records need writing.
 - **The receive thread**, at 20% of a core at six thousand and climbing faster than anything else.
   It is a single thread, and sharding it is the plan's Phase 7.
-- **The global player write lock**, held 6.5 ms, 14.7 ms and 19.9 ms per ten second window at 3,000,
-  4,500 and 6,000. Still under a quarter of a percent of wall time, but it is the one figure that
-  grows with player count rather than staying flat.
+- **The global player write lock, which is now the ceiling.** Held 6.5 ms, 14.7 ms and 19.9 ms per ten
+  second window at 3,000, 4,500 and 6,000 players — and *waited* eleven seconds per ten second window
+  at nine thousand, where the server stops recovering. Readers starve it: the send threads hold the
+  read lock across a pass, and a pass over nine thousand connections is long, while the mainloop needs
+  the write lock for every connect. This is the next thing to fix, and it is what stands between the
+  server and the populations it is being built for.
 - **Connection bursts.** Only 4,909 of 6,000 clients connected, staggered 3 ms apart. The receive
   thread drops connection inits under burst arrival, which is a known limit and unrelated to steady
   state, but it will matter for a zone that fills quickly.
