@@ -967,6 +967,39 @@ on a clean one.
 
 The reported figures stay right: 796,111 sends a second against 796,083 before.
 
+## What one worker can carry, and why the ratios are not capacity
+
+Everything above holds the load constant and varies the worker count, which says what a worker costs
+but not what it can carry. Those two are the same thing only if cost per packet does not depend on how
+busy the worker is, and it does. One worker, identical work per packet — a hundred players an arena,
+about ninety recipients — at two very different loads:
+
+| | half load | saturated |
+|---|---|---|
+| throughput | 15,009 pkt/s | 27,494 pkt/s |
+| arena worker | 50% | **108%** |
+| **cost per packet** | **33.3 µs** | **39.3 µs** |
+| broadcast of what was offered | 100% | **91%** |
+| working set | 290 MB | 452 MB |
+
+**A saturated worker costs about a fifth more per packet than one at half load.** Nothing was specced,
+so the missing nine percent is the server itself: with no queue depth limit the backlog simply grows,
+which is what the working set is doing, and throughput settles at what the worker can actually retire.
+
+So the worker count comparisons above, all made between 25% and 73% busy, measure the cheap end of
+that range. They are still a fair comparison with each other — both sides of every pair sat in the
+same range — but the ratio between them is not a capacity ratio, and four workers will not carry four
+times 27,300 packets a second.
+
+What can be said: **one arena worker sustains around 27,300 position packets a second** at ninety
+recipients each, which is roughly 2,700 players at ten updates a second in one arena group.
+
+What cannot be said is what four carry, and not for want of trying. Four workers would saturate
+somewhere near 87,000 packets a second, which at ninety recipients is nearly eight million updates a
+second flowing back to the load generator — twice what it has ever sustained. Raising the recipients
+per packet to reach saturation at a lower packet rate makes the generator's receive side worse rather
+than better. That measurement needs a second machine.
+
 ## What to watch next
 
 - **What is left in the send path is the connection lock and the outgoing queue**, which is real work
@@ -974,11 +1007,12 @@ The reported figures stay right: 796,111 sends a second against 796,083 before.
   workers cost 1.44 times one for the same work, that the extra is in the sends rather than the scan,
   and that nothing removable has been found to account for it. The clean figures on the fixed build
   are 72% of a core at one worker and 104% at four.
-- **Saturation, which none of these runs reach.** Every figure here holds the load at forty thousand
-  packets a second and varies the worker count, which answers what a worker costs but not what a
-  worker can carry. One worker is at 73% at this load, so the interesting question — whether four
-  workers deliver four times the throughput or 1.37 times less than that — has not been measured.
-  That is the number capacity planning actually needs.
+- **What four workers can carry**, which cannot be measured on this machine. One worker saturates at
+  about 27,300 packets a second at ninety recipients each; four would need something near four times
+  that, and at ninety recipients that is eight million updates a second back to the load generator,
+  which has never sustained more than four. Making packets costlier to lower the packet rate makes
+  the generator's side worse, not better. This needs a second machine, or a generator that can
+  receive far more cheaply than it does.
 - **Re-measuring the worker scaling numbers on the fixed build.** Every figure in this document from
   the arena workers predates the busy wait fix and overstates the penalty, the more so the more
   workers were running. The direction and the eliminations hold; the magnitudes need redoing.
