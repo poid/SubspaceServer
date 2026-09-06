@@ -1286,8 +1286,16 @@ namespace SS.Core.Modules
 
             int randnum = _prng.Rand();
 
+            // Read once. Every use below has to be the same ship as the test, because the mainloop can
+            // put this player into spectator mode while this runs - LagAction does it for ping, and a
+            // death does it too - and the ship then indexes an array with one entry per ship, which
+            // spectator is not. That threw IndexOutOfRangeException on the first run with weapons and
+            // packets handled on the arena thread. It cannot happen while the mainloop handles both,
+            // which is why it was not there to find before.
+            ShipType ship = player.Ship;
+
             // spectators don't get their position sent to anyone
-            if (player.Ship != ShipType.Spec)
+            if (ship != ShipType.Spec)
             {
                 int x1 = pos.X;
                 int y1 = pos.Y;
@@ -1350,14 +1358,14 @@ namespace SS.Core.Modules
                             && pos.Weapon.Alternate) // is a mine
                         {
                             // Use mine fire delay
-                            fireDelay = _clientSettings.GetSetting(player, _shipClientSettingIds[(int)player.Ship].MineFireDelayId);
+                            fireDelay = _clientSettings.GetSetting(player, _shipClientSettingIds[(int)ship].MineFireDelayId);
 
-                            if (_clientSettings.GetSetting(player, _shipClientSettingIds[(int)player.Ship].EmpBombId) != 0)
+                            if (_clientSettings.GetSetting(player, _shipClientSettingIds[(int)ship].EmpBombId) != 0)
                             {
                                 // For EMP mines, Continuum has strange behavior.
                                 // Take the larger of LandmineFireDelay and BombFireDelay.
                                 // TODO: Still need verification that this is correct, but from testing this is my guess on what Continuum is doing.
-                                int bombFireDelay = _clientSettings.GetSetting(player, _shipClientSettingIds[(int)player.Ship].BombFireDelayId);
+                                int bombFireDelay = _clientSettings.GetSetting(player, _shipClientSettingIds[(int)ship].BombFireDelayId);
                                 if (bombFireDelay > fireDelay)
                                 {
                                     fireDelay = bombFireDelay;
@@ -1367,7 +1375,7 @@ namespace SS.Core.Modules
                         else
                         {
                             // Use bomb fire delay
-                            fireDelay = _clientSettings.GetSetting(player, _shipClientSettingIds[(int)player.Ship].BombFireDelayId);
+                            fireDelay = _clientSettings.GetSetting(player, _shipClientSettingIds[(int)ship].BombFireDelayId);
 
                             // Carrying a flag or a ball can modify bomb fire delay.
                             int flaggerBombFireDelay = _clientSettings.GetSetting(player, _flaggerBombFireDelayId);
