@@ -147,11 +147,15 @@ if len(settled) < 3:
 # has a number for every argument and supports none of them, and reading one window out of it looks
 # exactly like reading one out of a steady run. This is reported every time rather than only when it
 # is bad, so that a comparison between two runs can be checked rather than assumed.
-settled_rates = rates[first:]
+# Measured over the windows the reported one is actually chosen from, which excludes the last two:
+# the tail of a run is clients disconnecting, and counting it made steady runs look unstable. A run
+# that held 14,953 to 15,047 across fifteen windows and then reported 12,315 as everyone left was
+# called an 18% spread, and a four worker comparison was thrown away and repeated over it.
+settled_rates = rates[first:-2] if len(settled) >= 3 else rates[first:]
 mean = sum(settled_rates) / len(settled_rates)
 low, high = min(settled_rates), max(settled_rates)
 spread = (high - low) / mean * 100 if mean else 0.0
-print(f"Settled windows:     {len(settled)} after {first} of ramp, "
+print(f"Settled windows:     {len(settled_rates)} after {first} of ramp and 2 of shutdown, "
       f"mean {mean:,.0f} pkt/s, spread {spread:.0f}%", file=sys.stderr)
 
 if spread > 10:
