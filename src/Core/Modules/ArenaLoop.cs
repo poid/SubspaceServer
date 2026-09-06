@@ -118,20 +118,28 @@ namespace SS.Core.Modules
             int workerCount = _configManager.GetInt(_configManager.Global, "ArenaLoop", "Workers", ConfigHelp.Constants.Global.ArenaLoop.Workers.Default);
             if (workerCount <= 0)
             {
-                // Deliberately a small fraction of the machine, because more workers is not better here
-                // and measurably worse past a point. Spreading the same work over more of them costs
-                // more processor time to do it, and the cost is not small: measured at four thousand
-                // players over forty arenas with the work per packet held identical -- same candidates
-                // scanned, same recipients, same sends -- one worker used 76% of a core, two used 92%
-                // between them, and four used 120%. Repeated on a second set of runs: 75%, 91%, 119%.
+                // A small fraction of the machine, because workers do not pay for themselves one for
+                // one. Measured at four thousand players over forty arenas with the work per packet
+                // held identical -- same candidates scanned, same recipients, same sends -- the same
+                // work costs 73% of a core on one worker, 89% split over two, and 100% split over
+                // four. Adding them is not free and never has been.
                 //
-                // Why is not known. It is not the player lock these threads share with the mainloop and
-                // the send threads, which was the original explanation here: the read acquisitions were
-                // later reduced by about ninety-six percent and the penalty did not move. It is also not
-                // the per recipient statistics, the send path, uneven loading across the workers, or the
-                // performance and efficiency cores of a hybrid processor. Until it is understood, the
-                // safe reading is that a worker earns its place only when there is enough work to keep
-                // it busy, so start few and raise it only if ?metrics shows the workers are the limit.
+                // What they do buy is a higher ceiling, sub-linearly: each worker can be driven to a
+                // whole core, so those figures extrapolate to roughly 1.6 times one worker's capacity
+                // at two and 2.9 times at four. One worker saturates at about 27,000 position packets
+                // a second at ninety recipients each, which is around 2,700 players.
+                //
+                // Size for the peak rather than for now. An arena belongs to the worker it was created
+                // on for the rest of its life, so this cannot be raised usefully once a zone is full:
+                // the arenas that are already busy stay where they are. Processor count is only a
+                // stand-in for how large a zone the machine was bought to host.
+                //
+                // Why the same work costs more when it is spread is not known, and six attempts have
+                // failed to move it: the shared per recipient counters, the buffer pool, the node pool,
+                // a processor per worker, the same again on real cores rather than hyperthread
+                // siblings, and moving packet handling onto the arena thread. Each helped one worker
+                // and none helped four. It is not the player lock either, which was the explanation
+                // here before the acquisitions were reduced by ninety-six percent without moving it.
                 workerCount = Math.Clamp(Environment.ProcessorCount / 8, 2, 8);
             }
 
