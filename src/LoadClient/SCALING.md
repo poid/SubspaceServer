@@ -1120,6 +1120,30 @@ failed cannot be compared with each other, so there is no throughput comparison 
 scale — the thirteen percent above is a positions-only figure and should not be quoted for anything
 else.
 
+## What a worker costs, and what it buys
+
+Filling in the two worker case on the current build completes the picture, and it is less bleak than
+"more is not better" suggested:
+
+| workers | same work costs | against one worker | ceiling, extrapolated |
+|---|---|---|---|
+| 1 | 73% of a core | 1.00 | ~55,000 pkt/s |
+| 2 | 89% between them | 1.22 | ~90,000 pkt/s, 1.6 times |
+| 4 | 100% between them | 1.37 | ~160,000 pkt/s, 2.9 times |
+
+The marginal cost falls rather than rises — one to two costs sixteen points, two to four costs eleven
+— so workers are sub-linear rather than wasteful. Four of them buy nearly three times the ceiling for
+just over a third more processor time, which is worth paying when the ceiling is what is wanted.
+
+The ceilings are extrapolations from a worker being able to reach a whole core, and they are
+optimistic: a saturated worker costs about a fifth more per packet than one at half load, measured
+below. Treat them as an ordering rather than as numbers.
+
+What actually decides the setting is that an arena belongs to the worker it was created on for the
+rest of its life. Raising it once a zone is full does not move the arenas that are already busy, so it
+has to be sized for the peak — which is why the default takes its cue from the processor count, as a
+stand-in for how large a zone the machine was meant to host.
+
 ## What one worker can carry, and why the ratios are not capacity
 
 Everything above holds the load constant and varies the worker count, which says what a worker costs
