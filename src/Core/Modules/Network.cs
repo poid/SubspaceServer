@@ -4770,16 +4770,36 @@ namespace SS.Core.Modules
 
         private void MainloopWork_CallPacketHandlers(SubspaceBuffer buffer)
         {
+            if (buffer is null)
+                return;
+
+            // Which thread a packet runs on is decided when it arrives, and the sender can leave the
+            // arena between then and now. Without this the arena's worker goes on to run a handler for
+            // a player whose state it no longer owns, beside whichever thread now does, which is the
+            // one thing giving each arena a single thread exists to prevent. Found by the threading
+            // assertions the first time weapons and deaths were sent with the setting on.
+            //
+            // Dropped rather than handed to the mainloop. Everything routed this way is that arena's
+            // business, so a packet for an arena the sender has already left has nothing to act on, and
+            // passing it along would let it overtake packets that went straight to the mainloop while
+            // the player was leaving.
+            if (Modules.ArenaLoop.IsArenaWorkerThread && !OwnsSendersArena(buffer))
+            {
+                ConnData? staleConn = buffer.Conn;
+                if (staleConn is not null)
+                    Interlocked.Decrement(ref staleConn.ProcessingHolds);
+
+                buffer.Dispose();
+                return;
+            }
+
             // Every game packet handler in the server is dispatched from here or from its arena-thread
             // twin, so asserting here covers all of them. Either thread is allowed, because which one a
             // packet arrives on depends on whether its sender is settled in an arena.
             ThreadingAssert.OwnsPlayerState(
                 _mainloop,
                 _arenaLoop,
-                (buffer?.Conn as PlayerConnection)?.Player?.Arena);
-
-            if (buffer is null)
-                return;
+                (buffer.Conn as PlayerConnection)?.Player?.Arena);
 
             using (buffer)
             {
@@ -4799,6 +4819,25 @@ namespace SS.Core.Modules
                     Interlocked.Decrement(ref conn.ProcessingHolds);
                 }
             }
+        }
+
+        /// <summary>
+        /// Whether the calling arena worker still owns the arena the packet's sender is in.
+        /// </summary>
+        /// <remarks>
+        /// False covers all three ways the answer can have changed since the packet was received: the
+        /// sender left for another arena, whose worker owns them now; the sender left every arena, so
+        /// the mainloop owns them; or the sender is gone.
+        /// </remarks>
+        /// <param name="buffer">The received packet, whose connection names the sender.</param>
+        private bool OwnsSendersArena(SubspaceBuffer buffer)
+        {
+            Arena? arena = (buffer.Conn as PlayerConnection)?.Player?.Arena;
+            if (arena is null)
+                return false;
+
+            IArenaLoop? arenaLoop = _arenaLoop;
+            return arenaLoop is not null && arenaLoop.IsArenaThread(arena);
         }
 
         private void CallPacketHandlers(ConnData conn, Span<byte> data, NetReceiveFlags flags)
