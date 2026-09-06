@@ -1052,8 +1052,37 @@ that survives every experiment above, because every experiment above was aimed a
 The setting exists to move the write onto the thread that does the reading. Its own documentation says
 to try it on a debug build first, since every packet handler in the server was written when the
 mainloop was the only thread that ran them, and the threading assertions are there to find whichever
-of them is not ready for that. That is the next measurement, and unlike the last five it changes what
-is shared rather than how much work is done.
+of them is not ready for that — which is what the load tests here are, so the assertions were already
+live.
+
+### Handling packets on the arena thread is worth thirteen percent, at one worker
+
+Turned on, with no assertion failures and no errors at either worker count:
+
+| | mainloop handles packets | arena thread handles packets |
+|---|---|---|
+| one worker, the workers | 73% | 75% |
+| one worker, **whole server** | 2.94 cores | **2.57 cores** |
+| four workers, the workers | 100% | 112% |
+| four workers, whole server | 2.94 cores | 2.97 cores |
+
+At one worker the mainloop effectively disappears — 74 iterations a second against 2,686, no longer
+using enough processor to appear among the threads at all — and absorbing all of its work costs the
+arena worker two points. The whole server does the same job for thirteen percent less.
+
+At four workers, absorbing the same work costs twelve points and the total does not move. That is the
+sixth intervention with the same signature, and the first that changed what is shared rather than how
+much work is done. It behaves like all the others.
+
+**What this is good for is the configuration, not the mystery.** The cheapest way to serve this load
+is one arena worker with packets handled on it: forty thousand packets a second for 2.57 cores,
+against 2.94 to 2.97 for every four worker arrangement tried. More workers have not been worth their
+cost at any load this machine can produce.
+
+One caveat on the assertions. This exercises one of the seventeen arena-scoped packet types, in a run
+that is positions only. Weapons, deaths, ship and freq changes, flags, balls and arena switching are
+untested on that path, and they are where the risk is: a handler that touches zone-wide state is
+exactly what the assertions exist to catch, and none of them ran.
 
 ## What one worker can carry, and why the ratios are not capacity
 
@@ -1090,11 +1119,17 @@ than better. That measurement needs a second machine.
 
 ## What to watch next
 
-- **What is left in the send path is the connection lock and the outgoing queue**, which is real work
-  rather than bookkeeping. Ten causes have now been ruled out and the honest summary is that four
-  workers cost 1.44 times one for the same work, that the extra is in the sends rather than the scan,
-  and that nothing removable has been found to account for it. The clean figures on the fixed build
-  are 72% of a core at one worker and 104% at four.
+- **The four worker floor, which nothing has moved.** Six interventions, each helping one worker and
+  none helping four, which sits between 100% and 112% whatever is done to it. The honest summary is
+  that the extra cost is in the sends rather than the scan, that it is not the work being done, not
+  the objects being shared, not the processors being shared, and not the mainloop writing what the
+  workers read. What is left in the send path is the connection lock and the outgoing queue, which is
+  real work rather than bookkeeping.
+- **Exercising the rest of the arena-thread packet path.** Turning `HandlePacketsOnArenaThread` on was
+  assertion-clean, but only positions were sent. Weapons, deaths, ship and freq changes, flags, balls
+  and arena switching all route the same way and none of them ran. That wants `--weapons` and
+  `--deaths` on a debug build before the setting is trusted, and it is worth doing because the setting
+  is worth thirteen percent of the server at one worker.
 - **What four workers can carry**, which cannot be measured on this machine. One worker saturates at
   about 27,300 packets a second at ninety recipients each; four would need something near four times
   that, and at ninety recipients that is eight million updates a second back to the load generator,
