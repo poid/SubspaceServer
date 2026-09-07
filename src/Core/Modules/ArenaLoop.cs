@@ -126,29 +126,36 @@ namespace SS.Core.Modules
             int workerCount = _configManager.GetInt(_configManager.Global, "ArenaLoop", "Workers", ConfigHelp.Constants.Global.ArenaLoop.Workers.Default);
             if (workerCount <= 0)
             {
-                // A small fraction of the machine, because workers do not pay for themselves one for
-                // one. Measured at four thousand players over forty arenas with the work per packet
-                // held identical -- same candidates scanned, same recipients, same sends -- the same
-                // work costs 73% of a core on one worker, 89% split over two, and 100% split over
-                // four. Adding them is not free and never has been.
+                // Two, and not derived from the processor count, because more of them buy almost
+                // nothing. Measured at ten thousand players over a hundred arenas, each driven until
+                // it could take no more:
                 //
-                // What they do buy is a higher ceiling, sub-linearly: each worker can be driven to a
-                // whole core, so those figures extrapolate to roughly 1.6 times one worker's capacity
-                // at two and 2.9 times at four. One worker saturates at about 27,000 position packets
-                // a second at ninety recipients each, which is around 2,700 players.
+                //   one worker    58,870 packets a second, 7.11 cores across the whole server
+                //   two workers   62,614 packets a second, 8.19 cores
+                //   four workers  63,393 packets a second, 9.26 cores
                 //
-                // Size for the peak rather than for now. An arena belongs to the worker it was created
-                // on for the rest of its life, so this cannot be raised usefully once a zone is full:
-                // the arenas that are already busy stay where they are. Processor count is only a
-                // stand-in for how large a zone the machine was bought to host.
+                // Four cost two and a bit more cores than one for seven percent more throughput. The
+                // reason worker count matters so little is that the mainloop backfills whatever the
+                // workers cannot take: a full queue sends the fan-out back to it, so one worker leaves
+                // it doing 22,000 packets a second, two leave it 1,300, and four leave it none. The
+                // work gets done either way; the setting mostly decides which thread does it.
                 //
-                // Why the same work costs more when it is spread is not known, and six attempts have
-                // failed to move it: the shared per recipient counters, the buffer pool, the node pool,
-                // a processor per worker, the same again on real cores rather than hyperthread
+                // Two rather than one because at one the mainloop is at 93% doing that backfilling,
+                // and it has a zone to run besides. At two it sits at 40% and the workers carry
+                // essentially all of the fan-out.
+                //
+                // Raising it is for a zone that has measured its workers saturated *and* the mainloop
+                // absorbing the overflow, and even then expect little: at two workers here both were
+                // true and doubling them again was worth one percent. Note also that an arena belongs
+                // to the worker it was created on for the rest of its life, so raising this does not
+                // move arenas that are already busy.
+                //
+                // Why the same work costs more when it is spread is still not known, and six attempts
+                // have failed to move it: the shared per recipient counters, the buffer pool, the node
+                // pool, a processor per worker, the same again on real cores rather than hyperthread
                 // siblings, and moving packet handling onto the arena thread. Each helped one worker
-                // and none helped four. It is not the player lock either, which was the explanation
-                // here before the acquisitions were reduced by ninety-six percent without moving it.
-                workerCount = Math.Clamp(Environment.ProcessorCount / 8, 2, 8);
+                // and none helped four.
+                workerCount = int.Min(2, Environment.ProcessorCount);
             }
 
             _workers = new Worker[workerCount];
