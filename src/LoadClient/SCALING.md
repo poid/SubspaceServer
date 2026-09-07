@@ -1205,6 +1205,30 @@ Per core of fan-out, the arrangement without the second worker is sixteen percen
 doing the work inline beats handing it to a worker, which is the handoff cost showing up from a
 direction none of the earlier experiments approached it from.
 
+### What a worker is actually worth, measured at saturation
+
+With the queue bounded and each configuration driven until it could take no more, ten thousand players
+over a hundred arenas:
+
+| workers | throughput | whole server | the workers do | the mainloop backfills |
+|---|---|---|---|---|
+| 1 | 58,870 pkt/s | 7.11 cores | 36,388/s | **22,484/s** |
+| 2 | 62,614 pkt/s | 8.19 cores | 61,353/s | 1,262/s |
+| 4 | 63,393 pkt/s | 9.26 cores | 63,393/s | 0 |
+
+**Four workers cost two and a bit more cores than one for seven percent more throughput.** Every
+earlier statement in this document about workers buying capacity sub-linearly — 1.6 times at two, 2.9
+at four — was extrapolated from cost at a fixed load because they could not be saturated at the time.
+Measured, four is 1.08 times one.
+
+The reason worker count matters so little is in the last column. A full worker queue sends the fan-out
+back to the mainloop, so the mainloop backfills whatever the workers cannot take, and the work gets
+done either way. The setting mostly decides which thread does it. That is also why one worker is not
+the answer despite being the cheapest: the mainloop is at 93% doing that backfilling, and it has a
+zone to run besides. At two it is at 40% and the workers carry essentially all of it.
+
+The default is now two rather than a share of the processor count.
+
 ### The comparison as it stood on unbounded queues
 
 Both worker counts can now be driven to the wall at the same load, which was impossible while the
