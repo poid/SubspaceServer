@@ -1205,6 +1205,44 @@ Per core of fan-out, the arrangement without the second worker is sixteen percen
 doing the work inline beats handing it to a worker, which is the handoff cost showing up from a
 direction none of the earlier experiments approached it from.
 
+### Everything measurable here has now been ruled out
+
+The penalty matters for a machine larger than this one: per worker-core, two workers retire 29,783
+packets a second and four retire 22,243, so four are a quarter less efficient at the thing you would
+buy more cores to do. Worth knowing what it is before scaling out.
+
+The runtime's own counters were the last untried instrument, and they close the last software
+suspect. Same load, same work per packet, one worker against four:
+
+| | one worker | four workers | |
+|---|---|---|---|
+| monitor lock contentions | 28/s | 77/s | against ~800,000 lock acquisitions a second |
+| garbage collection heap size | — | *smaller* at four | so not collection |
+| heap fragmentation | — | *lower* at four | |
+| thread pool queue | 0 | 0 | |
+
+Contention rises by less than three times, from four thousandths of a percent of acquisitions to one
+hundredth. At ten microseconds a blocking event that is under a tenth of a percent of a core, against a
+cost of twenty-five. **The connection lock and the queue behind it are not it**, and neither is the
+collector, which does less work at four workers rather than more. Nothing else in the runtime's
+instrumentation moves.
+
+So the list of things this cannot be now runs: the per recipient counters, the buffer pool, the node
+pool, dedicated processors, dedicated *physical* processors, the shared player lock, blocking on an
+empty queue, the mainloop writing what the workers read, the connection lock, and the collector.
+
+What is left is below the level anything here can see: how far the data travels between cores. That
+needs the processor's own counters, and this machine has none —
+`/sys/bus/event_source/devices` offers `software` and `tracepoint` events and no `cpu`, because WSL2
+does not expose a performance monitoring unit. It is not that `perf` is missing; there is nothing for
+it to read.
+
+**On real hardware this is one run.** `perf stat -e cache-misses,LLC-load-misses,LLC-store-misses`
+around the same comparison — four thousand players over forty arenas, spread out, one worker against
+four — would say in a single pass whether four workers take more cache misses for the same work. If
+they do, it is data moving between cores and the fix is in how arenas, connections and send threads
+are grouped. If they do not, everything above is wrong and it is something none of this has touched.
+
 ### What a worker is actually worth, measured at saturation
 
 With the queue bounded and each configuration driven until it could take no more, ten thousand players
