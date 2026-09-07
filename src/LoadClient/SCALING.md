@@ -1177,7 +1177,35 @@ hundred arenas, staggered, five minute hold:
 Four times the throughput, every client connecting in a third of the time, and the arena workers are
 the limit again rather than sitting idle behind a blocked mainloop.
 
-### And with that, the comparison this document has wanted all along
+### Bounding the queue, which changes the comparison below
+
+An overloaded worker with no queue limit does not shed, it accumulates. Offered four times what it
+could carry, one grew a two gigabyte managed heap and swung sixty percent between windows — those
+swings being collections rather than anything about the server's rate. Turning the limit on:
+
+| ten thousand players | no limit | limit of 2,000 |
+|---|---|---|
+| one worker | 27,357 pkt/s, 2,053 MB, 60% spread | **58,870 pkt/s, 187 MB, 9%** |
+| two workers | 48,856 pkt/s, 2,749 MB, 5% spread | **62,614 pkt/s, 218 MB, 8%** |
+
+Bounded memory, steady throughput, and **nothing dropped** — the mainloop's own limit was never
+reached. Nothing needed dropping, because the fan-out a full arena queue refuses runs on the mainloop
+instead: slower for that packet, free for the ones behind it. Now the default.
+
+**This changes what the worker comparison means.** With the queue bounded, adding a second worker is
+worth six percent rather than the seventy-eight the unbounded runs suggested — because in the one
+worker case the mainloop picks up the overflow and becomes a second fan-out thread in all but name:
+
+| | threads doing fan-out | throughput | per fan-out core |
+|---|---|---|---|
+| one worker + mainloop | 102% + 93% = 1.95 | 58,870 pkt/s | **30,190 pkt/s** |
+| two workers + mainloop | 103% + 103% + 40% = 2.46 | 62,614 pkt/s | **25,453 pkt/s** |
+
+Per core of fan-out, the arrangement without the second worker is sixteen percent better. The mainloop
+doing the work inline beats handing it to a worker, which is the handoff cost showing up from a
+direction none of the earlier experiments approached it from.
+
+### The comparison as it stood on unbounded queues
 
 Both worker counts can now be driven to the wall at the same load, which was impossible while the
 receive path, the connect burst, and then the write lock each ran out first. Same ten thousand clients,
@@ -1384,12 +1412,9 @@ than better. That measurement needs a second machine.
   data is written, and only dirty records need writing.
 - **The receive thread**, at 20% of a core at six thousand and climbing faster than anything else.
   It is a single thread, and sharding it is the plan's Phase 7.
-- **Backpressure, which the server does not currently apply.** Offered more than it can carry, it
-  queues the excess instead of refusing it: two gigabytes of managed heap in a run offered four times
-  what one worker could take, and throughput swinging by sixty percent as the collector works through
-  it. `ArenaLoop:MaxQueueDepth` and `Mainloop:MaxQueueDepth` both default to no limit and both exist
-  precisely for this. Turning them on is what makes an overloaded server degrade rather than thrash,
-  and it is also what would make the one worker figure above measurable properly.
+- **`Mainloop:MaxQueueDepth`, still unlimited.** The arena queue is bounded now and that was enough
+  here, because the overflow lands on the mainloop and the mainloop kept up. A load that overruns the
+  mainloop itself has not been produced yet, and until it is, the last line of shedding is untested.
 - **What four workers carry**, now that saturating one and two is possible. The 1.78 measured between
   one and two says the penalty costs capacity; whether it keeps costing the same at four is not known,
   and four workers need about a hundred thousand packets a second to reach the wall — which is what
