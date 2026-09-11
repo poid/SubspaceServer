@@ -95,6 +95,7 @@ namespace SS.Core.Modules.Scoring
             _commandManager.AddCommand("resetgame", Command_resetgame, arena);
 
             ad.BallsAdvisorToken = arena.RegisterAdvisor<IBallsAdvisor>(this);
+            ad.InterfaceToken = arena.RegisterInterface<IBallGamePoints>(this);
 
             return true;
         }
@@ -103,6 +104,9 @@ namespace SS.Core.Modules.Scoring
         {
             if (!arena.TryGetExtraData(_adKey, out ArenaData? ad))
                 return false;
+
+            if (ad.InterfaceToken is not null)
+                arena.UnregisterInterface(ref ad.InterfaceToken);
 
             arena.UnregisterAdvisor(ref ad.BallsAdvisorToken);
 
@@ -153,7 +157,12 @@ namespace SS.Core.Modules.Scoring
 
         bool IBallsAdvisor.AllowGoal(Arena arena, Player player, int ballId, TileCoordinates coordinates, ref BallData ballData)
         {
-            // Allow the goal if the tile is a goal and it can be scored on by the player's freq.
+            // A ball whose CustomGame bit is set is owned by another module; always allow it so its goal fires
+            // BallGoalCallback (which that module handles) and the ball respawns.
+            if (arena.TryGetExtraData(_adKey, out ArenaData? ad) && (ad.CustomGameMask & (1 << ballId)) != 0)
+                return true;
+
+            // Otherwise allow the goal if the tile is a goal and it can be scored on by the player's freq.
             _balls.GetGoalInfo(arena, player.Freq, coordinates, out bool isScoreable, out _);
             return isScoreable;
         }
@@ -180,14 +189,21 @@ namespace SS.Core.Modules.Scoring
             Description = "The minimum number of players who must be playing for soccer points to be awarded.")]
         [ConfigHelp<int>("Soccer", "MinTeams", ConfigScope.Arena, Default = 0,
             Description = "The minimum number of teams that must exist for soccer points to be awarded.")]
+        [ConfigHelp<int>("Soccer", "CustomGame", ConfigScope.Arena, Default = 0,
+            Description = """
+                A bitmask, indexed by ball id, of balls that this module should NOT score. For each such ball, another
+                module is expected to do its own goal handling (e.g. a PowerBall side-game). Bit 0 = ball 0. For a
+                single-ball arena, a value of 1 has the same effect as the old boolean 'custom game' flag. Note the
+                compatibility caveat for multi-ball arenas: previously any non-zero value meant "custom-game all balls",
+                whereas now a value of 1 excludes only ball 0 — set the mask bits for every ball you want excluded.
+                """)]
         private void Callback_ArenaAction(Arena arena, ArenaAction action)
         {
             if (!arena.TryGetExtraData(_adKey, out ArenaData? ad))
                 return;
 
             if (action == ArenaAction.Create
-                // TODO: || action == ArenaAction.ConfChanged
-                )
+                || action == ArenaAction.ConfChanged)
             {
                 ConfigHandle ch = arena.Cfg!;
                 ad.Mode = _configManager.GetEnum(ch, "Soccer", "Mode", SoccerMode.All);
@@ -197,10 +213,17 @@ namespace SS.Core.Modules.Scoring
                 ad.MinPlayers = _configManager.GetInt(ch, "Soccer", "MinPlayers", SoccerSettings.MinPlayers.Default);
                 ad.MinTeams = _configManager.GetInt(ch, "Soccer", "MinTeams", SoccerSettings.MinTeams.Default);
                 ad.IsFrequencyShipTypes = _configManager.GetInt(ch, "Misc", "FrequencyShipTypes", 0) != 0;
-                ad.IsCustomGame = _configManager.GetInt(ch, "Soccer", "CustomGame", 0) != 0;
+                ad.CustomGameMask = _configManager.GetInt(ch, "Soccer", "CustomGame", 0);
 
-                ad.IsStealPoints = ad.CapturePoints >= 0;
-                ResetTeamScores(ad);
+                // Steal scoring only applies when CapturePoints is positive. CapturePoints <= 0 means absolute scoring
+                // (0 would otherwise start every team with an empty pool, making it impossible to ever score).
+                ad.IsStealPoints = ad.CapturePoints > 0;
+
+                // Only reset the scores on Create. A ConfChanged fires on any arena config write (e.g. MultiPub
+                // changing game-type settings), and wiping the score mid-game would break "change the map but keep
+                // the game going". A new game resets scores via EndGame instead.
+                if (action == ArenaAction.Create)
+                    ResetTeamScores(ad);
             }
         }
 
@@ -209,14 +232,12 @@ namespace SS.Core.Modules.Scoring
             if (!arena.TryGetExtraData(_adKey, out ArenaData? ad))
                 return;
 
-            if (ad.IsCustomGame)
-                return; // custom soccer games do their own goal handling (e.g. scramble)
+            // A ball whose CustomGame bit is set is scored by another module (e.g. a PowerBall side-game).
+            if ((ad.CustomGameMask & (1 << ballId)) != 0)
+                return;
 
-            //if (!_balls.TryGetBallData(arena, ballId, out BallData ballData))
-            //return;
-
-            short scoringFreq = player.Freq; // TODO: investigate how ASSS has a value other than -1 when it accesses ballData.Freq;
-            if (scoringFreq < 0)
+            short scoringFreq = player.Freq;
+            if (scoringFreq < 0 || scoringFreq >= MaxTeams)
                 return;
 
             _balls.GetGoalInfo(arena, scoringFreq, goalCoordinates, out _, out short? ownerFreq);
@@ -318,8 +339,8 @@ namespace SS.Core.Modules.Scoring
             Args = "<freq 0 score> [<freq 1 score> [... [<freq 7 score>]]]",
             Description = """
                 Changes score of current soccer game, based on arguments. Only supports
-                first eight freqs, and arena must be in absolute scoring mode 
-                (Soccer:CapturePoints < 0).
+                first eight freqs, and arena must be in absolute scoring mode
+                (Soccer:CapturePoints <= 0).
                 """)]
         private void Command_setscore(ReadOnlySpan<char> commandName, ReadOnlySpan<char> parameters, Player player, ITarget target)
         {
@@ -335,7 +356,7 @@ namespace SS.Core.Modules.Scoring
 
             if (ad.IsStealPoints)
             {
-                _chat.SendMessage(player, "Arena must be using absolute scoring (Soccer:CapturePoints < 0).");
+                _chat.SendMessage(player, "Arena must be using absolute scoring (Soccer:CapturePoints <= 0).");
                 return;
             }
 
@@ -407,7 +428,11 @@ namespace SS.Core.Modules.Scoring
             if (ad.IsStealPoints
                 && (ad.Mode == SoccerMode.LeftRight || ad.Mode == SoccerMode.TopBottom))
             {
-                if (ad.TeamScores[(~freq) + 2] == 0)
+                // In a 2-team game the other team is (~freq)+2 (i.e. 1-freq). Guard the index in case a goal was
+                // scored on a freq >= 2 (which shouldn't happen in these modes but must not throw if it does).
+                int opponentFreq = (~freq) + 2;
+                if (opponentFreq >= 0 && opponentFreq < ad.TeamScores.Length
+                    && ad.TeamScores[opponentFreq] == 0)
                 {
                     // The opposing team doesn't have any points left.
                     EndGame(arena, ad, freq);
@@ -457,7 +482,7 @@ namespace SS.Core.Modules.Scoring
             {
                 _chat.SendArenaMessage(arena, ChatSound.Ding, $"Soccer game over.");
                 int points = RewardPoints(arena, freq);
-                _balls.EndGame(arena);
+                _balls.EndGame(arena, freq); // fires BallGameOver with the winning freq
                 ResetTeamScores(ad);
 
                 // Note: ASSS doesn't send score stats updates here because it relies on the IBalls.EndGame to end the 'game' interval,
@@ -487,7 +512,7 @@ namespace SS.Core.Modules.Scoring
                         }
                         else
                         {
-                            sb.Append($"SCORE: Even:{ad.TeamScores[0]} Odds:{ad.TeamScores[1]}");
+                            sb.Append($"SCORE: Evens:{ad.TeamScores[0]} Odds:{ad.TeamScores[1]}");
                         }
 
                         break;
@@ -513,6 +538,9 @@ namespace SS.Core.Modules.Scoring
                         // no score message
                         break;
                 }
+
+                if (sb.Length == 0)
+                    return;
 
                 if (player != null)
                     _chat.SendMessage(player, sb);
@@ -633,7 +661,7 @@ namespace SS.Core.Modules.Scoring
 
                 _chat.SendArenaMessage(arena, ChatSound.Ding, $"Soccer game over.");
 
-                _balls.EndGame(arena);
+                _balls.EndGame(arena); // fires BallGameOver
                 ResetTeamScores(ad);
             }
         }
@@ -660,6 +688,7 @@ namespace SS.Core.Modules.Scoring
         private class ArenaData : IResettable
         {
             public AdvisorRegistrationToken<IBallsAdvisor>? BallsAdvisorToken;
+            public InterfaceRegistrationToken<IBallGamePoints>? InterfaceToken;
 
             // settings
             public SoccerMode Mode;
@@ -670,7 +699,9 @@ namespace SS.Core.Modules.Scoring
             public int MinPlayers;
             public int MinTeams;
             public bool IsFrequencyShipTypes;
-            public bool IsCustomGame;
+
+            /// <summary>Bitmask, indexed by ball id, of balls this module should NOT score (another module owns them).</summary>
+            public int CustomGameMask;
 
             // state
             public readonly int[] TeamScores = new int[MaxTeams];
@@ -678,6 +709,7 @@ namespace SS.Core.Modules.Scoring
             public bool TryReset()
             {
                 BallsAdvisorToken = null;
+                InterfaceToken = null;
                 Mode = SoccerMode.All;
                 CapturePoints = 0;
                 IsStealPoints = false;
@@ -686,7 +718,7 @@ namespace SS.Core.Modules.Scoring
                 MinPlayers = 0;
                 MinTeams = 0;
                 IsFrequencyShipTypes = false;
-                IsCustomGame = false;
+                CustomGameMask = 0;
                 Array.Clear(TeamScores);
                 return true;
             }

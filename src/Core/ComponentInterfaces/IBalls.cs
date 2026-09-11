@@ -181,10 +181,11 @@ namespace SS.Core.ComponentInterfaces
         bool TrySpawnBall(Arena arena, int ballId);
 
         /// <summary>
-        /// Ends the ball game. This phases balls which will respawn.
+        /// Ends the ball game. This phases balls which will respawn. Fires <see cref="ComponentCallbacks.BallGameOverCallback"/>.
         /// </summary>
         /// <param name="arena">The arena to end the ball game for.</param>
-        void EndGame(Arena arena);
+        /// <param name="winnerFreq">The winning freq to report to <see cref="ComponentCallbacks.BallGameOverCallback"/>, or <c>-1</c> when the game ended with no single winner (timer, reset, etc.).</param>
+        void EndGame(Arena arena, short winnerFreq = -1);
 
         /// <summary>
         /// Records a goal for a ball, running the full server-side goal handling — goal advisors

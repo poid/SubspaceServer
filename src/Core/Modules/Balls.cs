@@ -166,7 +166,7 @@ namespace SS.Core.Modules
 
         [ConfigHelp<int>("Soccer", "NewGameDelay", ConfigScope.Arena, Default = -3000,
             Description = "How long to wait between games (in ticks). If this is negative, the actual delay is random, between zero and the absolute value.")]
-        void IBalls.EndGame(Arena arena)
+        void IBalls.EndGame(Arena arena, short winnerFreq)
         {
             if (arena == null)
                 return;
@@ -174,14 +174,19 @@ namespace SS.Core.Modules
             if (!arena.TryGetExtraData(_adKey, out ArenaData? ad))
                 return;
 
+            bool alreadyEnded;
             lock (ad.Lock)
             {
+                alreadyEnded = ad.GameEnded;
+
                 for (int i = 0; i < ad.BallCount; i++)
                 {
                     PhaseBall(arena, i);
                     ad.Balls[i].State = BallState.Waiting;
                     ad.Balls[i].Carrier = null;
                 }
+
+                ad.GameEnded = true;
 
                 int newGameDelay = _configManager.GetInt(arena.Cfg!, "Soccer", "NewGameDelay", SoccerSettings.NewGameDelay.Default);
                 if (newGameDelay < 0)
@@ -190,6 +195,15 @@ namespace SS.Core.Modules
                 for (int i = 0; i < ad.BallCount; i++)
                     ad.Balls[i].Time = ServerTick.Now + (uint)newGameDelay;
             }
+
+            // The ball game is over — notify subscribers. Fired after releasing EndGame's own ad.Lock (the other ball
+            // callbacks fire while holding it). A subscriber may still be under the lock re-entrantly when EndGame was
+            // reached from a locked path (e.g. a goal: HandleGoal -> BallGoal -> CheckGameOver -> EndGame); ad.Lock is
+            // reentrant so that is safe. Only fire on the active->ended transition, so a second EndGame in the same
+            // goal (e.g. a golden goal that also satisfies the win condition) doesn't fire BallGameOver twice.
+            // winnerFreq is -1 unless the caller (e.g. the scorer) reported a winning freq.
+            if (!alreadyEnded)
+                BallGameOverCallback.Fire(arena, arena, winnerFreq);
 
             IPersistExecutor? persistExecutor = _broker.GetInterface<IPersistExecutor>();
             if (persistExecutor != null)
@@ -1004,6 +1018,10 @@ namespace SS.Core.Modules
 
                 ad.BallCount = newBallCount;
 
+                // Dropping to zero balls stops the game (mirrors ASSS StopGame); the next spawn will fire BallGameStart.
+                if (newBallCount == 0)
+                    ad.GameEnded = true;
+
                 if (newBallCount > oldBallCount)
                 {
                     for (int i = oldBallCount; i < newBallCount; i++)
@@ -1122,6 +1140,13 @@ namespace SS.Core.Modules
                 d.Y = sy;
 
                 TryPlaceBall(arena, ballId, ref d);
+
+                // The first ball to spawn after a game-over (or stop) starts a new ball game. Mirrors ASSS SpawnBall.
+                if (ad.GameEnded)
+                {
+                    ad.GameEnded = false;
+                    BallGameStartCallback.Fire(arena, arena);
+                }
             }
 
             return true;
@@ -1217,7 +1242,7 @@ namespace SS.Core.Modules
 
             lock (ad.Lock)
             {
-                if (ballId > ad.BallCount)
+                if (ballId >= ad.BallCount)
                     return;
 
                 ref BallData bd = ref ad.Balls[ballId];
@@ -1453,6 +1478,13 @@ namespace SS.Core.Modules
             /// </summary>
             public bool BallCountOverridden;
 
+            /// <summary>
+            /// Whether the ball game has ended (or has not started yet). Set by <see cref="IBalls.EndGame"/> and whenever
+            /// the ball count drops to 0 (a game stop); cleared when a ball next spawns, which is the moment
+            /// <see cref="BallGameStartCallback"/> fires. Mirrors ASSS <c>balls.c</c>'s <c>gameEnded</c> flag.
+            /// </summary>
+            public bool GameEnded;
+
             #endregion
 
             public readonly Lock Lock = new();
@@ -1479,6 +1511,7 @@ namespace SS.Core.Modules
                     LastSendTime = default;
                     Settings = default;
                     BallCountOverridden = false;
+                    GameEnded = false;
                 }
 
                 return true;
