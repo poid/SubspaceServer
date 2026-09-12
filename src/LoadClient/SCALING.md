@@ -1598,20 +1598,38 @@ it, and references per core-second *fall*. The processor is spending time not is
 references — stalled longer on each miss, or waiting on something.
 
 Longer stalls for the same misses points at where the line comes from rather than how many there are.
-This is an EPYC Naples part with 8 MB of L3, and on that generation the L3 is not shared across the
-whole package: cores are grouped, and a line owned by a core in another group crosses the fabric.
-Eight vCPUs is plausibly two such groups, which four workers would span and two might not. That is a
-guess until the topology is read, and the next thing to do.
+The first guess was the fabric: this is an EPYC Naples part, and on that generation the L3 is not
+shared across a package but across a group of four cores, so a line owned by a core in another group
+crosses the interconnect. Eight vCPUs would be two such groups, which four workers might span and two
+might not.
+
+**The topology says no.** `shared_cpu_list` for the L3 is `0-7`, one cache for every processor, and
+`thread_siblings_list` is a single processor each, so there is no SMT either. Nothing here to span.
+
+That answer comes with a caveat which cannot be resolved from inside the guest: the machine reports
+8 MB of L3 for eight cores, where two real Naples groups would be 16 MB, so what the guest is shown is
+synthetic. The host may still be placing these vCPUs across groups, and neither reading the topology
+nor pinning inside the guest can see or change it. The hypothesis is untestable here rather than
+disproved — but it is also unactionable here, which matters more.
+
+What remains, and fits the numbers without needing any of that: the **working set grows with workers**,
+231 MB at one, 238 at two, 294 at four, against 8 MB of last level cache. A miss that used to be
+answered by another core's cache becomes a miss answered by memory, which is the same count of misses
+taking longer — exactly the shape measured. Whether that is buffers in flight or the collector giving
+each thread its own allocation budget is not established; the arena queues are nowhere near their 2,000
+item limit at 27% busy, so it is not backlog.
 
 ## What to watch next
 
-- **Read the L3 topology and pin to it.** `cat /sys/devices/system/cpu/cpu*/cache/index3/shared_cpu_list`.
-  If the eight vCPUs are two groups of four, then pinning the server to one group and the load
-  generator to the other tests the fabric explanation directly, and the answer would apply to how
-  arenas, connections and send threads should be grouped rather than merely how many of each to run.
-  This box has no SMT, so unlike the development machine a processor number is a core — but read
-  `thread_siblings_list` anyway before trusting that.
+- **The send thread count, re-measured at a load with headroom.** "Three are free" was measured on a
+  box that turned out to be about 94% busy, and at 1,600 clients two send threads run at 91% and make
+  83 passes a second against a nominal 100 — they are overrunning their interval in every
+  configuration above. This is the setting that decides how many players fit, so it is worth more than
+  anything left on the worker question.
 - **Why one worker makes the send threads dear**, which has nothing to do with how often they run.
+- **Whether the working set explains the four worker stalls**, since the topology did not. 294 MB
+  against 8 MB of last level cache, and the queues are not backlogged, so where the extra 56 MB comes
+  from is the question — buffers in flight, or the collector sizing per-thread budgets by thread count.
 - **Whole-machine utilisation during every run from here on.** Every measurement on the VPS records
   only what the server process used, so a cliff caused by running out of processors and a cliff caused
   by the code look identical. Idle time from `/proc/stat` across the `perf` window costs nothing and
