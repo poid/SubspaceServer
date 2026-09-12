@@ -1421,8 +1421,99 @@ second flowing back to the load generator — twice what it has ever sustained. 
 per packet to reach saturation at a lower packet rate makes the generator's receive side worse rather
 than better. That measurement needs a second machine.
 
+## On hardware with a real PMU: the threading penalty is more memory traffic, not worse memory
+
+Every cache explanation in this document up to here was a hypothesis that could not be tested, because
+WSL2 exposes no PMU — `/sys/bus/event_source/devices` has no `cpu` entry, so there is nothing for
+`perf` to read. The zone's VPS is 8 vCPUs of AMD EPYC under KVM with the counters exposed, and the
+comparison recorded at the end of the previous section has now been run there.
+
+The A/B is the send threads, not the arena workers. `ArenaLoop:Workers` was 2 in both runs. 2,000
+clients over 20 arenas, `--spread 16384`, 150 seconds, with `perf stat -e cache-misses,cache-references`
+attached to the server process for a 30 second window inside the settled part of the run.
+
+| | 2 send threads | 4 send threads | ratio |
+|---|---|---|---|
+| broadcast | 20,037 pkt/s | 19,995 pkt/s | 1.00 |
+| outgoing updates | 385,751/s | 383,790/s | 0.99 |
+| server processor | **2.93 cores** | **3.48 cores** | **1.19** |
+| cache references | 468.2 M/s | 560.8 M/s | 1.20 |
+| cache misses | 66.6 M/s | 76.8 M/s | 1.15 |
+| miss ratio | 14.23% | 13.70% | 0.96 |
+
+Identical delivered work, 19% more processor time. The counters move with the processor time and not
+with the work: **per outgoing update, four threads take 20% more cache references and 16% more misses**
+(1,213 → 1,461 references, 173 → 200 misses).
+
+The more informative normalisation is per core-second, and it is nearly flat — 159.8 M references and
+22.7 M misses per core-second at two threads, 161.1 M and 22.1 M at four. **The extra threads are not
+stalling more per unit of time; they are touching more memory for the same output.** Same instructions
+running slower would show as misses per core-second going up. It does not happen. That distinction was
+not available from any software instrument tried in this document.
+
+The miss *ratio* falling slightly is the detail that says where the extra references come from. If
+four threads simply had colder caches, references and misses would rise together and the ratio would
+hold or worsen. References rising faster than misses is the signature of lines that are fetched but
+found in another core's cache rather than in memory — coherence traffic. Which is the mechanism the
+arena worker section arrived at by elimination, now with a counter behind it.
+
+Where the 0.55 cores went, by thread:
+
+| | 2 threads | 4 threads | delta |
+|---|---|---|---|
+| send threads | 85 + 82 = 167% | 58 + 53 + 53 + 47 = 211% | **+44** |
+| arena workers | 51 + 50 = 101% | 56 + 55 = 111% | +10 |
+| receive + mainloop | 24% | 26% | +2 |
+
+**Both ends pay.** The producers got slower too, by a tenth of a core, without their own work changing
+at all — the arena workers write into the recipient's outgoing queue and there are now twice as many
+distinct threads consuming those lines.
+
+Per send thread the fit across the two points is 83.5% of a core for 1,000 players and 52.8% for 500,
+which is 22.1% constant plus 0.0614% per player owned. **That constant, if it is real, is the whole
+penalty**: two extra threads at 22% each is the 44 points. It is worth stating plainly that two points
+fit a straight line exactly and this is therefore not yet a measurement of a constant. The pass is a
+`Thread.Sleep` loop over the thread's own shard, so there is no spin to account for it, and the total
+player visits per second are the same in both runs. A three-thread run separates "each thread carries a
+fixed cost" from "the per-player cost rises as the shard shrinks"; nothing here does.
+
+### What this does not settle
+
+`ArenaLoop:Workers` was held at 2. The comparison named in `0ccc1ff` — one worker against four, same
+work, counters attached — has still not been run. The two penalties are the same shape and now share an
+explanation with hardware behind it, but the worker number itself is an extrapolation from the send
+threads until that run exists.
+
+`LLC-load-misses` and `LLC-store-misses` come back `<not supported>` under this hypervisor, so only the
+aggregate generic events are available, and what they map to on a virtualised EPYC is not certain
+enough to reason about absolute values. The ratios between two runs on the same box are the usable part.
+
+### Two measurements, one of which was worthless
+
+The first attempt ran `perf` by hand in a second terminal after the harness had already printed its
+results — by which time the harness has shut the server down. `pgrep` still found a process, so the
+window attached to a stray from an earlier run and recorded 957 M references against the 14,046 M the
+same configuration produces under load. The arithmetic caught it: 10 M references per core-second is
+one every 250 cycles, which is not what a busy server looks like.
+
+The fix was to stop doing it by hand. A wrapper starts the load test, waits for the fourth `position:`
+line in the server log, attaches `perf` to the running process for 30 seconds and then waits for the
+harness. The four-thread run had in fact been timed correctly the first time and reproduces to within
+7% on references and 4% on misses across the two attempts, which is the reason to trust the pair.
+
 ## What to watch next
 
+- **One arena worker against four, with the counters attached**, on the VPS. This is the run named in
+  `0ccc1ff` and the send thread A/B above is not a substitute for it.
+- **A three send thread run.** Two points cannot tell a per-thread constant from a per-player cost that
+  rises as shards shrink, and which of those it is decides whether more send threads are a fixed toll
+  worth paying at scale or a penalty that compounds.
+- **`Net:MaxSendThreads = 0` picks `ProcessorCount / 4` clamped to 1-8.** On the 8 vCPU VPS that is 2,
+  which the measurement above says is right. On a 32 vCPU machine it would be 8, and at 22% of a core
+  each that is nearly two cores of toll before a single packet is sent. The formula was never measured
+  against anything; it should be.
+- **The 38 errors logged in every VPS run**, which have been present in every run on that box and have
+  never been read.
 - **The four worker floor — deferred until the receive path is fixed, then revisit.** Spreading the
   same work over four workers costs 37% more processor time than one, and six interventions have each
   helped one worker and none helped four. It is not the work being done, not the objects being shared,
