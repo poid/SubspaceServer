@@ -1619,8 +1619,58 @@ taking longer — exactly the shape measured. Whether that is buffers in flight 
 each thread its own allocation budget is not established; the arena queues are nowhere near their 2,000
 item limit at 27% busy, so it is not backlog.
 
+## Threads are U shaped, and six is the bottom
+
+Adding the send thread count to the worker sweep, all at 1,600 clients over 16 arenas with the same
+instrumentation, and counting every thread that does continuous work — the arena workers, the send
+threads, the receive thread and the mainloop:
+
+| run | workers | send threads | busy threads | server processor | send | workers | references | misses | overruns |
+|---|---|---|---|---|---|---|---|---|---|
+| w1 | 1 | 2 | **5** | 2.78 cores | 182% | 75% | 463.0 M/s | 56.2 M/s | 1,063 |
+| **w2** | **2** | **2** | **6** | **2.39 cores** | **148%** | **71%** | **388.3 M/s** | **50.4 M/s** | 902 |
+| st3w2 | 2 | 3 | **7** | 2.82 cores | 175% | 82% | 444.2 M/s | 59.4 M/s | **471** |
+| w4 | 4 | 2 | **8** | 3.13 cores | 180% | 108% | 469.7 M/s | 61.7 M/s | 1,183 |
+
+Same work in every row — 16,004 to 16,016 packets a second, 289,000 to 291,000 updates delivered.
+
+**Six busy threads is the bottom of a U**, and it does not matter much which side the extra thread is
+added to: a seventh costs 18%, an eighth 31%. Server processor time and cache references move together
+across every row, which they did in the send thread comparison too.
+
+**"Three send threads are free" is withdrawn.** That was measured at 2,000 clients on a box later shown
+to be about 94% busy, where the machine rather than the setting was being measured. With headroom the
+third send thread costs 18% — the same as any other seventh thread. It does halve the overruns, 902 to
+471, so it buys latency; it does not buy capacity, and it is not free.
+
+**Adding a thread on either side makes both sides dearer.** The third send thread raised worker time
+from 71% to 82% as well as its own from 148% to 175%. Four workers raised send thread time from 148%
+to 180% as well as their own from 71% to 108%. Producers and consumers share the connection state and
+the buffers, and the cost lands on both.
+
+**One worker is the exception and is still unexplained.** It has the fewest busy threads of any row and
+is the second dearest, with the whole excess in the send threads, which do none of its work. Not
+because they run more often: 167 iterations a second against 166 at two workers. Batching is the
+suspect — `SendOutgoing` merges position packets that are already queued when it arrives
+(`Network.cs:4188`), so the producer's arrival pattern decides how much merging it does, and bytes per
+delivered update do vary with it: 21.7 at one worker, 23.2 at two, 22.4 at four. Suspect, not
+established.
+
+The arithmetic that makes it worth chasing: a send thread walks 800 connections 83.5 times a second,
+so 66,800 connection visits a second, and at 91% of a core that is **13.6 µs per connection** carrying
+about 2.2 queued packets of 22 bytes. Syscalls are not it — at roughly 20 updates packed into a
+datagram that is 7,250 sends a second per thread, under 2% of a core — and neither is the bandwidth
+limiter, whose `Iter` and `Check` are a few operations over a six integer array. Something per
+connection per pass costs far more than what it appears to do, and no amount of comparing runs will
+name it.
+
 ## What to watch next
 
+- **A sampled profile of one send thread at one worker against two**, which is now possible and is the
+  way to finish this. `scripts/loadtest/bash/profile-thread.sh` does it: hardware sampling at 999 Hz
+  against a single thread id, with `DOTNET_PerfMapEnabled=1` so managed frames resolve. The function
+  that is hot at one worker and not at two is the answer to the paragraph above. Do not reach for
+  `dotnet-trace` instead; it has already answered this class of question wrongly once.
 - **The send thread count, re-measured at a load with headroom.** "Three are free" was measured on a
   box that turned out to be about 94% busy, and at 1,600 clients two send threads run at 91% and make
   83 passes a second against a nominal 100 — they are overrunning their interval in every
