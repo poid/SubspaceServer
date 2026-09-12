@@ -1,0 +1,131 @@
+#!/bin/bash
+
+# Runs a load test and takes a hardware sampled profile of one server thread during it, resolving
+# JIT compiled frames.
+#
+# Why hardware sampling rather than dotnet-trace: dotnet-trace suspends threads at garbage collection
+# safe points, and safe points are not where time is spent. Asked where an arena worker's time went it
+# answered DateTime.UtcNow, at 95%, for a call costing 14 ns. perf samples on a counter overflow
+# wherever the processor happens to be, so it has no such bias - but it needs a machine that exposes a
+# PMU, which is why this could not be done on the development box.
+#
+# Usage:
+#   profile-thread.sh <label> <thread-name> [clients] [arenas] [duration] [extra load client args...]
+#
+# Examples:
+#   profile-thread.sh p-w1 Network-send-0 1600 16 150 --spread 16384
+#   profile-thread.sh p-w1 ArenaLoop-0 1600 16 150 --spread 16384
+#
+# The thread name is matched against /proc/<pid>/task/*/comm, which Linux truncates to 15 characters,
+# so a longer name should be given as its first 15.
+#
+# Environment:
+#   ZONE_DIR, LOADTEST_OUT   as loadtest.sh
+#   PERF_SECONDS             length of the sample window. Default: 30
+#   PERF_FREQ                samples per second. Default: 999, deliberately not 1000 so that the
+#                            sampling cannot lock step with anything running on a 1 ms period.
+
+set -u
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+OUT="${LOADTEST_OUT:-$REPO_ROOT/loadtest-results}"
+PERF_SECONDS="${PERF_SECONDS:-30}"
+PERF_FREQ="${PERF_FREQ:-999}"
+
+usage() {
+    grep '^#' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' | sed -n '2,26p'
+    exit 1
+}
+
+[ $# -lt 2 ] && usage
+
+LABEL="$1"
+THREAD_NAME="$2"
+CLIENTS="${3:-1600}"
+ARENAS="${4:-16}"
+DURATION="${5:-150}"
+shift $(( $# < 5 ? $# : 5 ))
+EXTRA=("$@")
+[ ${#EXTRA[@]} -eq 0 ] && EXTRA=(--spread 16384)
+
+SERVER_LOG="$OUT/${LABEL// /_}.server.log"
+PERF_DATA="$OUT/${LABEL// /_}.perf.data"
+PERF_TEXT="$OUT/${LABEL// /_}.perf.txt"
+
+if [ "$(pgrep -xc SubspaceServer || true)" -gt 0 ]; then
+    echo "A SubspaceServer is already running. Kill it first: pkill -x SubspaceServer" >&2
+    exit 1
+fi
+
+if ! sudo -v; then
+    echo "perf needs sudo, and it was refused." >&2
+    exit 1
+fi
+
+# Makes the runtime write /tmp/perf-<pid>.map, without which every managed frame reports as an
+# address in an anonymous mapping and the profile is unreadable. It must be set before the server
+# starts, which is why this wrapper exports it rather than the caller being asked to remember.
+export DOTNET_PerfMapEnabled=1
+
+mkdir -p "$OUT"
+rm -f "$SERVER_LOG"
+
+bash "$SCRIPT_DIR/loadtest.sh" "$LABEL" "$CLIENTS" "$ARENAS" "$DURATION" "${EXTRA[@]}" &
+LOADTEST_PID=$!
+
+windows=0
+while [ "$windows" -lt 4 ]; do
+    sleep 2
+    if ! kill -0 "$LOADTEST_PID" 2>/dev/null; then
+        echo "The load test exited before reaching steady state; see $SERVER_LOG" >&2
+        exit 1
+    fi
+    windows=0
+    [ -f "$SERVER_LOG" ] && windows=$(grep -c 'position: ' "$SERVER_LOG")
+done
+
+mapfile -t PIDS < <(pgrep -x SubspaceServer)
+if [ "${#PIDS[@]}" -ne 1 ]; then
+    echo "Expected exactly one SubspaceServer, found ${#PIDS[@]}. Not measuring." >&2
+    exit 1
+fi
+PID="${PIDS[0]}"
+
+TID=""
+for task in /proc/"$PID"/task/*; do
+    [ -r "$task/comm" ] || continue
+    if [ "$(cat "$task/comm")" = "$THREAD_NAME" ]; then
+        TID="$(basename "$task")"
+        break
+    fi
+done
+
+if [ -z "$TID" ]; then
+    echo "No thread named '$THREAD_NAME' in process $PID. Threads running now:" >&2
+    cat /proc/"$PID"/task/*/comm 2>/dev/null | sort -u >&2
+    kill "$LOADTEST_PID" 2>/dev/null
+    exit 1
+fi
+
+if [ ! -f "/tmp/perf-$PID.map" ]; then
+    echo "WARNING: /tmp/perf-$PID.map does not exist, so managed frames will not resolve." >&2
+    echo "         The server was probably started without DOTNET_PerfMapEnabled=1." >&2
+fi
+
+echo "=== profiling thread $THREAD_NAME (tid $TID) of $PID for $PERF_SECONDS s at $PERF_FREQ Hz ==="
+
+sudo perf record -F "$PERF_FREQ" --tid "$TID" -o "$PERF_DATA" -- sleep "$PERF_SECONDS"
+sudo chown "$(id -u):$(id -g)" "$PERF_DATA"
+
+# Reported while the process is alive, because the JIT map is keyed by pid and a later run's server
+# would be a different one.
+perf report -i "$PERF_DATA" --stdio --sort symbol --percent-limit 0.5 2>/dev/null > "$PERF_TEXT"
+
+echo
+echo "--- where $THREAD_NAME spent its time ---"
+sed -n '/^ *[0-9]/p' "$PERF_TEXT" | head -25
+echo
+echo "full profile: $PERF_TEXT"
+
+wait "$LOADTEST_PID"
