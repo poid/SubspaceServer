@@ -1536,8 +1536,82 @@ line in the server log, attaches `perf` to the running process for 30 seconds an
 harness. The four-thread run had in fact been timed correctly the first time and reproduces to within
 7% on references and 4% on misses across the two attempts, which is the reason to trust the pair.
 
+## The arena workers, with headroom and counters at last: two is the floor, and four is real
+
+The comparison owed since `0ccc1ff`. 1,600 clients over 16 arenas — chosen so the count divides evenly
+by one, two and four, since arenas are handed to workers round robin at creation (`ArenaLoop.cs:221`)
+— `--spread 16384`, send threads pinned at two so the adaptive supervisor could not vary them, and
+`perf` plus `/proc` over the same 30 second window inside the settled part of each run.
+
+| | 1 worker | 2 workers | 4 workers |
+|---|---|---|---|
+| broadcast | 16,016 pkt/s | 15,999 pkt/s | 16,005 pkt/s |
+| outgoing updates | 290,617/s | 289,563/s | 290,646/s |
+| **server processor** | 2.78 cores | **2.39 cores** | 3.13 cores |
+| send threads | 91 + 91 = **182%** | 74 + 74 = **148%** | 91 + 89 = **180%** |
+| arena workers | 75% | 36 + 35 = **71%** | 27 × 4 = **108%** |
+| receive + mainloop | 21% | 20% | 25% |
+| cache references | 463.0 M/s | 388.3 M/s | 469.7 M/s |
+| cache misses | 56.2 M/s | 50.4 M/s | 61.7 M/s |
+| send thread overruns | 1,063 | 902 | 1,183 |
+| working set | 231 MB | 238 MB | 294 MB |
+| **machine idle** | 1.32 cores | 2.49 cores | **1.65 cores** |
+
+**Two workers is a floor, not a compromise.** One costs 16% more processor time than two and four
+costs 31% more, for work that is identical to within a tenth of a percent. The default of two, which
+was picked for a different reason — that at one worker the mainloop was at 93% backfilling — turns out
+to be the measured optimum on this machine.
+
+**The four worker penalty is real and it is not the machine.** 1.65 cores were idle, so nothing was
+waiting for a processor. This is the first time the penalty has been measured with headroom and
+hardware counters at the same time, and it survives both. Worker processor time goes 71% → 108% for
+the same work, which is the same +50% shape seen on the development machine, and the send threads go
+up 32 points alongside it.
+
+### One worker is dear for a different reason than four
+
+The costs are not on the same thing. At four workers, **both** the workers and the send threads rise.
+At one worker the workers are *cheap* (75% against 71%, and it is one thread rather than two) and the
+whole of the excess is in the send threads, which do none of its work — 182% against 148%.
+
+The obvious explanation, that a single bursty producer makes the send threads pass over their shards
+more often, is **wrong**. Send thread iterations are 167 a second at one worker and 166 at two. Same
+passes, same sends, 34 points more processor time. It is the cost of a pass that changes, not their
+number. Note also that 167 across two threads is 83 each, against a nominal 100 — these threads are
+already overrunning their 10 ms interval at this load, in every configuration.
+
+### What the counters say about the four worker case
+
+Per outgoing update, against two workers as the baseline:
+
+| | 1 worker | 2 workers | 4 workers |
+|---|---|---|---|
+| references per update | 1,593 | 1,341 | 1,616 |
+| misses per update | 193.5 | 174.0 | 212.2 |
+| references per core-second | 166.5 M | 162.5 M | 150.1 M |
+| misses per core-second | 20.2 M | 21.1 M | 19.7 M |
+
+Four workers take 20% more references and 22% more misses per update, but **31% more processor time**.
+That gap is the new information. Where the send thread comparison showed processor time and memory
+traffic rising together, here processor time rises faster than the traffic that is supposed to explain
+it, and references per core-second *fall*. The processor is spending time not issuing memory
+references — stalled longer on each miss, or waiting on something.
+
+Longer stalls for the same misses points at where the line comes from rather than how many there are.
+This is an EPYC Naples part with 8 MB of L3, and on that generation the L3 is not shared across the
+whole package: cores are grouped, and a line owned by a core in another group crosses the fabric.
+Eight vCPUs is plausibly two such groups, which four workers would span and two might not. That is a
+guess until the topology is read, and the next thing to do.
+
 ## What to watch next
 
+- **Read the L3 topology and pin to it.** `cat /sys/devices/system/cpu/cpu*/cache/index3/shared_cpu_list`.
+  If the eight vCPUs are two groups of four, then pinning the server to one group and the load
+  generator to the other tests the fabric explanation directly, and the answer would apply to how
+  arenas, connections and send threads should be grouped rather than merely how many of each to run.
+  This box has no SMT, so unlike the development machine a processor number is a core — but read
+  `thread_siblings_list` anyway before trusting that.
+- **Why one worker makes the send threads dear**, which has nothing to do with how often they run.
 - **Whole-machine utilisation during every run from here on.** Every measurement on the VPS records
   only what the server process used, so a cliff caused by running out of processors and a cliff caused
   by the code look identical. Idle time from `/proc/stat` across the `perf` window costs nothing and
