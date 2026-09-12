@@ -73,6 +73,15 @@ else
     echo "WARNING: no global.conf at $GLOBAL_CONF; set ZONE_DIR if the zone is elsewhere." >&2
 fi
 
+# Authenticate now rather than at the point of measurement. A password prompt between the two
+# /proc readings lands inside the window they bracket, and the processor time the server accumulates
+# while somebody types is then divided by the window length as if it had happened during it. That
+# reported 8.07 cores for a server using 2.78.
+if ! sudo -v; then
+    echo "perf needs sudo, and it was refused." >&2
+    exit 1
+fi
+
 rm -f "$SERVER_LOG"
 
 bash "$SCRIPT_DIR/loadtest.sh" "$LABEL" "$CLIENTS" "$ARENAS" "$DURATION" "${EXTRA[@]}" &
@@ -113,11 +122,21 @@ echo "=== attaching to $PID at steady state, $PERF_SECONDS s ==="
 
 read -ra CPU_BEFORE < /proc/stat
 PROC_BEFORE="$(process_ticks "$PID")"
+WALL_BEFORE="$(date +%s%N)"
 
 sudo perf stat -e cache-misses,cache-references -p "$PID" -- sleep "$PERF_SECONDS"
 
+WALL_AFTER="$(date +%s%N)"
 PROC_AFTER="$(process_ticks "$PID")"
 read -ra CPU_AFTER < /proc/stat
+
+# Divide by the window that was actually bracketed, not the one that was asked for, so that anything
+# stretching it produces a figure that is still true rather than one that is quietly inflated.
+ELAPSED="$(echo "scale=3; ($WALL_AFTER - $WALL_BEFORE) / 1000000000" | bc)"
+if [ "$(echo "$ELAPSED > $PERF_SECONDS * 11 / 10" | bc)" -eq 1 ]; then
+    echo "WARNING: the readings bracket ${ELAPSED}s but perf counted ${PERF_SECONDS}s." >&2
+    echo "         The core figures below cover the longer window; the counters do not." >&2
+fi
 
 # Fields 1..8 are user nice system idle iowait irq softirq steal. guest and guest_nice are already
 # counted inside user and nice, so including them would double count.
@@ -131,17 +150,23 @@ nproc_count="$(nproc)"
 clk_tck="$(getconf CLK_TCK)"
 
 machine_cores="$(echo "scale=2; ($total - $idle) * $nproc_count / $total" | bc)"
-server_cores="$(echo "scale=2; ($PROC_AFTER - $PROC_BEFORE) / $clk_tck / $PERF_SECONDS" | bc)"
+server_cores="$(echo "scale=2; ($PROC_AFTER - $PROC_BEFORE) / $clk_tck / $ELAPSED" | bc)"
+idle_cores="$(echo "scale=2; $nproc_count - $machine_cores" | bc)"
 
 echo
-echo "--- the whole machine over the same $PERF_SECONDS s ---"
+echo "--- the whole machine over the same window ---"
 printf 'server %s cores, everything else %s, idle %s of %s vCPUs (steal %s%%)\n' \
     "$server_cores" \
     "$(echo "scale=2; $machine_cores - $server_cores" | bc)" \
-    "$(echo "scale=2; $nproc_count - $machine_cores" | bc)" \
+    "$idle_cores" \
     "$nproc_count" \
     "$(echo "scale=1; $steal * 100 / $total" | bc)"
-echo "Idle near zero means the machine ran out of processors and the comparison measures the"
-echo "machine rather than the change being tested. The load generator runs here too."
+
+if [ "$(echo "$idle_cores < 1" | bc)" -eq 1 ]; then
+    echo
+    echo "WARNING: under one core idle. This run measures where the machine ran out of processors,"
+    echo "         not the change being tested. The load generator runs here too and at this load it"
+    echo "         costs more than the server does. Lower the client count or move it to another box."
+fi
 
 wait "$LOADTEST_PID"
