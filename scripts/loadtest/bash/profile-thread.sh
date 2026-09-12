@@ -68,6 +68,16 @@ fi
 # starts, which is why this wrapper exports it rather than the caller being asked to remember.
 export DOTNET_PerfMapEnabled=1
 
+# Say what is actually being measured, so a label cannot misdescribe a run. Two profiles were once
+# taken of configurations that differed in a second setting left over from the run before.
+GLOBAL_CONF="${ZONE_DIR:-$REPO_ROOT/src/SubspaceServer/Zone}/conf/global.conf"
+if [ -f "$GLOBAL_CONF" ]; then
+    echo "config: $(grep -E '^[[:space:]]*(SendThreads|MaxSendThreads|Workers|HandlePacketsOnArenaThread)[[:space:]]*=' \
+        "$GLOBAL_CONF" | tr -s ' ' | paste -sd'; ' -)"
+else
+    echo "WARNING: no global.conf at $GLOBAL_CONF; set ZONE_DIR if the zone is elsewhere." >&2
+fi
+
 mkdir -p "$OUT"
 rm -f "$SERVER_LOG"
 
@@ -116,16 +126,33 @@ fi
 echo "=== profiling thread $THREAD_NAME (tid $TID) of $PID for $PERF_SECONDS s at $PERF_FREQ Hz ==="
 
 sudo perf record -F "$PERF_FREQ" --tid "$TID" -o "$PERF_DATA" -- sleep "$PERF_SECONDS"
-sudo chown "$(id -u):$(id -g)" "$PERF_DATA"
 
 # Reported while the process is alive, because the JIT map is keyed by pid and a later run's server
-# would be a different one.
-perf report -i "$PERF_DATA" --stdio --sort symbol --percent-limit 0.5 2>/dev/null > "$PERF_TEXT"
+# would be a different one. Under sudo, because /proc/kallsyms is restricted to root on a default
+# kernel and without it every kernel frame reports as a bare address.
+{
+    echo "=== by library ==="
+    sudo perf report -i "$PERF_DATA" --stdio --sort dso --percent-limit 0.4 2>/dev/null
+    echo
+    echo "=== by library and symbol ==="
+    sudo perf report -i "$PERF_DATA" --stdio --sort dso,symbol --percent-limit 0.4 2>/dev/null
+} > "$PERF_TEXT"
+sudo chown "$(id -u):$(id -g)" "$PERF_DATA" "$PERF_TEXT"
 
 echo
-echo "--- where $THREAD_NAME spent its time ---"
-sed -n '/^ *[0-9]/p' "$PERF_TEXT" | head -25
+echo "--- which library $THREAD_NAME spent its time in ---"
+sed -n '/^=== by library ===/,/^=== by library and symbol ===/p' "$PERF_TEXT" | sed -n '/^ *[0-9]/p' | head -12
+echo
+echo "--- and where in it ---"
+sed -n '/^=== by library and symbol ===/,$p' "$PERF_TEXT" | sed -n '/^ *[0-9]/p' | head -20
 echo
 echo "full profile: $PERF_TEXT"
+
+if ! grep -q 'perf-.*\.map' "$PERF_TEXT"; then
+    echo
+    echo "NOTE: no JIT map appears in the profile, so managed frames are unresolved. If most of the"
+    echo "      time is in libcoreclr.so with no symbols, install the runtime's debug symbols to name"
+    echo "      them; if it is in the kernel, the symbols are already there now that report runs as root."
+fi
 
 wait "$LOADTEST_PID"
