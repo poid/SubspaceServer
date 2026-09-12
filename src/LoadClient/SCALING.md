@@ -1421,7 +1421,7 @@ second flowing back to the load generator — twice what it has ever sustained. 
 per packet to reach saturation at a lower packet rate makes the generator's receive side worse rather
 than better. That measurement needs a second machine.
 
-## On hardware with a real PMU: the threading penalty is more memory traffic, not worse memory
+## On hardware with a real PMU: a cliff at four send threads, and it is probably the box
 
 Every cache explanation in this document up to here was a hypothesis that could not be tested, because
 WSL2 exposes no PMU — `/sys/bus/event_source/devices` has no `cpu` entry, so there is nothing for
@@ -1432,57 +1432,92 @@ The A/B is the send threads, not the arena workers. `ArenaLoop:Workers` was 2 in
 clients over 20 arenas, `--spread 16384`, 150 seconds, with `perf stat -e cache-misses,cache-references`
 attached to the server process for a 30 second window inside the settled part of the run.
 
-| | 2 send threads | 4 send threads | ratio |
+| | 2 send threads | 3 send threads | 4 send threads |
 |---|---|---|---|
-| broadcast | 20,037 pkt/s | 19,995 pkt/s | 1.00 |
-| outgoing updates | 385,751/s | 383,790/s | 0.99 |
-| server processor | **2.93 cores** | **3.48 cores** | **1.19** |
-| cache references | 468.2 M/s | 560.8 M/s | 1.20 |
-| cache misses | 66.6 M/s | 76.8 M/s | 1.15 |
-| miss ratio | 14.23% | 13.70% | 0.96 |
+| broadcast | 20,037 pkt/s | 20,007 pkt/s | 19,995 pkt/s |
+| outgoing updates | 385,751/s | 383,449/s | 383,790/s |
+| server processor | **2.93 cores** | **2.94 cores** | **3.48 cores** |
+| busiest send thread | 85% | 61% | 58% |
+| cache references | 468.2 M/s | 488.7 M/s | 560.8 M/s |
+| cache misses | 66.6 M/s | 68.2 M/s | 76.8 M/s |
+| miss ratio | 14.23% | 13.95% | 13.70% |
 
-Identical delivered work, 19% more processor time. The counters move with the processor time and not
-with the work: **per outgoing update, four threads take 20% more cache references and 16% more misses**
-(1,213 → 1,461 references, 173 → 200 misses).
+**The third thread is free and the fourth is not.** Two and three threads cost the same processor time
+to the hundredth of a core, while the busiest thread falls from 85% of its interval to 61%. The step
+to four costs 19%.
 
-The more informative normalisation is per core-second, and it is nearly flat — 159.8 M references and
-22.7 M misses per core-second at two threads, 161.1 M and 22.1 M at four. **The extra threads are not
-stalling more per unit of time; they are touching more memory for the same output.** Same instructions
-running slower would show as misses per core-second going up. It does not happen. That distinction was
-not available from any software instrument tried in this document.
+The counters track the processor time exactly at all three points. Per outgoing update: 1,214 → 1,275
+→ 1,461 references, 173 → 178 → 200 misses. So the relationship established below holds — the work
+being done and the memory being touched move together — but it is a cliff between three and four
+threads, not a cost per thread.
 
-The miss *ratio* falling slightly is the detail that says where the extra references come from. If
-four threads simply had colder caches, references and misses would rise together and the ratio would
-hold or worsen. References rising faster than misses is the signature of lines that are fetched but
-found in another core's cache rather than in memory — coherence traffic. Which is the mechanism the
-arena worker section arrived at by elimination, now with a counter behind it.
+Per core-second the counters are flat across all three: 159.8, 166.3, 161.1 M references and 22.7,
+23.2, 22.1 M misses. **The threads are not stalling more per unit of time; the four-thread
+configuration touches more memory for the same output.** Same instructions running slower would show
+as misses per core-second going up, and that does not happen at any of the three points.
 
-Where the 0.55 cores went, by thread:
+The miss *ratio* falls monotonically, 14.23 → 13.95 → 13.70%. Colder caches would raise references and
+misses together and hold or worsen the ratio. References rising faster than misses is the signature of
+lines fetched but found in another core's cache rather than in memory.
 
-| | 2 threads | 4 threads | delta |
+Where the processor time went, by thread:
+
+| | 2 threads | 3 threads | 4 threads |
 |---|---|---|---|
-| send threads | 85 + 82 = 167% | 58 + 53 + 53 + 47 = 211% | **+44** |
-| arena workers | 51 + 50 = 101% | 56 + 55 = 111% | +10 |
-| receive + mainloop | 24% | 26% | +2 |
+| send threads | 85 + 82 = **167%** | 61 + 60 + 55 = **176%** | 58+53+53+47 = **211%** |
+| arena workers | 51 + 50 = 101% | 48 + 47 = 95% | 56 + 55 = 111% |
+| receive + mainloop | 24% | 23% | 26% |
 
-**Both ends pay.** The producers got slower too, by a tenth of a core, without their own work changing
-at all — the arena workers write into the recipient's outgoing queue and there are now twice as many
-distinct threads consuming those lines.
+The arena workers get *cheaper* at three threads and dearer at four, which no story about the send
+threads alone explains — the producers are being affected by something that only appears at four.
 
-Per send thread the fit across the two points is 83.5% of a core for 1,000 players and 52.8% for 500,
-which is 22.1% constant plus 0.0614% per player owned. **That constant, if it is real, is the whole
-penalty**: two extra threads at 22% each is the 44 points. It is worth stating plainly that two points
-fit a straight line exactly and this is therefore not yet a measurement of a constant. The pass is a
-`Thread.Sleep` loop over the thread's own shard, so there is no spin to account for it, and the total
-player visits per second are the same in both runs. A three-thread run separates "each thread carries a
-fixed cost" from "the per-player cost rises as the shard shrinks"; nothing here does.
+### The four-thread cliff is most likely the machine, not the code
+
+The two-point fit recorded here first — 22.1% of a core constant per thread plus 0.0614% per player —
+predicted 3.15 cores at three threads. The measurement is 2.94. **There is no per-thread constant.**
+Refitting on the two-and-three-thread points gives 9.0% plus 0.0745% per player, which predicts 46.3%
+per thread at four and measures 52.8%: the four-thread run is 6.5 points per thread above its own
+trend line.
+
+What is special about four is the box. `loadtest.sh` runs the load generator on the same machine, and
+2,000 clients receiving 379,000 updates a second is not cheap. At three send threads the server's hot
+threads are 3 send + 2 arena + receive + mainloop = 7 on 8 vCPUs; at four they are 8, before the
+generator, the garbage collector, the reliable thread and the sized send thread are counted.
+
+The variance says the same thing. Three runs of the four-thread configuration cost 3.48, 3.64 and 4.33
+cores; two runs of the two-thread configuration cost 2.93 and 3.09. A contended machine gives noisy
+numbers; a fixed toll would not.
+
+So the honest reading is that this pair measures **where this VPS runs out of processors while also
+generating its own load**, and the coherence signature in the counters is what oversubscription looks
+like from inside the process — threads descheduled, migrated, and refilling caches. It is not proof of
+an intrinsic cost to running more send threads, and the three-thread point is evidence against one.
+
+### What this means for the setting
+
+On this box **three send threads is strictly better than two**: the same processor time, and the
+busiest thread drops from 85% of its interval to 61%. The send threads were the binding constraint at
+two — at 85% they are close to overrunning, and an overrun means outgoing data going out late — so
+the third thread buys roughly 40% more population headroom for nothing. `Net:MaxSendThreads = 3`.
+
+Refitting capacity on the honest points: a send thread saturates near 1,220 players owned, and the
+server costs about `0.09 × threads + 0.00134 × players` cores. Three threads reach about 3,700 players
+at 5.2 cores. Beyond that this box cannot both serve and generate, so the population sweep needs the
+generator moved off it.
 
 ### What this does not settle
 
 `ArenaLoop:Workers` was held at 2. The comparison named in `0ccc1ff` — one worker against four, same
-work, counters attached — has still not been run. The two penalties are the same shape and now share an
-explanation with hardware behind it, but the worker number itself is an extrapolation from the send
-threads until that run exists.
+work, counters attached — has still not been run, and the three-thread result above is a reason not to
+assume the answer. The arena worker penalty was measured on a machine with 32 logical processors at
+73%, 89% and 100% of a core for one, two and four workers, which is nowhere near filling it, so
+whatever explains the four-send-thread cliff on an 8 vCPU box does not obviously explain that. **They
+are two open questions, not one**, and this section should not be read as having closed either.
+
+Nothing here separates oversubscription from an intrinsic cost, because no run recorded what the whole
+machine was doing — only what the server process was doing. Server processor time and the server's own
+cache counters both look the same whether the server is slow because of coherence traffic or slow
+because it is being descheduled.
 
 `LLC-load-misses` and `LLC-store-misses` come back `<not supported>` under this hypervisor, so only the
 aggregate generic events are available, and what they map to on a virtualised EPYC is not certain
@@ -1503,15 +1538,18 @@ harness. The four-thread run had in fact been timed correctly the first time and
 
 ## What to watch next
 
+- **Whole-machine utilisation during every run from here on.** Every measurement on the VPS records
+  only what the server process used, so a cliff caused by running out of processors and a cliff caused
+  by the code look identical. Idle time from `/proc/stat` across the `perf` window costs nothing and
+  would have answered the four-thread question in the first run rather than the third.
+- **Moving the load generator off the box.** 2,000 clients receiving 379,000 updates a second share
+  8 vCPUs with the server, so the ceiling being measured is the pair, not the server. Nothing above
+  3,000 players is worth measuring on this box until that is fixed.
 - **One arena worker against four, with the counters attached**, on the VPS. This is the run named in
   `0ccc1ff` and the send thread A/B above is not a substitute for it.
-- **A three send thread run.** Two points cannot tell a per-thread constant from a per-player cost that
-  rises as shards shrink, and which of those it is decides whether more send threads are a fixed toll
-  worth paying at scale or a penalty that compounds.
 - **`Net:MaxSendThreads = 0` picks `ProcessorCount / 4` clamped to 1-8.** On the 8 vCPU VPS that is 2,
-  which the measurement above says is right. On a 32 vCPU machine it would be 8, and at 22% of a core
-  each that is nearly two cores of toll before a single packet is sent. The formula was never measured
-  against anything; it should be.
+  and 3 measures better — same processor time, 24 points more headroom on the busiest thread. The
+  formula has never been measured against anything on any machine.
 - **The 38 errors logged in every VPS run**, which have been present in every run on that box and have
   never been read.
 - **The four worker floor — deferred until the receive path is fixed, then revisit.** Spreading the
