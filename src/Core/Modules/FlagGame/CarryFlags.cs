@@ -25,6 +25,7 @@ namespace SS.Core.Modules.FlagGame
         private readonly IArenaManager _arenaManager;
         private readonly IConfigManager _configManager;
         private readonly ILogManager _logManager;
+        private readonly IMainloop _mainloop;
         private readonly IMainloopTimer _mainloopTimer;
         private readonly IMapData _mapData;
         private readonly INetwork _network;
@@ -37,12 +38,22 @@ namespace SS.Core.Modules.FlagGame
 
         private ArenaDataKey<ArenaData> _adKey;
 
+        /// <summary>
+        /// For firing <see cref="FlagGameResetCallback"/> on the mainloop.
+        /// </summary>
+        /// <remarks>
+        /// Assigned in <see cref="IModule.Load"/> rather than initialized with the field, because a field
+        /// initializer cannot bind a delegate to an instance method.
+        /// </remarks>
+        private Action<FlagGameReset>? _mainloopWork_FireFlagGameReset;
+
         private readonly DefaultCarryFlagBehavior _defaultCarryFlagBehavior;
 
         public CarryFlags(
             IArenaManager arenaManager,
             IConfigManager configManager,
             ILogManager logManager,
+            IMainloop mainloop,
             IMainloopTimer mainloopTimer,
             IMapData mapData,
             INetwork network,
@@ -51,6 +62,7 @@ namespace SS.Core.Modules.FlagGame
             _arenaManager = arenaManager ?? throw new ArgumentNullException(nameof(arenaManager));
             _configManager = configManager ?? throw new ArgumentNullException(nameof(configManager));
             _logManager = logManager ?? throw new ArgumentNullException(nameof(logManager));
+            _mainloop = mainloop ?? throw new ArgumentNullException(nameof(mainloop));
             _mainloopTimer = mainloopTimer ?? throw new ArgumentNullException(nameof(mainloopTimer));
             _mapData = mapData ?? throw new ArgumentNullException(nameof(mapData));
             _network = network ?? throw new ArgumentNullException(nameof(network));
@@ -66,6 +78,7 @@ namespace SS.Core.Modules.FlagGame
             _chatNetwork = broker.GetInterface<IChatNetwork>();
 
             _adKey = _arenaManager.AllocateArenaData<ArenaData>();
+            _mainloopWork_FireFlagGameReset = MainloopWork_FireFlagGameReset;
 
             _network.AddPacket(C2SPacketType.TouchFlag, Packet_TouchFlag);
             _network.AddPacket(C2SPacketType.DropFlags, Packet_DropFlags);
@@ -780,7 +793,23 @@ namespace SS.Core.Modules.FlagGame
 
             ad.GameState = GameState.Stopped;
 
-            FlagGameResetCallback.Fire(arena, arena, winnerFreq, points);
+            // The reset reaches handlers registered zone-wide: the Game module respawning the winning
+            // team and the stats module scoring the game, both written for the mainloop. A reset that
+            // begins on an arena thread, which a flag drop or a touch does when
+            // Net:HandlePacketsOnArenaThread is on and the game ends on it, hands the firing to the
+            // mainloop rather than running them here. From the mainloop it fires in place, as it always
+            // has, so the timer and command paths are unchanged. Found by the threading assertion, on
+            // the first load test that dropped flags on the arena thread.
+            if (ArenaLoop.IsArenaWorkerThread)
+            {
+                Action<FlagGameReset>? mainloopWork = _mainloopWork_FireFlagGameReset;
+                if (mainloopWork is not null)
+                    _mainloop.QueueMainWorkItem(mainloopWork, new FlagGameReset(arena, winnerFreq, points));
+            }
+            else
+            {
+                FlagGameResetCallback.Fire(arena, arena, winnerFreq, points);
+            }
 
             bool started = false;
 
@@ -796,6 +825,18 @@ namespace SS.Core.Modules.FlagGame
             // Instead of being done here, it's in the SS.Core.Modules.FlagGamePoints scoring module.
 
             return started;
+        }
+
+        /// <summary>
+        /// Fires the flag game reset callback, for a reset that happened on an arena thread.
+        /// </summary>
+        /// <remarks>
+        /// Not re-validated on arrival. The handlers pick out the arena's players themselves, so a reset
+        /// for an arena that has since emptied or gone reaches nobody.
+        /// </remarks>
+        private void MainloopWork_FireFlagGameReset(FlagGameReset reset)
+        {
+            FlagGameResetCallback.Fire(reset.Arena, reset.Arena, reset.WinnerFreq, reset.Points);
         }
 
         private void AdjustCarriedFlags(Arena? arena, Player player, AdjustFlagReason reason)
@@ -831,6 +872,11 @@ namespace SS.Core.Modules.FlagGame
         }
 
         #region Helper types
+
+        /// <summary>
+        /// A flag game reset carried from an arena thread to the mainloop, for firing the callback there.
+        /// </summary>
+        private readonly record struct FlagGameReset(Arena Arena, short WinnerFreq, int Points);
 
         private class Settings : ICarryFlagSettings
         {
