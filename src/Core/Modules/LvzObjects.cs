@@ -1208,7 +1208,7 @@ namespace SS.Core.Modules
             }
         }
 
-        private class ArenaData : IResettable
+        private sealed class ArenaData : IResettable
         {
             public readonly List<LvzData> List = [];
 
@@ -1244,7 +1244,7 @@ namespace SS.Core.Modules
             }
         }
 
-        private class PlayerData : IResettable
+        private sealed class PlayerData : IResettable
         {
             public BroadcastAuthorization Permission = BroadcastAuthorization.None;
 

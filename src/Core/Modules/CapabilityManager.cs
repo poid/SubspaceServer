@@ -466,7 +466,7 @@ namespace SS.Core.Modules
             Temp,
         }
 
-        private class PlayerData : IResettable
+        private sealed class PlayerData : IResettable
         {
             /// <summary>
             /// The player's current group.

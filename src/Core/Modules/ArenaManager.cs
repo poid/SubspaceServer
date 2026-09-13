@@ -2159,7 +2159,7 @@ namespace SS.Core.Modules
 
         #region Helper types
 
-        private class SpawnLoc(short x, short y) : IResettable
+        private sealed class SpawnLoc(short x, short y) : IResettable
         {
             public short X = x;
             public short Y = y;
@@ -2176,7 +2176,7 @@ namespace SS.Core.Modules
             }
         }
 
-        private class ArenaData : IResettable
+        private sealed class ArenaData : IResettable
         {
             /// <summary>
             /// counter for the # of holds on the arena

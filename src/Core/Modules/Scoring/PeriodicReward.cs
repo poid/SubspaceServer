@@ -382,7 +382,7 @@ namespace SS.Core.Modules.Scoring
 
         #region Helper types
 
-        private class ArenaData : IResettable
+        private sealed class ArenaData : IResettable
         {
             public Settings? Settings;
             public bool TimerRunning;

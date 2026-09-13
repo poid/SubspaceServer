@@ -183,7 +183,7 @@ namespace SS.Core.Modules
             public int Interval { get; }
         }
 
-        private class ArenaData : IResettable
+        private sealed class ArenaData : IResettable
         {
             public string? GreetMessage;
             public readonly List<PeriodicMessage> PeriodicMessageList = new(10);

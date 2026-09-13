@@ -180,7 +180,7 @@ namespace SS.Core.Modules.Scoring
 
         #region Helper types
 
-        private class ArenaData : IResettable
+        private sealed class ArenaData : IResettable
         {
             // settings
             public int FixedKillReward;

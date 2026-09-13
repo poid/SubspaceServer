@@ -1394,7 +1394,7 @@ namespace SS.Core.Modules.Scoring
             All = 3,
         }
 
-        private class PlayerData : IResettable
+        private sealed class PlayerData : IResettable
         {
             public readonly Dictionary<PersistInterval, SortedDictionary<int, BaseStatInfo>> CurrentArenaStats = new()
             {

@@ -484,7 +484,7 @@ namespace SS.Core.Modules
             public double NoFlags;
         }
 
-        private class ArenaLagLimits : IResettable
+        private sealed class ArenaLagLimits : IResettable
         {
             /// <summary>
             /// Limits for average ping.
@@ -534,7 +534,7 @@ namespace SS.Core.Modules
             }
         }
 
-        private class PlayerData : IResettable
+        private sealed class PlayerData : IResettable
         {
             /// <summary>
             /// When the last lag check was performed.

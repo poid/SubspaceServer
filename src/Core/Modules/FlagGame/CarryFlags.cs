@@ -985,7 +985,7 @@ namespace SS.Core.Modules.FlagGame
             }
         }
 
-        private class ArenaData : IResettable
+        private sealed class ArenaData : IResettable
         {
             public InterfaceRegistrationToken<IFlagGame>? FlagGameRegistrationToken;
             public InterfaceRegistrationToken<ICarryFlagGame>? CarryFlagGameRegistrationToken;

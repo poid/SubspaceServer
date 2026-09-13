@@ -178,7 +178,7 @@ namespace SS.Core.Modules.Enforcers
 
         #region Helper types
 
-        private class ArenaData : IResettable
+        private sealed class ArenaData : IResettable
         {
             public AdvisorRegistrationToken<IFreqManagerEnforcerAdvisor>? AdvisorToken = null;
 
@@ -200,7 +200,7 @@ namespace SS.Core.Modules.Enforcers
             }
         }
 
-        private class PlayerData : IResettable
+        private sealed class PlayerData : IResettable
         {
             public DateTime? LastChange = null;
 

@@ -661,7 +661,7 @@ namespace SS.Core.Modules.FlagGame
             public DateTime LastSendTimestamp;
         }
 
-        private class ArenaData : IResettable
+        private sealed class ArenaData : IResettable
         {
             public InterfaceRegistrationToken<IFlagGame>? FlagGameRegistrationToken;
             public InterfaceRegistrationToken<IStaticFlagGame>? StaticFlagGameRegistrationToken;

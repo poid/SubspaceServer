@@ -1937,7 +1937,7 @@ namespace SS.Core.Modules
 
         #endregion
 
-        private class PlayerData : IResettable
+        private sealed class PlayerData : IResettable
         {
             public uint BillingUserId;
             public TimeSpan Usage;

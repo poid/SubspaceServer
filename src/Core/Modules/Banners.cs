@@ -365,7 +365,7 @@ namespace SS.Core.Modules
             PendingClear,
         }
 
-        private class PlayerData : IResettable
+        private sealed class PlayerData : IResettable
         {
             /// <summary>
             /// Timestamp that the player last set their banner in the current session.

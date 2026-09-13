@@ -527,7 +527,7 @@ namespace SS.Core.Modules
 
         #region Helper types
 
-        private class PlayerData : IResettable
+        private sealed class PlayerData : IResettable
         {
             private char[]? _passwordHashChars = null;
             private int _passwordHashLength = 0;

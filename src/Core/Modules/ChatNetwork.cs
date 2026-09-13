@@ -971,7 +971,7 @@ namespace SS.Core.Modules
         /// The <see cref="ChatThread(object)"/> is the only thread that accesses the data members.
         /// Except for <see cref="OutList"/>, which has <see cref="OutLock"/> to synchronize access.
         /// </remarks>
-        private class ClientData : IResettable
+        private sealed class ClientData : IResettable
         {
             /// <summary>
             /// The socket that we accepted a connection for.

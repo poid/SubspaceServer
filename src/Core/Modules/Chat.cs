@@ -1657,7 +1657,7 @@ namespace SS.Core.Modules
             }
         }
 
-        private class ArenaData : IResettable
+        private sealed class ArenaData : IResettable
         {
             /// <summary>
             /// The arena's chat mask.
@@ -1683,7 +1683,7 @@ namespace SS.Core.Modules
             }
         }
 
-        private class PlayerData : IResettable
+        private sealed class PlayerData : IResettable
         {
             /// <summary>
             /// The player's chat mask.

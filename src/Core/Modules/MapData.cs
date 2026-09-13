@@ -1151,7 +1151,7 @@ namespace SS.Core.Modules
             }
         }
 
-        private class ArenaData : IResettable
+        private sealed class ArenaData : IResettable
         {
             public readonly ReaderWriterLockSlim Lock = new();
 

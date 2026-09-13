@@ -441,7 +441,7 @@ namespace SS.Core.Modules
 
         #region Helper types
 
-        private class IdlePlayerData : IResettable
+        private sealed class IdlePlayerData : IResettable
         {
             public DateTime? LastActive;
             public bool NotAvailable;
