@@ -166,8 +166,21 @@ thread_switches() {
 VOLUNTARY_BEFORE="$(thread_switches voluntary_ctxt_switches)"
 INVOLUNTARY_BEFORE="$(thread_switches nonvoluntary_ctxt_switches)"
 
+# Counted over the same window, beside the samples: how many times the thread gave up the processor
+# of its own accord (sched_yield), asked to be blocked (futex), was switched out, and was moved to
+# another CPU. The samples say where the thread's time went; these say how many times the events
+# that put it in the kernel happened, which is what turns "a fifth of the thread is in the kernel"
+# into a cost per event. The distinction they were added for: a thread switched out 5,000 times a
+# second that blocked only 400 of them is yielding, which is what SemaphoreSlim does for up to 140
+# iterations before it will block, and that is spinning between items rather than sleeping.
+COUNTS_FILE="$OUT/${LABEL// /_}.counts.txt"
+sudo perf stat -e syscalls:sys_enter_sched_yield,syscalls:sys_enter_futex,context-switches,cpu-migrations \
+    --tid "$TID" -o "$COUNTS_FILE" -- sleep "$PERF_SECONDS" &
+COUNTS_PID=$!
+
 sudo perf record ${PERF_EVENT:+-e "$PERF_EVENT"} -F "$PERF_FREQ" --tid "$TID" -o "$PERF_DATA" -- sleep "$PERF_SECONDS"
 
+wait "$COUNTS_PID" 2>/dev/null
 VOLUNTARY_AFTER="$(thread_switches voluntary_ctxt_switches)"
 INVOLUNTARY_AFTER="$(thread_switches nonvoluntary_ctxt_switches)"
 
@@ -182,13 +195,22 @@ INVOLUNTARY_AFTER="$(thread_switches nonvoluntary_ctxt_switches)"
     sudo perf report -i "$PERF_DATA" --stdio --sort dso,symbol --percent-limit 0.4 2>/dev/null
 } > "$PERF_TEXT"
 sudo chown "$(id -u):$(id -g)" "$PERF_DATA" "$PERF_TEXT"
+[ -f "$COUNTS_FILE" ] && sudo chown "$(id -u):$(id -g)" "$COUNTS_FILE"
 
 echo
 echo "--- which library $THREAD_NAME spent its time in ---"
 sed -n '/^=== by library ===/,/^=== by library and symbol ===/p' "$PERF_TEXT" | sed -n '/^ *[0-9]/p' | head -12
 echo
 echo "--- how often $THREAD_NAME slept ---"
-echo "$(( (VOLUNTARY_AFTER - VOLUNTARY_BEFORE) / PERF_SECONDS )) times/s blocked and woken, $(( (INVOLUNTARY_AFTER - INVOLUNTARY_BEFORE) / PERF_SECONDS )) times/s preempted"
+echo "$(( (VOLUNTARY_AFTER - VOLUNTARY_BEFORE) / PERF_SECONDS )) times/s blocked and woken, $(( (INVOLUNTARY_AFTER - INVOLUNTARY_BEFORE) / PERF_SECONDS )) times/s switched out while still runnable (preempted, or yielded)"
+if [ -s "$COUNTS_FILE" ]; then
+    awk -v seconds="$PERF_SECONDS" '
+        /<not (supported|counted)>/ { printf "%12s     %s\n", "n/a", $NF; next }
+        /sched_yield|futex|context-switches|cpu-migrations/ {
+            gsub(",", "", $1)
+            if ($1 ~ /^[0-9]+$/) printf "%12d/s  %s\n", $1 / seconds, $2
+        }' "$COUNTS_FILE"
+fi
 echo
 echo "--- and where in it ---"
 sed -n '/^=== by library and symbol ===/,$p' "$PERF_TEXT" | sed -n '/^ *[0-9]/p' | head -20
