@@ -155,7 +155,21 @@ fi
 
 echo "=== profiling thread $THREAD_NAME (tid $TID) of $PID for $PERF_SECONDS s at $PERF_FREQ Hz${PERF_EVENT:+ on $PERF_EVENT} ==="
 
+# How often the thread slept during the window, from the kernel's own count. A thread that blocks
+# between items pays to be woken for each of them, and that cost lands in the kernel and in the
+# runtime's wait code rather than in any method of the server's, so a profile alone cannot say
+# whether a kernel share grew because of it. Two arena workers at 42% and four at 28% doubled the
+# kernel's share per packet, and this is what tells the two readings of that apart.
+thread_switches() {
+    awk -v key="$1:" '$1 == key { print $2 }' "/proc/$PID/task/$TID/status" 2>/dev/null || echo 0
+}
+VOLUNTARY_BEFORE="$(thread_switches voluntary_ctxt_switches)"
+INVOLUNTARY_BEFORE="$(thread_switches nonvoluntary_ctxt_switches)"
+
 sudo perf record ${PERF_EVENT:+-e "$PERF_EVENT"} -F "$PERF_FREQ" --tid "$TID" -o "$PERF_DATA" -- sleep "$PERF_SECONDS"
+
+VOLUNTARY_AFTER="$(thread_switches voluntary_ctxt_switches)"
+INVOLUNTARY_AFTER="$(thread_switches nonvoluntary_ctxt_switches)"
 
 # Reported while the process is alive, because the JIT map is keyed by pid and a later run's server
 # would be a different one. Under sudo, because /proc/kallsyms is restricted to root on a default
@@ -173,8 +187,14 @@ echo
 echo "--- which library $THREAD_NAME spent its time in ---"
 sed -n '/^=== by library ===/,/^=== by library and symbol ===/p' "$PERF_TEXT" | sed -n '/^ *[0-9]/p' | head -12
 echo
+echo "--- how often $THREAD_NAME slept ---"
+echo "$(( (VOLUNTARY_AFTER - VOLUNTARY_BEFORE) / PERF_SECONDS )) times/s blocked and woken, $(( (INVOLUNTARY_AFTER - INVOLUNTARY_BEFORE) / PERF_SECONDS )) times/s preempted"
+echo
 echo "--- and where in it ---"
 sed -n '/^=== by library and symbol ===/,$p' "$PERF_TEXT" | sed -n '/^ *[0-9]/p' | head -20
+echo
+echo "--- the kernel's part of that, since it is what changes when a thread sleeps more ---"
+sed -n '/^=== by library and symbol ===/,$p' "$PERF_TEXT" | grep '\[k\] ' | head -10
 echo
 echo "full profile: $PERF_TEXT"
 
