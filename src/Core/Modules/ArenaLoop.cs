@@ -484,7 +484,38 @@ namespace SS.Core.Modules
         private sealed class Worker(ArenaLoop owner, int index) : IDisposable
         {
             private readonly ArenaLoop _owner = owner;
-            private readonly BlockingCollection<IArenaWorkItem> _queue = [];
+            private readonly ConcurrentQueue<IArenaWorkItem> _queue = new();
+
+            /// <summary>
+            /// Set when something is added to <see cref="_queue"/>, cleared by the worker when it finds
+            /// the queue empty.
+            /// </summary>
+            /// <remarks>
+            /// <para>
+            /// The queue used to be a <see cref="BlockingCollection{T}"/>, whose wait is a
+            /// <see cref="SemaphoreSlim"/>. When that finds nothing queued it spins for up to 140
+            /// iterations before it will block, and from the tenth iteration every other one is a
+            /// <see cref="Thread.Yield"/>: a sched_yield system call, a full trip through the scheduler
+            /// whether or not there is anything else to run, up to 65 of them for one empty queue. Nearly
+            /// every item arrives inside the first few iterations, but the few hundred times a second a gap
+            /// outlasted the budget cost 65 system calls each, about 140 µs of processor per idle
+            /// transition. Measured on one worker at two workers: 17,942 sched_yield calls a second for 284
+            /// blocks, a fifth of the worker's time. The budget does not shrink with more workers while the
+            /// gaps between one worker's items grow, so it was also why four workers cost more per packet
+            /// than two, and it was the part of a worker's time that no change to the work could reach.
+            /// </para>
+            /// <para>
+            /// The spin count here stays under <see cref="SpinWait"/>'s yield threshold of ten, so the wait
+            /// spins briefly on pause instructions, for the item that is about to arrive, and then blocks.
+            /// </para>
+            /// </remarks>
+            private readonly ManualResetEventSlim _itemQueued = new(false, spinCount: 10);
+
+            /// <summary>
+            /// Whether <see cref="Stop"/> has been called, after which nothing more is accepted.
+            /// </summary>
+            private volatile bool _isAddingCompleted;
+
             private Thread? _thread;
 
             /// <summary>
@@ -507,14 +538,19 @@ namespace SS.Core.Modules
 
             public void Stop()
             {
-                _queue.CompleteAdding();
+                _isAddingCompleted = true;
+                _itemQueued.Set();
                 _thread?.Join();
                 _thread = null;
+
+                // An item that got past the check in TryQueue before the flag was set, and into the queue
+                // after the thread had drained it, has nobody left to run it.
+                DrainQueue();
             }
 
             public bool TryQueue(IArenaWorkItem workItem, bool sheddable)
             {
-                if (_queue.IsAddingCompleted)
+                if (_isAddingCompleted)
                 {
                     if (workItem is IDisposable disposable)
                         disposable.Dispose();
@@ -539,39 +575,19 @@ namespace SS.Core.Modules
                     }
                 }
 
-                try
-                {
-                    if (_queue.TryAdd(workItem))
-                        return true;
-                }
-                catch (InvalidOperationException)
-                {
-                    // The queue was marked complete for adding between the check above and here.
-                }
-
-                if (workItem is IDisposable toDispose)
-                    toDispose.Dispose();
-
-                return false;
+                _queue.Enqueue(workItem);
+                _itemQueued.Set();
+                return true;
             }
 
             public void Drain()
             {
-                if (_queue.IsAddingCompleted)
+                if (_isAddingCompleted)
                     return;
 
                 BarrierWorkItem barrier = new();
-
-                try
-                {
-                    if (!_queue.TryAdd(barrier))
-                        return;
-                }
-                catch (InvalidOperationException)
-                {
-                    return;
-                }
-
+                _queue.Enqueue(barrier);
+                _itemQueued.Set();
                 barrier.Wait();
             }
 
@@ -680,9 +696,9 @@ namespace SS.Core.Modules
 
                 try
                 {
-                    while (!_queue.IsCompleted)
+                    while (true)
                     {
-                        if (_queue.TryTake(out IArenaWorkItem? workItem, GetTimerWaitMilliseconds(), cancellationToken))
+                        if (_queue.TryDequeue(out IArenaWorkItem? workItem))
                         {
                             try
                             {
@@ -707,6 +723,22 @@ namespace SS.Core.Modules
                             // Arena work runs whatever a module registered, so this is where a hold left
                             // behind would go unnoticed and be inherited by the next item.
                             ThreadingAssert.WarnIfPlayerLockLeaked(_owner._playerData, _owner._logManager, $"{nameof(ArenaLoop)}-{Index}");
+
+                            ProcessTimers();
+                            continue;
+                        }
+
+                        if (_isAddingCompleted)
+                            break;
+
+                        // Cleared before the queue is looked at again, not after. An item queued between the
+                        // failed dequeue and here has already set the event; clearing it after finding the
+                        // queue empty would throw that wake away and sleep on a queue with something in it.
+                        _itemQueued.Reset();
+
+                        if (_queue.IsEmpty)
+                        {
+                            _itemQueued.Wait(GetTimerWaitMilliseconds(), cancellationToken);
                         }
 
                         ProcessTimers();
@@ -717,18 +749,27 @@ namespace SS.Core.Modules
                     // Shutting down.
                 }
 
-                // Release anything still queued, so that pooled work items and whatever they hold go back
-                // rather than being dropped on the floor at shutdown.
-                while (_queue.TryTake(out IArenaWorkItem? remaining))
+                DrainQueue();
+            }
+
+            /// <summary>
+            /// Releases whatever is still queued, so that pooled work items and what they hold go back
+            /// rather than being dropped on the floor at shutdown, and nobody is left waiting on a barrier.
+            /// </summary>
+            private void DrainQueue()
+            {
+                while (_queue.TryDequeue(out IArenaWorkItem? remaining))
                 {
-                    if (remaining is IDisposable disposable)
+                    if (remaining is BarrierWorkItem barrier)
+                        barrier.Process();
+                    else if (remaining is IDisposable disposable)
                         disposable.Dispose();
                 }
             }
 
             public void Dispose()
             {
-                _queue.Dispose();
+                _itemQueued.Dispose();
             }
         }
 
