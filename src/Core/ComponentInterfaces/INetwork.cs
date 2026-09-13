@@ -142,6 +142,12 @@ namespace SS.Core.ComponentInterfaces
         ulong BuffersTotal { get; }
         ulong BuffersUsed { get; }
 
+        /// <summary>
+        /// Datagrams the operating system refused because a socket's send buffer was full, and which
+        /// were therefore dropped. See Net:SendBufferSize.
+        /// </summary>
+        ulong SendBufferFullDrops { get; }
+
         ulong GroupedStats0 { get; }
         ulong GroupedStats1 { get; }
         ulong GroupedStats2 { get; }
