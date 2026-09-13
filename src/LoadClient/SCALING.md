@@ -1878,8 +1878,10 @@ any of the above. It has not been measured in Release, or with the yield fix in.
 - **`Net:MaxSendThreads = 0` picks `ProcessorCount / 4` clamped to 1-8.** On the 8 vCPU VPS that is 2,
   and 3 measures better — same processor time, 24 points more headroom on the busiest thread. The
   formula has never been measured against anything on any machine.
-- **The 38 errors logged in every VPS run**, which have been present in every run on that box and have
-  never been read.
+- **The 34 errors logged in every VPS run — read at last, and harmless.** Every one is an
+  `AttachModule failed: Unable to find module` at startup, for `SS.Matchmaking.Modules.*` and
+  `SS.Bots.BotsModule`, which the arena configs on that box ask for and which are not loaded there.
+  Once per arena, nothing in the packet path, and nothing in any measurement above.
 - **The four worker floor — FOUND, see "Why four workers cost more than two" above.** It was the
   wait between items, not the work: six interventions on the work helped one worker and none helped
   four because the extra was 65 `sched_yield` calls per idle gap. Fixed on `scale/24-worker-wait`.
