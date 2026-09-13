@@ -138,7 +138,7 @@ report_run() {
 
     echo
     echo "--- what the load client saw ---"
-    grep -E "Connected|survived|clients sent|Server sent" "$CLIENT_LOG"
+    grep -E "Connected|survived|clients sent|Server sent|stopped reaching" "$CLIENT_LOG"
 
     echo
     echo "--- what the server did ---"

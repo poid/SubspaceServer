@@ -113,6 +113,7 @@ namespace SS.LoadClient
             }
 
             long measureStart = Stopwatch.GetTimestamp();
+            long measureStartTicks = Environment.TickCount64;
 
             // Counters are taken as deltas across the hold, not as totals. Clients that connected early
             // have been sending and receiving throughout the connect ramp, which for thousands of them
@@ -155,6 +156,7 @@ namespace SS.LoadClient
             }
 
             double seconds = Stopwatch.GetElapsedTime(measureStart).TotalSeconds;
+            long endTicks = Environment.TickCount64;
 
             long positionUpdates = 0;
             long positionUpdatesSent = 0;
@@ -212,6 +214,24 @@ namespace SS.LoadClient
 
             if (options.ArenaSwitchesPerMinute > 0)
                 Console.WriteLine($"Arena entries: {arenaEntries / seconds:F1}/s, each one a completed switch.");
+
+            // A client the server stopped reaching looks fine from here: it kept sending, and nothing
+            // came back. Say how many went silent before the end and when, because all of them at about
+            // the same moment is the network between the two, and a trickle is something else.
+            List<double> silentAt = [];
+            foreach (GameClient client in startedClients)
+            {
+                long last = Volatile.Read(ref client.LastReceiveTicks);
+                if (last > 0 && endTicks - last > 10_000)
+                    silentAt.Add((last - measureStartTicks) / 1000d);
+            }
+
+            if (silentAt.Count > 0)
+            {
+                silentAt.Sort();
+                Console.WriteLine($"Clients the server stopped reaching before the end: {silentAt.Count} of {startedClients.Length}; "
+                    + $"they last heard from it {silentAt[silentAt.Count / 2]:F0} s into the hold (earliest {silentAt[0]:F0}, latest {silentAt[^1]:F0}).");
+            }
 
             // The server explains a refusal to the player in chat and nowhere else, so what the clients
             // were told is the only record of why a request was turned down. Over the whole run, not the

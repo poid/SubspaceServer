@@ -127,6 +127,18 @@ namespace SS.LoadClient
         public long BytesReceived;
 
         /// <summary>
+        /// When the last datagram arrived from the server, as <see cref="Environment.TickCount64"/>,
+        /// or 0 if none has.
+        /// </summary>
+        /// <remarks>
+        /// A client the server has stopped reaching cannot tell: it keeps sending and nothing comes
+        /// back, and the server drops it for timeout half a minute later. Across a NAT that is what a
+        /// lost or changed mapping looks like, and the time each client went silent is what says
+        /// whether they all went at once, which is the network, or one by one, which is something else.
+        /// </remarks>
+        public long LastReceiveTicks;
+
+        /// <summary>
         /// Kill notifications seen, which confirms deaths are actually being processed rather than
         /// silently rejected.
         /// </summary>
@@ -426,6 +438,7 @@ namespace SS.LoadClient
 
                     Interlocked.Increment(ref PacketsReceived);
                     Interlocked.Add(ref BytesReceived, received);
+                    Volatile.Write(ref LastReceiveTicks, Environment.TickCount64);
 
                     // Parsed here rather than in a helper, and only awaited when there is actually an ack
                     // to send. Nearly every packet is a position update needing no reply, and calling an
