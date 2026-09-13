@@ -76,6 +76,21 @@ namespace SS.LoadClient
         /// </summary>
         private int _outgoingSequenceNumber;
 
+        /// <summary>
+        /// What to add to this machine's tick count to get the server's, learned from the time sync
+        /// exchange, or 0 until the first reply.
+        /// </summary>
+        /// <remarks>
+        /// The server stamps a player's position time from its own clock on arena entry and takes a
+        /// position packet only if its timestamp is newer than that. This client used to stamp
+        /// positions with its own machine's ticks. On the same machine as the server that is the same
+        /// counter, so it agreed by accident; on another machine it is a number from a different uptime
+        /// that is never newer, and the server broadcast nothing from two thousand clients while every
+        /// one of them sent ten positions a second. Real clients sync their clock to the server's the
+        /// same way this now does.
+        /// </remarks>
+        private uint _serverTickOffset;
+
         public string Name { get; } = name;
 
         public bool IsConnected { get; private set; }
@@ -101,6 +116,11 @@ namespace SS.LoadClient
         /// sent before that are discarded, so there is no point starting to send them earlier.
         /// </remarks>
         public bool IsInArena => Volatile.Read(ref _ownPlayerId) >= 0;
+
+        /// <summary>
+        /// The time now on the server's clock, as well as this client knows it.
+        /// </summary>
+        private ServerTick ServerTime => ServerTick.Now + Volatile.Read(ref _serverTickOffset);
 
         public string? FailureReason { get; private set; }
 
@@ -281,6 +301,10 @@ namespace SS.LoadClient
                             if (received >= 6 && _receiveBuffer[0] == 0x00 && _receiveBuffer[1] == 0x02)
                             {
                                 IsConnected = true;
+
+                                // The reply is read by the receive loop once the caller starts it; the
+                                // kernel holds it until then.
+                                await SendTimeSyncAsync(cancellationToken);
                                 return true;
                             }
                         }
@@ -387,12 +411,17 @@ namespace SS.LoadClient
         /// </param>
         public Task SendPositionAsync(short x, short y, short xSpeed, short ySpeed, sbyte rotation, WeaponCodes weapon, CancellationToken cancellationToken)
         {
-            Interlocked.Increment(ref PositionUpdatesSent);
+            long sent = Interlocked.Increment(ref PositionUpdatesSent);
+
+            // Clocks drift and the first sync can be lost, so it is repeated every thirty seconds at this
+            // client's ten hertz. Not awaited: the reply sets the offset whenever it arrives.
+            if (sent % 300 == 1)
+                _ = SendTimeSyncAsync(cancellationToken);
 
             C2S_PositionPacket position = new()
             {
                 Rotation = rotation,
-                Time = ServerTick.Now,
+                Time = ServerTime,
                 X = x,
                 Y = y,
                 XSpeed = xSpeed,
@@ -547,10 +576,33 @@ namespace SS.LoadClient
                     }
                     break;
 
+                case 0x06: // the server's answer to a time sync: our time when we asked, its time when it answered
+                    if (span.Length >= TimeSyncResponse.Length)
+                    {
+                        uint clientTime = LittleEndianConverter.Convert(MemoryMarshal.Read<uint>(span.Slice(2, 4)));
+                        uint serverTime = LittleEndianConverter.Convert(MemoryMarshal.Read<uint>(span.Slice(6, 4)));
+
+                        // The server's time when it answered against ours when we asked, so this is off by
+                        // one trip one way. A tick is ten milliseconds and the trip is a few, so adding
+                        // half the round trip is not worth the arithmetic.
+                        Volatile.Write(ref _serverTickOffset, serverTime - clientTime);
+                    }
+                    break;
+
                 case 0x07: // the server dropped us
                     FailureReason ??= "disconnected by server";
                     break;
             }
+        }
+
+        /// <summary>
+        /// Asks the server what time it is, so that positions can be stamped on its clock.
+        /// </summary>
+        private Task SendTimeSyncAsync(CancellationToken cancellationToken)
+        {
+            TimeSyncRequest request = new(ServerTick.Now, (uint)Interlocked.Read(ref PositionUpdatesSent), (uint)Interlocked.Read(ref PacketsReceived));
+            ReadOnlySpan<byte> bytes = MemoryMarshal.AsBytes(MemoryMarshal.CreateReadOnlySpan(ref request, 1));
+            return SendRawAsync(bytes.ToArray(), cancellationToken);
         }
 
         /// <summary>
@@ -669,7 +721,7 @@ namespace SS.LoadClient
         /// </summary>
         public Task SendShootBallAsync(byte ballId, short x, short y, CancellationToken cancellationToken)
         {
-            BallPacket packet = new(isS2C: false, ballId, x, y, xSpeed: 0, ySpeed: 0, playerId: _ownPlayerId, time: ServerTick.Now);
+            BallPacket packet = new(isS2C: false, ballId, x, y, xSpeed: 0, ySpeed: 0, playerId: _ownPlayerId, time: ServerTime);
             ReadOnlySpan<byte> bytes = MemoryMarshal.AsBytes(MemoryMarshal.CreateReadOnlySpan(ref packet, 1));
             return SendRawAsync(bytes.ToArray(), cancellationToken);
         }
