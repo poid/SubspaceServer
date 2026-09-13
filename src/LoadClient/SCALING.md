@@ -1928,6 +1928,16 @@ Not measured for cost: a run that switches arenas and changes ships has clients 
 part of it, which the broadcast-versus-offered check reports, so it is a correctness run and not a
 throughput one. The 3% cost of the setting stands from `hw-2`.
 
+**On the VPS, 1,600 clients over 16 arenas, 150 seconds, Debug, everything on: 0 assertion failures,
+1,599 of 1,600 survived.** 27 warnings: 19 for a ball two clients raced for, 6 for a ship or freq
+change sent before the server's notice of the previous one had been acked, 2 for a request landing
+mid switch. The one error is the security module wanting `clients/Continuum.exe` for its checksum,
+which that box does not have. Not a throughput run in any sense: with no `--spread` the fan-out was
+88 recipients a packet, 520,000 sends a second, and two workers sat at 93% each on a Debug build,
+so only 36% of the offered positions were broadcast and the mainloop, at 1%, had nothing to
+backfill with. The one lost client is most likely a reliable packet that went unacknowledged for
+fifteen seconds on a saturated server, which is the client's own give-up rule.
+
 ## What to watch next
 
 - **A sampled profile of one send thread at one worker against two**, which is now possible and is the
@@ -1968,7 +1978,8 @@ throughput one. The 3% cost of the setting stands from `hw-2`.
 - **The rest of the arena-thread packet path — DONE, see "Everything the arena thread can be handed"
   above.** Ship and freq changes, flags, balls and arena switching are all produced by the load
   client now. They found a third defect, the flag game reset, fixed on `scale/26`, and a 90 second
-  run with everything on is clean on a Debug build. Still to run on the VPS at 1,600 clients.
+  run with everything on is clean on a Debug build, and so is 150 seconds at 1,600 clients on the
+  VPS.
 - **A combat load this machine can sustain at four thousand clients.** Both code paths collapse there,
   so nothing about combat can be compared at that scale.
 - **What four workers can carry**, which cannot be measured on this machine. One worker saturates at
