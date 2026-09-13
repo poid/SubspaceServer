@@ -2018,11 +2018,13 @@ the largest single cost that is not the server's own. Combat roughly doubles the
 - **Whole-machine utilisation during every run — DONE.** `validate.sh` records the server's cores, the
   rest of the machine, idle and the kernel's UDP overflows over the perf window, and warns under a
   core idle.
-- **Moving the load generator off the box.** The Release limit series above ran the pair to 5,000
-  with the box under half a core idle from 3,000 on, so everything past 3,000 is the pair's number.
-  The server's cores at 4,000 and 5,000 were measured while it shared 0.4 idle cores with the
-  generator, and the extrapolation to a box of its own needs the generator elsewhere to become a
-  measurement.
+- **Moving the load generator off the box — the harness can now do it.** `remote-loadtest.sh`
+  runs the load client here and the server on another machine over SSH, with `server-side.sh`
+  taking the whole-machine window there from `/proc`, and reports through the same code as a local
+  run. The Release limit series above ran the pair to 5,000 with the box under half a core idle from
+  3,000 on, so everything past 3,000 is the pair's number, and the extrapolation to a box of its
+  own is waiting on this run. What bounds a run from a home connection is the router's table of UDP
+  flows, one per client, and the downstream link, about 2 KB/s per client with arena-local ids.
 - **Position latency, which the send side degrades by and nothing here sees.** Past its interval a
   send thread stretches its pass and batches more per datagram, so delivery stays above 99% while
   every position arrives later. The load client could stamp each position it sends and read the age
