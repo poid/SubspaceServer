@@ -540,6 +540,18 @@ namespace SS.Core.Modules
 
         #region Module Members
 
+        [ConfigHelp<int>("Net", "ReceiveBufferSize", ConfigScope.Global, Default = 1048576, Min = 0,
+            Description = """
+                The size in bytes to ask the operating system for on each socket's receive buffer, or 0
+                to leave it at whatever the operating system defaults to.
+                One socket carries the whole zone's incoming traffic, and the usual default is small for
+                that: the kernel charges a datagram far more than its payload, so a couple of hundred
+                kilobytes holds only a few hundred packets, which at a few thousand players is a few
+                milliseconds. Anything stopping the receive thread for longer starts losing packets, and
+                a lost connection attempt or position looks like nothing at all rather than an error.
+                The operating system silently caps this at its own maximum, and a warning is logged when
+                it does. On Linux that maximum is net.core.rmem_max and has to be raised separately.
+                """)]
         [ConfigHelp<bool>("Net", "HandlePacketsOnArenaThread", ConfigScope.Global, Default = false,
             Description = """
                 Whether packets from a player who is settled in an arena are handled on that arena's
@@ -659,6 +671,8 @@ namespace SS.Core.Modules
                 Description = "The bind port for the internal client socket (used to communicate with billing servers).")]
             bool InitializeSockets()
             {
+                int receiveBufferSize = _configManager.GetInt(_configManager.Global, "Net", "ReceiveBufferSize", ConfigHelp.Constants.Global.Net.ReceiveBufferSize.Default);
+
                 //
                 // Listen sockets (pairs of game and ping sockets)
                 //
@@ -804,6 +818,36 @@ namespace SS.Core.Modules
                     {
                         // not fatal, just warn
                         _logManager.LogM(LogLevel.Warn, nameof(Network), $"Can't make socket nonblocking. {ex.Message}");
+                    }
+
+                    // One socket carries the whole zone's incoming traffic, and it was left on whatever
+                    // the operating system defaults to. That default is small for the job: the kernel
+                    // charges a datagram far more than its payload, so a couple of hundred kilobytes
+                    // holds only a few hundred of these packets, which at a few thousand players is
+                    // measured in milliseconds. Anything that stops the receive thread for longer than
+                    // that - a collection, a scheduling delay, a burst of arrivals - and the kernel
+                    // starts discarding, which shows up as lost connection attempts and missing
+                    // positions rather than as any error.
+                    if (receiveBufferSize > 0)
+                    {
+                        try
+                        {
+                            socket.ReceiveBufferSize = receiveBufferSize;
+                        }
+                        catch (Exception ex)
+                        {
+                            _logManager.LogM(LogLevel.Warn, nameof(Network), $"Can't set the socket receive buffer size. {ex.Message}");
+                        }
+
+                        // Reported because the operating system silently clamps this to its own maximum,
+                        // so asking for more than it allows looks like it worked. On Linux that maximum
+                        // is net.core.rmem_max, which has to be raised separately for a large value here
+                        // to have any effect.
+                        if (socket.ReceiveBufferSize < receiveBufferSize)
+                        {
+                            _logManager.LogM(LogLevel.Warn, nameof(Network),
+                                $"Asked for a {receiveBufferSize} byte receive buffer on port {port} but got {socket.ReceiveBufferSize}; the OS capped it. On Linux see net.core.rmem_max.");
+                        }
                     }
 
                     bindAddress ??= IPAddress.Any;
