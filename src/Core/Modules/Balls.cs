@@ -1338,7 +1338,7 @@ namespace SS.Core.Modules
             public ServerTick KillerValidPickupTime;
         }
 
-        private class ArenaData : IResettable
+        private sealed class ArenaData : IResettable
         {
             /// <summary>
             /// The # of balls currently in play. 0 if the arena has no ball game.

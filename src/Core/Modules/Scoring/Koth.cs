@@ -737,7 +737,7 @@ namespace SS.Core.Modules.Scoring
             Running,
         }
 
-        private class ArenaData : IResettable
+        private sealed class ArenaData : IResettable
         {
             public Settings Settings;
             public InterfaceRegistrationToken<ICrownsBehavior>? ICrownsBehaviorRegistrationToken;
@@ -756,7 +756,7 @@ namespace SS.Core.Modules.Scoring
             }
         }
 
-        private class PlayerData : IResettable
+        private sealed class PlayerData : IResettable
         {
             public DateTime? ExpireTimestamp;
             public int Deaths;

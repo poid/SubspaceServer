@@ -442,7 +442,7 @@ namespace SS.Core.Modules
             }
         }
 
-        private class PlayerLagStats : IResettable
+        private sealed class PlayerLagStats : IResettable
         {
             private readonly PingStats PositionPacketPing = new();
             private readonly PingStats ReliablePing = new();

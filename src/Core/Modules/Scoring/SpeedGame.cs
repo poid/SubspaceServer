@@ -561,7 +561,7 @@ namespace SS.Core.Modules.Scoring
             Running,
         }
 
-        private class ArenaData : IResettable
+        private sealed class ArenaData : IResettable
         {
             public Settings Settings;
             public GameState GameState = GameState.Stopped;

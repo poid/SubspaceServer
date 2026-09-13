@@ -763,7 +763,7 @@ namespace SS.Core.Modules
         /// <summary>
         /// Per arena data
         /// </summary>
-        private class ArenaData : IResettable
+        private sealed class ArenaData : IResettable
         {
             /// <summary>
             /// Checksum of the map tiles.
@@ -796,7 +796,7 @@ namespace SS.Core.Modules
         /// <summary>
         /// Per player data
         /// </summary>
-        private class PlayerData : IResettable
+        private sealed class PlayerData : IResettable
         {
             /// <summary>
             /// Whether a security request was sent and is still pending (hasn't been fulfilled with a valid response yet).

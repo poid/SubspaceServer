@@ -3085,7 +3085,7 @@ namespace SS.Core.Modules
             }
         }
 
-        private class PlayerData : IResettable
+        private sealed class PlayerData : IResettable
         {
             /// <summary>
             /// The player's latest position packet.
@@ -3224,7 +3224,7 @@ namespace SS.Core.Modules
             }
         }
 
-        private class ArenaData : IResettable
+        private sealed class ArenaData : IResettable
         {
             /// <summary>
             /// Client setting to multiply kill points if the killer was carrying a flag.

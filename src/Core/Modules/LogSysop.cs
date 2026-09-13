@@ -314,7 +314,7 @@ namespace SS.Core.Modules
             All,
         }
 
-        private class PlayerData : IResettable
+        private sealed class PlayerData : IResettable
         {
             public SeeWhat SeeWhat;
 

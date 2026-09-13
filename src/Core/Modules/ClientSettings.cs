@@ -1096,7 +1096,7 @@ namespace SS.Core.Modules
 
         #region Helper types
 
-        private class ArenaData : IResettable
+        private sealed class ArenaData : IResettable
         {
             public S2C_ClientSettings Settings;
             public OverrideData OverrideData;
@@ -1116,7 +1116,7 @@ namespace SS.Core.Modules
             }
         }
 
-        private class PlayerData : IResettable
+        private sealed class PlayerData : IResettable
         {
             public S2C_ClientSettings Settings;
             public OverrideData OverrideData;

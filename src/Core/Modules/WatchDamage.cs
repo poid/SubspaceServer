@@ -301,7 +301,7 @@ namespace SS.Core.Modules
             }
         }
 
-        private class PlayerData : IResettable
+        private sealed class PlayerData : IResettable
         {
             public HashSet<Player> PlayersWatching = [];
             public int CallbackWatchCount;

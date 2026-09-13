@@ -218,7 +218,7 @@ namespace SS.Core.Modules.Scoring
 
         #endregion
 
-        private class ArenaData : IResettable
+        private sealed class ArenaData : IResettable
         {
             // setting
             public double BountyRatio;

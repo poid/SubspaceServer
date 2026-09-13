@@ -1101,7 +1101,7 @@ namespace SS.Core.Modules
             }
         }
 
-        private class ArenaData : IResettable
+        private sealed class ArenaData : IResettable
         {
             public readonly List<Freq> Freqs = [];
             public Config Config;
@@ -1120,7 +1120,7 @@ namespace SS.Core.Modules
             }
         }
 
-        private class PlayerData : IResettable
+        private sealed class PlayerData : IResettable
         {
             public Freq? Freq;
 

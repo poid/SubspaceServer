@@ -298,7 +298,7 @@ namespace SS.Core.Modules.Scoring
             OwnAllDropped = 1,
         }
 
-        private class ArenaData : IResettable
+        private sealed class ArenaData : IResettable
         {
             // settings
             public FlagMode FlagMode;

@@ -187,7 +187,7 @@ namespace SS.Core.Modules.Enforcers
 
         #region Helper types
 
-        private class ArenaData : IResettable
+        private sealed class ArenaData : IResettable
         {
             public AdvisorRegistrationToken<IFreqManagerEnforcerAdvisor>? AdvisorToken = null;
 

@@ -877,7 +877,7 @@ namespace SS.Core.Modules
         /// <param name="TotalLength">The total # of bytes of the transfer.</param>
         private readonly record struct UploadDataChunk(byte[]? DataArray, int DataLength, int Offset, int TotalLength);
 
-        private class UploadDataContext : IResettable, IDisposable
+        private sealed class UploadDataContext : IResettable, IDisposable
         {
             /// <summary>
             /// For synchronizing access to everything except the <see cref="Stream"/>.
