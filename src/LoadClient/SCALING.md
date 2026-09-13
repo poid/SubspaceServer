@@ -2004,24 +2004,20 @@ the largest single cost that is not the server's own. Combat roughly doubles the
 
 ## What to watch next
 
-- **A sampled profile of one send thread at one worker against two**, which is now possible and is the
-  way to finish this. `scripts/loadtest/bash/profile-thread.sh` does it: hardware sampling at 999 Hz
-  against a single thread id, with `DOTNET_PerfMapEnabled=1` so managed frames resolve. The function
-  that is hot at one worker and not at two is the answer to the paragraph above. Do not reach for
-  `dotnet-trace` instead; it has already answered this class of question wrongly once.
-- **The send thread count, re-measured at a load with headroom.** "Three are free" was measured on a
-  box that turned out to be about 94% busy, and at 1,600 clients two send threads run at 91% and make
-  83 passes a second against a nominal 100 — they are overrunning their interval in every
-  configuration above. This is the setting that decides how many players fit, so it is worth more than
-  anything left on the worker question.
-- **Why one worker makes the send threads dear**, which has nothing to do with how often they run.
-- **Whether the working set explains the four worker stalls**, since the topology did not. 294 MB
-  against 8 MB of last level cache, and the queues are not backlogged, so where the extra 56 MB comes
-  from is the question — buffers in flight, or the collector sizing per-thread budgets by thread count.
-- **Whole-machine utilisation during every run from here on.** Every measurement on the VPS records
-  only what the server process used, so a cliff caused by running out of processors and a cliff caused
-  by the code look identical. Idle time from `/proc/stat` across the `perf` window costs nothing and
-  would have answered the four-thread question in the first run rather than the third.
+- **A sampled profile of one send thread — DONE.** `profile-thread.sh` did it and found the firewall,
+  see "The firewall is a fifth of the send thread" above; the worker profiles that followed found the
+  wait that yielded.
+- **The send thread count, re-measured at a load with headroom.** Still open in that form. The
+  Release limit series ran three threads to 5,000 and the box never had headroom past 3,000. It is the
+  setting that decides how many players fit, and what a thread carries is now known: about 70,000
+  datagrams a second before its pass stretches.
+- **Why one worker makes the send threads dear — WITHDRAWN.** Run-to-run variance; the pair reversed
+  on repetition.
+- **Whether the working set explains the four worker stalls — SUPERSEDED.** The stalls were the wait
+  yielding, see "Why four workers cost more than two" above.
+- **Whole-machine utilisation during every run — DONE.** `validate.sh` records the server's cores, the
+  rest of the machine, idle and the kernel's UDP overflows over the perf window, and warns under a
+  core idle.
 - **Moving the load generator off the box.** The Release limit series above ran the pair to 5,000
   with the box under half a core idle from 3,000 on, so everything past 3,000 is the pair's number.
   The server's cores at 4,000 and 5,000 were measured while it shared 0.4 idle cores with the
@@ -2034,9 +2030,14 @@ the largest single cost that is not the server's own. Combat roughly doubles the
 - **Fewer kernel crossings per datagram on the send thread.** The wall is 14 µs of send thread per
   datagram with a fifth of it the firewall, and one system call per datagram. `sendmmsg` sends many
   in one crossing, which would not touch the firewall's share but would take the syscall's, and it is
-  the only lever left on the send side that is the server's own.
-- **One arena worker against four, with the counters attached**, on the VPS. This is the run named in
-  `0ccc1ff` and the send thread A/B above is not a substitute for it.
+  the only lever left on the send side that is the server's own. Two cautions before building it.
+  The 14 µs was measured with the generator on the same box, where every datagram sent over loopback
+  runs the receiver's kernel path in the sender's context, so a good part of it is the generator's
+  receive work and disappears with real clients on a real interface; and the syscall boundary itself
+  is a small share of what is left, so the expected gain is of the order of a tenth of the send
+  thread, not a half. Worth measuring the send thread's profile with the generator elsewhere first.
+- **One arena worker against four, with the counters attached — DONE.** The profiles `pw`, `rw` and
+  `fw` at two and four workers are that run, with symbols, and they found the wait.
 - **`Net:MaxSendThreads = 0` picks `ProcessorCount / 4` clamped to 1-8.** On the 8 vCPU VPS that is 2,
   and 3 measures better — same processor time, 24 points more headroom on the busiest thread. The
   formula has never been measured against anything on any machine.
@@ -2054,19 +2055,20 @@ the largest single cost that is not the server's own. Combat roughly doubles the
   client now. They found a third defect, the flag game reset, fixed on `scale/26`, and a 90 second
   run with everything on is clean on a Debug build, and so is 150 seconds at 1,600 clients on the
   VPS.
-- **A combat load this machine can sustain at four thousand clients.** Both code paths collapse there,
-  so nothing about combat can be compared at that scale.
-- **What four workers can carry**, which cannot be measured on this machine. One worker saturates at
-  about 27,300 packets a second at ninety recipients each; four would need something near four times
-  that, and at ninety recipients that is eight million updates a second back to the load generator,
-  which has never sustained more than four. Making packets costlier to lower the packet rate makes
-  the generator's side worse, not better. This needs a second machine, or a generator that can
-  receive far more cheaply than it does.
+- **A combat load at four thousand clients.** Both code paths collapsed there on the development box,
+  so nothing about combat has been measured for cost at that scale. The arena-thread vetting ran
+  combat at 1,600 on the VPS for correctness, not cost. Needs the generator off the box, in Release.
+- **What four workers can carry**, which cannot be measured with the generator on the same machine.
+  One worker saturates at about 27,300 packets a second at ninety recipients each; the 1.78 measured
+  between one and two says the residual penalty costs capacity; whether it keeps costing the same at
+  four is not known, and four workers need about a hundred thousand packets a second to reach the
+  wall. At ninety recipients that is eight million updates a second back to the generator, which has
+  never sustained more than four. A second machine.
 - **Re-measuring the worker scaling numbers on the fixed build.** Every figure in this document from
-  the arena workers predates the busy wait fix, and now also the yield fix, and overstates the
-  penalty, the more so the more workers were running. The saturation figures are unaffected, since a
-  saturated worker has no gaps to spin in. The direction and the eliminations hold; the magnitudes
-  need redoing, and in Release.
+  the arena workers before "Why four workers cost more than two" predates the busy wait fix, and the
+  yield fix, and overstates the penalty, the more so the more workers were running. The saturation
+  figures are unaffected, since a saturated worker has no gaps to spin in. Two workers are now
+  measured in Release to 5,000 on the VPS; four only at 1,600.
 - **Whether isolating the workers still makes it worse.** Explained: that result was measured with
   the yield spin present, and a yield on an uncontended core returns at once, so the budget was spent
   faster there. An artefact of the spin, not a clue, and not worth repeating.
@@ -2087,15 +2089,13 @@ the largest single cost that is not the server's own. Combat roughly doubles the
 - **The periodic persist sync**, 5.2 seconds at ten thousand players with 2.3 of it in the commit.
   Chunking it stops it blocking logins for the whole sweep, but the cost itself scales with how much
   data is written, and only dirty records need writing.
-- **The receive thread**, at 20% of a core at six thousand and climbing faster than anything else.
-  It is a single thread, and sharding it is the plan's Phase 7.
+- **The receive thread — not the ceiling at ten thousand.** 27% of a core at 5,000 in Release, rising
+  about linearly, so about half a core at 10,000, behind the send threads by a wide margin. Sharding
+  it, the plan's Phase 7, was not needed for the population; draining per wake (`scale/20`) was what
+  it needed. It is still one thread, and it is the next single-thread limit after the mainloop.
 - **`Mainloop:MaxQueueDepth`, still unlimited.** The arena queue is bounded now and that was enough
   here, because the overflow lands on the mainloop and the mainloop kept up. A load that overruns the
   mainloop itself has not been produced yet, and until it is, the last line of shedding is untested.
-- **What four workers carry**, now that saturating one and two is possible. The 1.78 measured between
-  one and two says the penalty costs capacity; whether it keeps costing the same at four is not known,
-  and four workers need about a hundred thousand packets a second to reach the wall — which is what
-  the generator can now just about offer.
-- **Connection bursts.** Only 4,909 of 6,000 clients connected, staggered 3 ms apart. The receive
-  thread drops connection inits under burst arrival, which is a known limit and unrelated to steady
-  state, but it will matter for a zone that fills quickly.
+- **Connection bursts — FIXED by the receive drain.** 6,000 of 6,000 connected since `scale/20`,
+  against 4,844 before it, and 5,000 connected in 28 seconds on the VPS staggered 3 ms apart.
+  `--connect-delay` remains the polite way to bring thousands up at once.
