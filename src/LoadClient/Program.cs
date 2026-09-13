@@ -146,6 +146,24 @@ namespace SS.LoadClient
                 ? $"Holding for {options.Duration.TotalSeconds:F0}s at 10Hz. Read the server's ?metrics output now."
                 : "Holding until interrupted (Ctrl+C) at 10Hz. Read the server's ?metrics output now.");
 
+            // Twenty seconds in, one client asks the server how it sees that client's lag. The reply is
+            // the server's own ping and packet loss figures for a client of this generator, which is the
+            // only way to tell a path that really loses packets from a generator that reports its counts
+            // wrongly, and the two look identical from the spec count.
+            GameClient lagProbe = startedClients[0];
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await Task.Delay(TimeSpan.FromSeconds(20), cancellationToken);
+                    await lagProbe.SendChatAsync("?lag", cancellationToken);
+                }
+                catch (OperationCanceledException)
+                {
+                    // The hold was shorter than that.
+                }
+            }, cancellationToken);
+
             try
             {
                 await Task.WhenAll(receiveTasks.Concat(positionTasks).Where(t => t is not null)!);
@@ -229,6 +247,14 @@ namespace SS.LoadClient
 
             if (options.ArenaSwitchesPerMinute > 0)
                 Console.WriteLine($"Arena entries: {arenaEntries / seconds:F1}/s, each one a completed switch.");
+
+            string[] lagLines = [.. lagProbe.GetRecentChat().Where(line => line.Contains("ping") || line.Contains("ploss"))];
+            if (lagLines.Length > 0)
+            {
+                Console.WriteLine($"The server's lag view of {lagProbe.Name}, twenty seconds in:");
+                foreach (string line in lagLines)
+                    Console.WriteLine($"  {line}");
+            }
 
             // A client the server stopped reaching looks fine from here: it kept sending, and nothing
             // came back. Say how many went silent before the end and when, because all of them at about

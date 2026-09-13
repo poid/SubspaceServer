@@ -147,6 +147,12 @@ namespace SS.LoadClient
         public long BytesReceived;
 
         /// <summary>
+        /// Datagrams this client handed to its socket, of every kind. The time sync request reports it,
+        /// and the server derives client-to-server packet loss from it against what it received.
+        /// </summary>
+        public long PacketsSent;
+
+        /// <summary>
         /// When the last datagram arrived from the server, as <see cref="Environment.TickCount64"/>,
         /// or 0 if none has.
         /// </summary>
@@ -247,6 +253,13 @@ namespace SS.LoadClient
         /// </remarks>
         private readonly Dictionary<string, long> _chatMessages = [];
 
+        /// <summary>
+        /// The last few chat messages exactly as received, for reading a command's reply.
+        /// </summary>
+        private readonly Queue<string> _recentChat = new();
+
+        private const int MaxRecentChat = 12;
+
         public async Task<bool> ConnectAsync(string host, int port, CancellationToken cancellationToken)
         {
             try
@@ -300,6 +313,20 @@ namespace SS.LoadClient
                             int received = await _socket.ReceiveAsync(_receiveBuffer, SocketFlags.None, attemptTimeout.Token);
                             if (received >= 6 && _receiveBuffer[0] == 0x00 && _receiveBuffer[1] == 0x02)
                             {
+                                // EncryptionNull answers with the key unchanged, which is the protocol's
+                                // way of saying no encryption. EncryptionVIE answers with it negated and
+                                // encrypts everything after, which this client cannot do: the login would
+                                // reach the server as garbage and be dropped without a word, and thirty
+                                // seconds later the server would kick the connection for sending no data.
+                                // That cost two hours once, blamed on code, when it was the zone's module
+                                // order under a different branch. Say it here, at once.
+                                int responseKey = LittleEndianConverter.Convert(MemoryMarshal.Read<int>(_receiveBuffer.AsSpan(2, 4)));
+                                if (responseKey != key)
+                                {
+                                    FailureReason = "the server answered the connection init with a changed key, so an encryption module took this connection; load EncryptionNull before EncryptionVIE";
+                                    return false;
+                                }
+
                                 IsConnected = true;
 
                                 // The reply is read by the receive loop once the caller starts it; the
@@ -600,7 +627,10 @@ namespace SS.LoadClient
         /// </summary>
         private Task SendTimeSyncAsync(CancellationToken cancellationToken)
         {
-            TimeSyncRequest request = new(ServerTick.Now, (uint)Interlocked.Read(ref PositionUpdatesSent), (uint)Interlocked.Read(ref PacketsReceived));
+            // The counts are every datagram sent and received, which is what the server compares its own
+            // per-connection counts against for packet loss. Reporting only the positions sent made the
+            // server see loss that was not there, and it specced six hundred of a thousand clients for it.
+            TimeSyncRequest request = new(ServerTick.Now, (uint)Interlocked.Read(ref PacketsSent), (uint)Interlocked.Read(ref PacketsReceived));
             ReadOnlySpan<byte> bytes = MemoryMarshal.AsBytes(MemoryMarshal.CreateReadOnlySpan(ref request, 1));
             return SendRawAsync(bytes.ToArray(), cancellationToken);
         }
@@ -811,7 +841,37 @@ namespace SS.LoadClient
                     _chatMessages[message] = 1;
                 else
                     _chatMessages["(other messages)"] = _chatMessages.GetValueOrDefault("(other messages)") + 1;
+
+                _recentChat.Enqueue(Encoding.ASCII.GetString(messageBytes));
+                while (_recentChat.Count > MaxRecentChat)
+                    _recentChat.Dequeue();
             }
+        }
+
+        /// <summary>
+        /// The last few chat messages exactly as received, oldest first.
+        /// </summary>
+        public string[] GetRecentChat()
+        {
+            lock (_chatMessages)
+            {
+                return [.. _recentChat];
+            }
+        }
+
+        /// <summary>
+        /// Says something in public chat, which is also how a command is issued, sent reliably as a real
+        /// client does.
+        /// </summary>
+        public Task<bool> SendChatAsync(string message, CancellationToken cancellationToken)
+        {
+            const byte ChatTypePublic = 2;
+
+            byte[] packet = new byte[ChatPacket.HeaderLength + ChatPacket.MaxMessageBytes];
+            ChatPacket header = new((byte)C2SPacketType.Chat, ChatTypePublic, 0, 0);
+            MemoryMarshal.AsBytes(MemoryMarshal.CreateReadOnlySpan(ref header, 1)).CopyTo(packet);
+            int length = ChatPacket.SetMessage(packet, message);
+            return SendReliableAsync(packet[..length], cancellationToken);
         }
 
         private void NoteBall(ReadOnlySpan<byte> span)
@@ -966,6 +1026,7 @@ namespace SS.LoadClient
             try
             {
                 await _socket.SendToAsync(data, SocketFlags.None, _serverEndPoint, cancellationToken);
+                Interlocked.Increment(ref PacketsSent);
                 return true;
             }
             catch (OperationCanceledException)
