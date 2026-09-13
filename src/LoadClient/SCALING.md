@@ -1938,6 +1938,70 @@ so only 36% of the offered positions were broadcast and the mainloop, at 1%, had
 backfill with. The one lost client is most likely a reliable packet that went unacknowledged for
 fifteen seconds on a saturated server, which is the client's own give-up rule.
 
+## Where this box runs out with the generator on it, in Release, and what the wall is made of
+
+The first limit series on a Release build. Same shape as every throughput run here: a hundred
+players per arena, `--spread 16384` for 18 to 20 in view, positions only, connects staggered 3 ms
+apart, 150 second holds, `validate.sh` taking the server's cores, the rest of the machine and the
+idle over the same 30 second window. `SendThreads = 2` with `MaxSendThreads = 3`, and the server grew
+the third thread on its own at 2,000. Two workers. First with zone-wide player ids, which every run on
+this box had used without anyone noticing, then the top two points again with arena-local ids.
+
+| clients | ids | server cores | send threads | workers | rest of box | idle | out KB/s | datagrams/s | delivered | lag specs | overflows |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 2,000 | zone | 3.19 | 83, 81, 68% | 25% | 3.59 | 1.22 | 6,844 | | 99.5% | 0 | |
+| 2,500 | zone | 3.56 | 84, 83, 82% | 33% | 3.35 | 1.09 | 10,401 | | 99.2% | 0 | |
+| 3,000 | zone | 3.98 | 92, 91, 90% | 36% | 3.26 | 0.76 | 11,063 | | 99.7% | 0 | |
+| 3,500 | zone | 4.29 | 96, 96, 96% | 47% | 3.11 | 0.60 | 13,549 | | 99.75% | 0 | |
+| 4,000 | zone | 4.53 | 93, 92, 92% | 65% | 2.88 | 0.59 | 16,023 | | 99.8% | 0 | |
+| 4,000 | zone, repeat | 4.26 | 96, 96, 95% | 57% | 3.40 | 0.34 | 16,010 | 186,987 | 99.8% | 0 | 158 |
+| 5,000 | zone | 4.70 | 93, 93, 92% | 69% | 2.91 | 0.39 | 19,520 | 200,941 | 99.5% | **239** | **810** |
+| 4,000 | arena | 4.25 | 96, 96, 95% | 51% | 3.26 | 0.49 | **9,136** | 205,951 | 99.8% | 0 | 0 |
+| 5,000 | arena | 4.62 | 94, 93, 93% | 67% | 2.95 | 0.43 | **10,947** | 202,057 | 99.7% | 0 | 0 |
+
+"Delivered" is what the clients received against what the server handed its send threads.
+"Overflows" is the kernel's count of datagrams discarded for want of socket buffer, machine wide, in
+the 30 second window; the datagram and overflow columns were added to `validate.sh` partway through.
+The two 4,000 runs with zone-wide ids are the run-to-run spread at this load: 0.27 cores on the
+server, 0.25 on idle. Nothing smaller than that up here is a difference.
+
+**With the generator on it, this box holds 5,000.** Every point was clean on the server's side:
+broadcast at 100% of offered, delivery above 99%, all clients surviving. The one blemish, 239 players
+specced for lag at 5,000 with zone-wide ids, was the generator's: 810 datagrams discarded from its
+sockets in the window, with the server's own drop counter still, and the same 5,000 with arena-local
+ids had no specs and no overflows while the server worked just as hard. The box itself was out of
+processors from 3,000 on, under a core idle, and the script said so every time.
+
+**The wall is the send threads, and it is made of datagrams.** Arena-local ids cut the bytes sent
+by 43% and left the three send threads exactly where they were, at 96%. The datagram count did not
+fall, it rose a little, because what sets it is how many connections have something to send each
+pass, and at ten position packets a second with 18 in view that is most of them every pass. Three
+threads move about 200,000 datagrams a second, about 14 µs of send thread each, a fifth of it the
+firewall. From 4,000 to 5,000 the datagram rate stayed flat at that figure while delivery held: the
+threads were past their 10 ms interval, each pass took longer, each connection was visited less often,
+and more positions went into each datagram. That is graceful, and it is also latency, which nothing
+here measures. Overruns began climbing at 2,500, so the send side was holding its interval to about
+that many players and stretching it above.
+
+**What arena-local ids are worth, restated.** Bandwidth: 43% at 4,000 and 44% at 5,000, which is
+real on a hosted box and on the players' own links. The workers, which build the smaller packet, went
+from 57 to 51%. The generator's side, which parses it, got cheaper and stopped overflowing. The send
+threads: nothing, because their cost is per datagram. The record above that credited local ids with
+more updates delivered per second was measured with the generator on the same box, where the
+generator's parsing was what got cheaper.
+
+**The server's own line**, three send threads: 1.7 cores plus 0.73 per thousand players from 2,000
+to 3,500, then flattening as the send threads stop growing and start stretching. Beyond that the
+server's cores say less, because it was sharing under half a core of idle with the generator.
+
+**What it would carry alone on eight of these vCPUs** is an extrapolation and marked as one. With
+the generator gone, six or seven send threads have the cores to run, and each moves about 70,000
+datagrams a second before its pass stretches, so roughly 430,000 a second between them, against
+the 200,000 that three threads hit here. Everything else, the workers at four, the receive thread
+and the mainloop, adds up to under two cores at 10,000. That puts nominal-latency positions-only
+capacity near 8,000 and graceful capacity above 10,000, with the firewall's fifth of every datagram
+the largest single cost that is not the server's own. Combat roughly doubles the send side.
+
 ## What to watch next
 
 - **A sampled profile of one send thread at one worker against two**, which is now possible and is the
@@ -1958,9 +2022,19 @@ fifteen seconds on a saturated server, which is the client's own give-up rule.
   only what the server process used, so a cliff caused by running out of processors and a cliff caused
   by the code look identical. Idle time from `/proc/stat` across the `perf` window costs nothing and
   would have answered the four-thread question in the first run rather than the third.
-- **Moving the load generator off the box.** 2,000 clients receiving 379,000 updates a second share
-  8 vCPUs with the server, so the ceiling being measured is the pair, not the server. Nothing above
-  3,000 players is worth measuring on this box until that is fixed.
+- **Moving the load generator off the box.** The Release limit series above ran the pair to 5,000
+  with the box under half a core idle from 3,000 on, so everything past 3,000 is the pair's number.
+  The server's cores at 4,000 and 5,000 were measured while it shared 0.4 idle cores with the
+  generator, and the extrapolation to a box of its own needs the generator elsewhere to become a
+  measurement.
+- **Position latency, which the send side degrades by and nothing here sees.** Past its interval a
+  send thread stretches its pass and batches more per datagram, so delivery stays above 99% while
+  every position arrives later. The load client could stamp each position it sends and read the age
+  of each one it receives, which would turn "the send threads are at 96%" into milliseconds.
+- **Fewer kernel crossings per datagram on the send thread.** The wall is 14 µs of send thread per
+  datagram with a fifth of it the firewall, and one system call per datagram. `sendmmsg` sends many
+  in one crossing, which would not touch the firewall's share but would take the syscall's, and it is
+  the only lever left on the send side that is the server's own.
 - **One arena worker against four, with the counters attached**, on the VPS. This is the run named in
   `0ccc1ff` and the send thread A/B above is not a substitute for it.
 - **`Net:MaxSendThreads = 0` picks `ProcessorCount / 4` clamped to 1-8.** On the 8 vCPU VPS that is 2,
