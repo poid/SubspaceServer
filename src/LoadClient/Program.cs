@@ -199,11 +199,10 @@ namespace SS.LoadClient
             // Each of these is something the server told every client in the arena, so it is counted once
             // per client that saw it. They confirm the server processed the requests rather than refusing
             // them: a refusal is a warning in the server log and nothing here.
-            if (options.ShipChangesPerMinute > 0)
-                Console.WriteLine($"Ship change notifications seen: {shipChanges / seconds:F0}/s.");
-
-            if (options.FreqChangesPerMinute > 0)
-                Console.WriteLine($"Freq change notifications seen: {freqChanges / seconds:F0}/s.");
+            // A freq change by a player in a ship is notified to the arena as a ship change, so the two
+            // cannot be told apart here; the separate freq change notification is only for spectators.
+            if (options.ShipChangesPerMinute > 0 || options.FreqChangesPerMinute > 0)
+                Console.WriteLine($"Ship and freq change notifications seen: {(shipChanges + freqChanges) / seconds:F0}/s.");
 
             if (options.FlagsPerMinute > 0)
                 Console.WriteLine($"Flag pickup notifications seen: {flagPickups / seconds:F0}/s.");
@@ -213,6 +212,27 @@ namespace SS.LoadClient
 
             if (options.ArenaSwitchesPerMinute > 0)
                 Console.WriteLine($"Arena entries: {arenaEntries / seconds:F1}/s, each one a completed switch.");
+
+            // The server explains a refusal to the player in chat and nowhere else, so what the clients
+            // were told is the only record of why a request was turned down. Over the whole run, not the
+            // hold, since a refusal during the ramp is as telling as one during it.
+            if (options.ShipChangesPerMinute > 0 || options.FreqChangesPerMinute > 0 || options.ArenaSwitchesPerMinute > 0
+                || options.BallsPerMinute > 0 || options.FlagsPerMinute > 0)
+            {
+                Dictionary<string, long> chatMessages = [];
+                foreach (GameClient client in startedClients)
+                {
+                    foreach ((string message, long count) in client.GetChatMessages())
+                        chatMessages[message] = chatMessages.GetValueOrDefault(message) + count;
+                }
+
+                if (chatMessages.Count > 0)
+                {
+                    Console.WriteLine("Chat received, most frequent first:");
+                    foreach ((string message, long count) in chatMessages.OrderByDescending(pair => pair.Value).Take(8))
+                        Console.WriteLine($"  {count,8}  {message}");
+                }
+            }
 
             await Task.WhenAll(startedClients.Select(c => c.DisconnectAsync(CancellationToken.None)));
 
@@ -318,6 +338,9 @@ namespace SS.LoadClient
                 int ballToShoot = -1;
                 bool flagToDrop = false;
 
+                // Ships are 0 to 7 and 8 is spectator mode.
+                const int SpectatorShip = 8;
+
                 try
                 {
                     // 10Hz, matching a real client's SendPositionDelay of 10.
@@ -344,6 +367,26 @@ namespace SS.LoadClient
                         if (deathChancePerTick > 0d && Random.Shared.NextDouble() < deathChancePerTick)
                             await client.SendDeathAsync(token);
 
+                        // What the server last said this client is in decides what it may do this tick.
+                        // Until the server has said, which is the case between an arena request and the
+                        // entry it produces, nothing: a request in that window is refused with a warning
+                        // about the player's state, and warnings are what a run like this is read by.
+                        int ownShip = client.OwnShip;
+                        if (ownShip < 0)
+                            continue;
+
+                        if (ownShip == SpectatorShip)
+                        {
+                            // Put in spectator mode without asking. The ship change enforcer allows no
+                            // ship for five seconds after a change, and an arena entry inside that window
+                            // lands in spec. Ask for a ship once a second until one is given, and try
+                            // nothing else meanwhile, since flags and balls are refused from spec.
+                            if (tick % 10 == 0)
+                                await client.SendShipChangeAsync((sbyte)Random.Shared.Next(SpectatorShip), token);
+
+                            continue;
+                        }
+
                         // At most one of these a tick. The server refuses a ship or freq change until the
                         // client has acked the previous one, and an arena switch makes both moot.
                         if (arenaSwitchChancePerTick > 0d && Random.Shared.NextDouble() < arenaSwitchChancePerTick)
@@ -352,17 +395,20 @@ namespace SS.LoadClient
                             ballToShoot = -1;
                             flagToDrop = false;
                             await client.GoToArenaAsync(options.Arenas[currentArena], options.ViewWidth, options.ViewHeight, token);
+                            continue;
                         }
                         else if (shipChangeChancePerTick > 0d && Random.Shared.NextDouble() < shipChangeChancePerTick)
                         {
                             // A different ship from the current one, and never spectator mode, which would
                             // take the client out of the fan out and have it refused flags and balls.
-                            int ship = client.OwnShip;
-                            if (ship >= 0)
-                                await client.SendShipChangeAsync((sbyte)((ship + 1 + Random.Shared.Next(7)) % 8), token);
+                            await client.SendShipChangeAsync((sbyte)((ownShip + 1 + Random.Shared.Next(SpectatorShip - 1)) % SpectatorShip), token);
                         }
                         else if (freqChangeChancePerTick > 0d && Random.Shared.NextDouble() < freqChangeChancePerTick)
                         {
+                            // To the other public freq. The balancer refuses a move that would leave the
+                            // two teams more than one apart, so this succeeds only from the larger team,
+                            // which after a few deaths, switches and refusals is often enough. Private freqs
+                            // are not an alternative: the test arenas have none available.
                             int freq = client.OwnFreq;
                             if (freq >= 0)
                                 await client.SendFreqChangeAsync((short)(freq == 0 ? 1 : 0), token);

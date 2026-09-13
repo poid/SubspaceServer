@@ -4,6 +4,7 @@ using SS.Utilities;
 using System.Net;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
+using System.Text;
 
 namespace SS.LoadClient
 {
@@ -202,6 +203,18 @@ namespace SS.LoadClient
 
         public int OwnFreq => Volatile.Read(ref _ownFreq);
 
+        private const int MaxDistinctChatMessages = 16;
+
+        /// <summary>
+        /// Chat messages received, by text, with how many times each arrived.
+        /// </summary>
+        /// <remarks>
+        /// The server explains a refused ship change, freq change, or flag touch to the player in chat
+        /// and nowhere else, so this is the only record of why a request was turned down. Capped at a
+        /// handful of distinct texts, since a message that carries a number is a new text every time.
+        /// </remarks>
+        private readonly Dictionary<string, long> _chatMessages = [];
+
         public async Task<bool> ConnectAsync(string host, int port, CancellationToken cancellationToken)
         {
             try
@@ -332,6 +345,12 @@ namespace SS.LoadClient
         public Task<bool> GoToArenaAsync(string arenaName, short viewWidth, short viewHeight, CancellationToken cancellationToken)
         {
             const byte ShipWarbird = 0;
+
+            // Unknown from here until the server says, on entry, what it gave this client. Nothing that
+            // depends on being in a ship is attempted in between, because a request that arrives while
+            // the server is moving the player is refused with a warning about the player's state.
+            Volatile.Write(ref _ownShip, -1);
+            Volatile.Write(ref _ownFreq, -1);
 
             C2S_GoArenaVIE go = new(
                 shipType: ShipWarbird,
@@ -464,6 +483,8 @@ namespace SS.LoadClient
                     Interlocked.Increment(ref FlagPickupsSeen);
                 else if (span[0] == (byte)S2CPacketType.Ball && span.Length >= BallPacket.Length)
                     NoteBall(span);
+                else if (span[0] == (byte)S2CPacketType.Chat && span.Length > ChatPacket.HeaderLength)
+                    NoteChat(span);
 
                 return;
             }
@@ -648,6 +669,8 @@ namespace SS.LoadClient
         private void NoteArenaEntry(short playerId)
         {
             _ownPlayerId = playerId;
+            Volatile.Write(ref _ownShip, -1);
+            Volatile.Write(ref _ownFreq, -1);
             Interlocked.Increment(ref ArenaEntriesSeen);
 
             lock (_knownPlayerIds)
@@ -682,6 +705,48 @@ namespace SS.LoadClient
             short playerId = LittleEndianConverter.Convert(MemoryMarshal.Read<short>(span.Slice(1, 2)));
             if (playerId == _ownPlayerId)
                 Volatile.Write(ref _ownFreq, LittleEndianConverter.Convert(MemoryMarshal.Read<short>(span.Slice(3, 2))));
+        }
+
+        /// <summary>
+        /// The chat messages received so far, by text, with how many times each arrived.
+        /// </summary>
+        public KeyValuePair<string, long>[] GetChatMessages()
+        {
+            lock (_chatMessages)
+            {
+                return [.. _chatMessages];
+            }
+        }
+
+        private void NoteChat(ReadOnlySpan<byte> span)
+        {
+            ReadOnlySpan<byte> messageBytes = ChatPacket.GetMessageBytes(span);
+            int end = messageBytes.IndexOf((byte)0);
+            if (end >= 0)
+                messageBytes = messageBytes[..end];
+
+            if (messageBytes.IsEmpty)
+                return;
+
+            // Allocates, which is fine here: chat is a message every so often, not a packet every tick.
+            // Digits are replaced so that "Frequency 100 is not available" and "Frequency 101 is not
+            // available" count as one message, and so that a message naming a player does not take up
+            // one of the distinct texts per player.
+            string message = string.Create(messageBytes.Length, messageBytes, static (chars, bytes) =>
+            {
+                for (int i = 0; i < bytes.Length; i++)
+                    chars[i] = bytes[i] >= (byte)'0' && bytes[i] <= (byte)'9' ? '#' : (char)bytes[i];
+            });
+
+            lock (_chatMessages)
+            {
+                if (_chatMessages.TryGetValue(message, out long count))
+                    _chatMessages[message] = count + 1;
+                else if (_chatMessages.Count < MaxDistinctChatMessages)
+                    _chatMessages[message] = 1;
+                else
+                    _chatMessages["(other messages)"] = _chatMessages.GetValueOrDefault("(other messages)") + 1;
+            }
         }
 
         private void NoteBall(ReadOnlySpan<byte> span)
