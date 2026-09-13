@@ -68,6 +68,14 @@ fi
 # starts, which is why this wrapper exports it rather than the caller being asked to remember.
 export DOTNET_PerfMapEnabled=1
 
+# The map alone is not enough. By default the runtime maps JIT compiled code twice - writable in one
+# mapping, executable in another, backed by a memfd - so that no page is ever both. perf attributes
+# the samples to that memfd, reports them as "memfd:doublemapper", and never consults the map, which
+# is keyed by the addresses the map file describes. Turning the double mapping off puts JIT code
+# where the map says it is. It weakens a hardening measure, which is why it is set here for a
+# profiling run rather than anywhere a server would be started for real.
+export DOTNET_EnableWriteXorExecute=0
+
 # Say what is actually being measured, so a label cannot misdescribe a run. Two profiles were once
 # taken of configurations that differed in a second setting left over from the run before.
 GLOBAL_CONF="${ZONE_DIR:-$REPO_ROOT/src/SubspaceServer/Zone}/conf/global.conf"

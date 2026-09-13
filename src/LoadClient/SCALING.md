@@ -1619,7 +1619,56 @@ taking longer — exactly the shape measured. Whether that is buffers in flight 
 each thread its own allocation budget is not established; the arena queues are nowhere near their 2,000
 item limit at 27% busy, so it is not backlog.
 
-## Threads are U shaped, and six is the bottom
+## The firewall is a fifth of the send thread, and it has been corrupting every comparison
+
+**Read this before the two sections below it, both of which it invalidates in part.**
+
+A sampled profile of one send thread, hardware counters, 999 Hz, 30 seconds inside a settled run of
+1,600 clients over 16 arenas:
+
+```
+66.82%  [kernel.kallsyms]
+31.54%  memfd:doublemapper          <- JIT compiled code
+ 0.80%  libcoreclr.so
+
+12.31%  nft_do_chain                <- nftables walking its rule chain
+ 3.05%  expr_call_ops_eval
+ 1.96%  nft_meta_get_eval
+ 1.32%  nft_immediate_eval
+ 1.05%  __nf_conntrack_find_get
+ 0.85%  nf_hook_slow
+ 0.81%  udp_sendmsg                 <- the actual send
+```
+
+**Two thirds of the send thread is kernel, and at least a fifth of the whole thread is the firewall**,
+evaluating its chain and doing a connection tracking lookup for every datagram. `udp_sendmsg` itself
+is 0.81%. `__pv_queued_spin_lock_slowpath` at 2.14% is contention on conntrack's own locks between the
+server's threads.
+
+This is the answer to the arithmetic that could not be made to work: 13.6 µs per connection per pass
+for two 22 byte packets, against syscalls that ought to cost 2% of a core. The syscalls do cost about
+that. The firewall wrapped around them costs ten times more.
+
+### It also explains why the comparisons would not settle
+
+Same configuration, different runs: `Workers = 2` measured 2.39 cores and then 2.82, and `Workers = 1`
+measured 2.78 twice and then 2.63. **The one worker against two result reversed on repetition.** An 18%
+spread between runs of one configuration is larger than most of the differences recorded below, so:
+
+- **"One worker makes the send threads dear" is withdrawn.** It was one pair, and the pair did not hold.
+- **"Six busy threads is the bottom of a U" is withdrawn.** Every step in it — 1 to 2 workers at 16%,
+  2 to 3 send threads at 18% — is at or below the noise it was measured against.
+- **Four workers costing 31% is the only step above the spread**, and it is one run. It needs repeating
+  before it is believed either.
+
+Connection tracking is stateful and its table carries entries between runs, which is a plausible source
+of exactly this kind of run to run variation. Nothing in the harness was wrong; the machine underneath
+it was not holding still, and no amount of averaging windows *within* a run would show that.
+
+**Nothing on this machine should be compared again until the firewall is out of the packet path**, and
+then every configuration needs repeating rather than measuring once.
+
+## Threads are U shaped, and six is the bottom — WITHDRAWN, see above
 
 Adding the send thread count to the worker sweep, all at 1,600 clients over 16 arenas with the same
 instrumentation, and counting every thread that does continuous work — the arena workers, the send
