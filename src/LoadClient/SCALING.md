@@ -977,6 +977,9 @@ The reported figures stay right: 796,111 sends a second against 796,083 before.
 
 ## Removing work stops helping once there are four workers
 
+*Explained below, under "Why four workers cost more than two": the extra was never in the work. It
+was the wait between items, which spun and yielded, and none of the removals here could touch it.*
+
 The node pool was the last shared object on the send path that had not been tested — a
 `DefaultObjectPool` whose fast path is a single field settled by an interlocked compare-exchange,
 taken from once per recipient. Replacing it with plain allocation, which removes it from the path
@@ -1713,6 +1716,124 @@ limiter, whose `Iter` and `Check` are a few operations over a six integer array.
 connection per pass costs far more than what it appears to do, and no amount of comparing runs will
 name it.
 
+## The worker's profile, and the first thing it said was that this is a Debug build
+
+With managed frames resolving at last (`DOTNET_EnableWriteXorExecute=0`, so that JIT code is where
+the perf map says it is), `profile-thread.sh` against `ArenaLoop-0` at 1,600 clients over 16 arenas,
+`--spread 16384`, two workers, 30 s at 999 Hz:
+
+| where | share of the worker |
+|---|---|
+| JIT code | 88.9% |
+| kernel | 7.7%, all of it timer interrupts |
+| libcoreclr | 2.3% |
+
+No system calls. A worker buffers packets and the send threads do the sending, so the firewall that
+costs a send thread a fifth of itself never touches a worker. That was argued above from first
+principles; this is the measurement.
+
+The second thing in it was the tag on every method of the server's own: `[MinOptJitted]`. The runtime
+marks each method in the perf map with how it was compiled, and that one means compiled with
+optimisation off and never to be tiered up, which is what every method of an assembly built in Debug
+gets. The BCL methods around them were `[OptimizedTier1]`. `loadtest.sh` ran `dotnet run` with no
+configuration, which is Debug, and every figure in this document was measured that way. The caveat
+was written down near the top; what the profile added was its size:
+
+| method | share of the worker | in a Release build |
+|---|---|---|
+| `LittleEndianConverter.Convert(int16)` | 7.3% | nothing: on x64 it returns its argument, and is inlined away |
+| `TryGetExtraData` and its cast helper | 14.4% | inlined at the call site |
+| `Hypot` | 7.3% | real work, in registers rather than stack slots |
+| packet getters, `Debug.Assert` string handlers | 2.8% | gone |
+
+`CONFIGURATION=Release` on `loadtest.sh` now runs the Release build, built first by the caller; the
+run says which build it was, and `profile-thread.sh` sums the `[MinOptJitted]` share of a profile and
+warns. In Release the same worker went from 52.5 µs a packet to 30, and the server from 2.61 cores
+to 2.27. The send threads did not move, because their cost is in the kernel.
+
+Per-packet figures from here on are a method's share × the worker's utilisation ÷ the packets that
+worker handled. Both the thread's total and its share of the packets change with the worker count, so
+the raw percentages mislead.
+
+## Why four workers cost more than two: the wait spun and yielded
+
+Two workers against four, same load, one worker profiled each time, Debug and then Release:
+
+| µs per packet on the worker | pw-2 (Debug) | pw-4 | rw-2b (Release) | rw-4 |
+|---|---|---|---|---|
+| whole worker | 52.5 | 70.0 | 30.0 | 37.5 |
+| kernel and runtime | 5.2 | 13.2 | 9.6 | 13.6 |
+| send side: `SendOrBufferPacket`, `OutLock`, pool, atomics | 15.4 | 19.9 | 10.6 | 13.0 |
+| scan side: `BroadcastPosition`, `Hypot`, `TryGetExtraData` | 21.9 | 23.6 | 8.5 | 9.5 |
+
+The send side grew and the scan side did not, which is what the hand timing above had said. But the
+largest mover was the kernel, and the timer interrupt's share of it was constant, so whatever it was
+scaled per packet and not per processor-second. Its symbols were the scheduler and system call entry
+and exit, with `do_sched_yield` among them. Nothing else: no networking, no memory management.
+
+The obvious reading, that an idler worker blocks and is woken for more of its items, was wrong, and
+the kernel's own counts for the thread said so: 284 blocks a second, but 2,765 times a second
+switched out while still runnable. `perf stat` on the thread over the same window:
+
+| per second, one worker of two, Release | |
+|---|---|
+| `sched_yield` | 17,942 |
+| `futex` | 539 |
+| blocked and woken | 284 |
+
+A worker waited on a `BlockingCollection`, whose wait is a `SemaphoreSlim`. When that finds nothing
+queued it spins for up to 140 iterations before it will block, and from the tenth iteration every
+other one is `Thread.Yield`: a `sched_yield` system call and a full trip through the scheduler,
+whether or not anything else can run, up to 65 of them for one empty queue. 284 × 65 is 18,460.
+Nearly every item arrives inside the first few iterations, which are pause instructions and cost
+nothing to speak of, but the few hundred gaps a second that outlast the budget cost 65 system calls
+each, about 140 µs of processor per idle transition, and that was a fifth of the worker's time. The
+budget is fixed while the gaps between one worker's items grow with the number of workers, so a
+worker at four is more often in the expensive part of its wait than a worker at two. The cost lands
+in the kernel and in the runtime's spin, never in any method of the server's, which is why six
+changes to the work each helped one worker and none helped four: the extra was never in the work.
+
+It is not a capacity cost. At saturation there are no gaps and the spin never runs, so the 1.78
+measured between one and two saturated workers above stands. It is a cost at partial load that grows
+with idleness, and every worker comparison in this document that was not at saturation was inflated
+by it, more so the more workers were running. It is also why isolating the workers on their own
+cores made it worse: a yield with nothing else to run returns at once, and the budget is spent
+faster.
+
+### The fix
+
+`scale/24-worker-wait`: a `ConcurrentQueue` and a `ManualResetEventSlim` with a spin count of ten,
+under `SpinWait`'s yield threshold, so the wait spins for a couple of microseconds on pause
+instructions, for the item that is about to arrive, and then blocks. The event is cleared before the
+queue is re-read, so a wake cannot be lost between the two.
+
+| per second on one worker, Release | rw-2c, before | fw-2, after | fw-4, after |
+|---|---|---|---|
+| `sched_yield` | 17,942 | 248 | 106 |
+| blocked and woken | 284 | 583 | 579 |
+| kernel share of the worker | 19.6% | 10.1% | 12.6% |
+
+| | rw-2b | rw-4 | fw-2 | fw-4 |
+|---|---|---|---|---|
+| µs per packet on the worker | 30.0 | 37.5 | 22.5 | 25.0 |
+| the four worker penalty | | +25% | | +11% |
+| all workers together | 48% | 60% | 36% | 40% |
+| whole server, cores | 2.32 | 2.42 | 2.11 | 2.10 |
+
+Three Release runs of two workers before the fix put the profiled worker at 24, 24 and 20 percent;
+after it, 18. The server costs the same at four workers as at two. What is left on the worker is a
+microsecond on the send side, where the pool dequeue and `SendOrBufferPacket` grew, and a microsecond
+of real block-and-wake, since a worker at four blocks twice as often per packet. The scan side is flat
+to within a percent.
+
+### The cast that was a call
+
+The largest single item left on the worker in Release is `CastHelpers.IsInstanceOfClass` at 12.65%,
+about 2.9 µs a packet. It is the `is T` inside `TryGetExtraData`, once per candidate scanned, and it
+is a call because `Game.PlayerData` was not sealed: for a class nothing can derive from, the same
+check is an inline comparison of the method table pointer. `scale/25-sealed-extra-data` seals every
+module's private per-player and per-arena data class. Not yet measured.
+
 ## What to watch next
 
 - **A sampled profile of one send thread at one worker against two**, which is now possible and is the
@@ -1743,19 +1864,11 @@ name it.
   formula has never been measured against anything on any machine.
 - **The 38 errors logged in every VPS run**, which have been present in every run on that box and have
   never been read.
-- **The four worker floor — deferred until the receive path is fixed, then revisit.** Spreading the
-  same work over four workers costs 37% more processor time than one, and six interventions have each
-  helped one worker and none helped four. It is not the work being done, not the objects being shared,
-  not the processors being shared, and not the mainloop writing what the workers read; what is left in
-  the send path is the connection lock and the outgoing queue, which is real work rather than
-  bookkeeping.
-
-  Parked when nothing here could deliver enough packets to make the workers the constraint — they had
-  38% and 55% of themselves spare while a quarter of the offered load went missing upstream.
-  **Draining the receive socket has since changed that**: a single worker now runs at 111% and is the
-  limit, so the condition this was waiting on is met and it is ready to pick up again. The next thing
-  it needs is the saturation comparison that could not be run before — what one worker carries against
-  what two carry, both driven to the wall.
+- **The four worker floor — FOUND, see "Why four workers cost more than two" above.** It was the
+  wait between items, not the work: six interventions on the work helped one worker and none helped
+  four because the extra was 65 `sched_yield` calls per idle gap. Fixed on `scale/24-worker-wait`.
+  What remains is +11% per packet on the worker at four against two, nothing at the level of the
+  whole server, and it sits in the send path's shared lines.
 - **The rest of the arena-thread packet path still.** Weapons and deaths have now been run through it
   and found two defects, both fixed, with a sustained combat run clean afterwards. Ship and freq
   changes, flags, balls, and above all switching arena while packets are in flight — which is what the
@@ -1770,11 +1883,13 @@ name it.
   the generator's side worse, not better. This needs a second machine, or a generator that can
   receive far more cheaply than it does.
 - **Re-measuring the worker scaling numbers on the fixed build.** Every figure in this document from
-  the arena workers predates the busy wait fix and overstates the penalty, the more so the more
-  workers were running. The direction and the eliminations hold; the magnitudes need redoing.
-- **Whether isolating the workers still makes it worse.** That result was measured with the spin
-  present, and an uncontended core is exactly where a spin costs most, so it is the one earlier
-  finding that could be an artefact rather than a clue.
+  the arena workers predates the busy wait fix, and now also the yield fix, and overstates the
+  penalty, the more so the more workers were running. The saturation figures are unaffected, since a
+  saturated worker has no gaps to spin in. The direction and the eliminations hold; the magnitudes
+  need redoing, and in Release.
+- **Whether isolating the workers still makes it worse.** Explained: that result was measured with
+  the yield spin present, and a yield on an uncontended core returns at once, so the budget was spent
+  faster there. An artefact of the spin, not a clue, and not worth repeating.
 - **Where the load goes in the saturated runs**, where nothing is specced and half the offered packets
   still produce no broadcast. A counter on each early return in `HandlePositionPacket` would say in
   one run which of the three it is, and the timestamp check is the one to expect.
