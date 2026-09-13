@@ -1060,6 +1060,9 @@ live.
 
 ### Handling packets on the arena thread is worth thirteen percent, at one worker
 
+*Re-measured in Release with the yield fix in, at two workers: a three percent loss. See "The cast
+that was a call" below. This figure was taken in Debug with the spin present.*
+
 Turned on, with no assertion failures and no errors at either worker count:
 
 | | mainloop handles packets | arena thread handles packets |
@@ -1848,7 +1851,31 @@ What that leaves on the scan side is about 87 ns per candidate, for a hundred ca
 and the line being fetched is player state the mainloop writes for every packet it handles. That is
 the sharing relationship "What none of them touched" describes, and `Net:HandlePacketsOnArenaThread`
 is the setting that removes it, measured at 13% of the server at one worker on a Debug build before
-any of the above. It has not been measured in Release, or with the yield fix in.
+any of the above.
+
+**Measured in Release with the yield fix in, `hw-2`: a loss of about three percent.**
+
+| | sw-2, off | hw-2, on |
+|---|---|---|
+| whole server, cores | 2.17 | 2.23 |
+| mainloop | 9%, 2,891 iterations a second | below the listing, 159 a second |
+| each of two workers | 19 to 20% | 26% |
+| worker, µs per packet | 23.75 | 32.5 |
+
+The mainloop left the packet path, and the workers took on more than it gave up. Of the extra 8.75 µs
+a packet on the worker, about 2 is the handler itself: `HandlePositionPacket`, the work item, the
+advisor lookup, the player lock. The rest is the scan and the sends getting dearer on the same thread:
+`BroadcastPosition` 8.7 to 11.0 µs, the pool dequeue 1.5 to 2.5, the connection lock 1.6 to 2.3. So
+the scan's cost is not the position line the mainloop writes, and moving the write did not buy it
+back. The thirteen percent at one worker above was measured in Debug with the yield spin present,
+which confounds it. Left off.
+
+What the scan's 87 ns per candidate is remains open. `PERF_EVENT=cache-misses` on
+`profile-thread.sh` is the instrument for it, attributing samples to the instructions that missed
+rather than to whichever one consumed the load. But the worker is a fifth of a core at this load and
+each send thread is four fifths, so it is not where the next player fits, and the worker question is
+closed here: the code reason four cost more than two was the wait, it is fixed, and what remains is
+the send path's shared lines at about half a microsecond per recipient.
 
 ## What to watch next
 
