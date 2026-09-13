@@ -164,6 +164,12 @@ namespace SS.Core.Modules
         private int[] _sendShardPlayerCounts = [];
 
         /// <summary>
+        /// When a full send buffer was last noted in the log, so that it is noted at most every ten
+        /// seconds rather than once per dropped datagram.
+        /// </summary>
+        private long _lastSendBufferFullLogTimestamp;
+
+        /// <summary>
         /// What fraction of its interval each send thread spent working, as a percentage, over that
         /// thread's most recent measurement window.
         /// </summary>
@@ -552,6 +558,21 @@ namespace SS.Core.Modules
                 The operating system silently caps this at its own maximum, and a warning is logged when
                 it does. On Linux that maximum is net.core.rmem_max and has to be raised separately.
                 """)]
+        [ConfigHelp<int>("Net", "SendBufferSize", ConfigScope.Global, Default = 4194304, Min = 0,
+            Description = """
+                The size in bytes to ask the operating system for on each socket's send buffer, or 0 to
+                leave it at whatever the operating system defaults to.
+                The socket is non-blocking, so when the buffer is full a datagram is refused rather than
+                waited for, and the server drops it: a reliable one is resent by the reliable layer, an
+                unreliable one is a position the next one supersedes. The default buffer is a couple of
+                hundred kilobytes, which a burst of players entering an arena fills on a real network
+                interface, where a datagram is charged to the buffer until the interface has taken it.
+                On loopback that never happens, which is why it was not seen until the load generator
+                ran on another machine: 2,517 datagrams refused in one connect ramp of two thousand.
+                Drops are counted in ?netstats and noted in the log at most once every ten seconds.
+                The operating system silently caps this at its own maximum, and a warning is logged when
+                it does. On Linux that maximum is net.core.wmem_max and has to be raised separately.
+                """)]
         [ConfigHelp<bool>("Net", "HandlePacketsOnArenaThread", ConfigScope.Global, Default = false,
             Description = """
                 Whether packets from a player who is settled in an arena are handled on that arena's
@@ -672,6 +693,7 @@ namespace SS.Core.Modules
             bool InitializeSockets()
             {
                 int receiveBufferSize = _configManager.GetInt(_configManager.Global, "Net", "ReceiveBufferSize", ConfigHelp.Constants.Global.Net.ReceiveBufferSize.Default);
+                int sendBufferSize = _configManager.GetInt(_configManager.Global, "Net", "SendBufferSize", ConfigHelp.Constants.Global.Net.SendBufferSize.Default);
 
                 //
                 // Listen sockets (pairs of game and ping sockets)
@@ -847,6 +869,30 @@ namespace SS.Core.Modules
                         {
                             _logManager.LogM(LogLevel.Warn, nameof(Network),
                                 $"Asked for a {receiveBufferSize} byte receive buffer on port {port} but got {socket.ReceiveBufferSize}; the OS capped it. On Linux see net.core.rmem_max.");
+                        }
+                    }
+
+                    // The other direction has the same problem with the opposite sign. The socket is
+                    // non-blocking, so a datagram that does not fit in the send buffer is refused, and
+                    // on a real interface a datagram stays charged to the buffer until the interface has
+                    // taken it. A burst of players entering an arena, each owed a run of reliable
+                    // packets, fills the default in no time. Loopback takes a datagram at once, so this
+                    // was invisible until the load generator ran on a different machine.
+                    if (sendBufferSize > 0)
+                    {
+                        try
+                        {
+                            socket.SendBufferSize = sendBufferSize;
+                        }
+                        catch (Exception ex)
+                        {
+                            _logManager.LogM(LogLevel.Warn, nameof(Network), $"Can't set the socket send buffer size. {ex.Message}");
+                        }
+
+                        if (socket.SendBufferSize < sendBufferSize)
+                        {
+                            _logManager.LogM(LogLevel.Warn, nameof(Network),
+                                $"Asked for a {sendBufferSize} byte send buffer on port {port} but got {socket.SendBufferSize}; the OS capped it. On Linux see net.core.wmem_max.");
                         }
                     }
 
@@ -1131,6 +1177,11 @@ namespace SS.Core.Modules
             try
             {
                 ld.GameSocket.SendTo(data, SocketFlags.None, remoteAddress);
+            }
+            catch (SocketException ex) when (ex.SocketErrorCode == SocketError.WouldBlock)
+            {
+                NoteSendBufferFull(ld.GameSocket);
+                return;
             }
             catch (SocketException ex)
             {
@@ -5308,6 +5359,34 @@ namespace SS.Core.Modules
         /// </remarks>
         /// <param name="conn">Context about the connection.</param>
         /// <param name="data">The data to send.</param>
+        /// <summary>
+        /// Counts a datagram the operating system refused because the socket's send buffer was full,
+        /// and says so in the log at most once every ten seconds.
+        /// </summary>
+        /// <remarks>
+        /// The datagram is dropped rather than waited for. A reliable one is resent by the reliable
+        /// layer, and an unreliable one is a position the next one supersedes, so waiting would cost
+        /// the send thread's pass for nothing. Logging each one was itself a cost: one connect ramp
+        /// over a real interface wrote 2,517 error lines with stack traces for datagrams that did not
+        /// matter individually. The count is what matters, and it is in ?netstats.
+        /// </remarks>
+        /// <param name="socket">The socket whose buffer was full, to name it.</param>
+        private void NoteSendBufferFull(Socket socket)
+        {
+            ulong drops = Interlocked.Increment(ref _globalStats.SendBufferFullDrops);
+
+            long now = Stopwatch.GetTimestamp();
+            long last = Volatile.Read(ref _lastSendBufferFullLogTimestamp);
+            if (now - last < Stopwatch.Frequency * 10)
+                return;
+
+            // Whichever thread wins the exchange logs; the others have been told the count moved on.
+            if (Interlocked.CompareExchange(ref _lastSendBufferFullLogTimestamp, now, last) != last)
+                return;
+
+            _logManager.LogM(LogLevel.Warn, nameof(Network), $"The send buffer of socket {socket.LocalEndPoint} was full; {drops} datagrams dropped so far. See Net:SendBufferSize.");
+        }
+
         private void SendRaw(ConnData conn, ReadOnlySpan<byte> data)
         {
             if (conn is null)
@@ -5376,6 +5455,11 @@ namespace SS.Core.Modules
                 try
                 {
                     conn.SendSocket!.SendTo(encryptedBuffer, SocketFlags.None, conn.RemoteAddress!);
+                }
+                catch (SocketException ex) when (ex.SocketErrorCode == SocketError.WouldBlock)
+                {
+                    NoteSendBufferFull(conn.SendSocket!);
+                    return;
                 }
                 catch (SocketException ex)
                 {
@@ -7402,6 +7486,7 @@ namespace SS.Core.Modules
             public ulong PingsReceived, PacketsSent, PacketsReceived;
             public ulong BytesSent, BytesReceived;
             public ulong BuffersTotal, BuffersUsed;
+            public ulong SendBufferFullDrops;
             public readonly ulong[] GroupedStats = new ulong[8];
             public readonly ulong[] RelGroupedStats = new ulong[8];
             public readonly ulong[] PriorityStats = new ulong[(int)Enum.GetValues<BandwidthPriority>().Max() + 1];
@@ -7415,6 +7500,7 @@ namespace SS.Core.Modules
             ulong IReadOnlyNetStats.BytesReceived => Interlocked.Read(ref BytesReceived);
             ulong IReadOnlyNetStats.BuffersTotal => Interlocked.Read(ref BuffersTotal);
             ulong IReadOnlyNetStats.BuffersUsed => Interlocked.Read(ref BuffersUsed);
+            ulong IReadOnlyNetStats.SendBufferFullDrops => Interlocked.Read(ref SendBufferFullDrops);
 
             ulong IReadOnlyNetStats.GroupedStats0 => Interlocked.Read(ref GroupedStats[0]);
             ulong IReadOnlyNetStats.GroupedStats1 => Interlocked.Read(ref GroupedStats[1]);

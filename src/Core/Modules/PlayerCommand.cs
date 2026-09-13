@@ -1849,6 +1849,7 @@ namespace SS.Core.Modules
             _chat.SendMessage(player, $"netstats: bw out={bwout}  bw in={bwin}");
 
             _chat.SendMessage(player, $"netstats: buffers used={stats.BuffersUsed}/{stats.BuffersTotal} ({(double)stats.BuffersUsed / stats.BuffersTotal:p})");
+            _chat.SendMessage(player, $"netstats: send buffer full drops={stats.SendBufferFullDrops}");
 
             _chat.SendMessage(player, $"netstats: grouped=" +
                 $"{stats.GroupedStats0}/" +
