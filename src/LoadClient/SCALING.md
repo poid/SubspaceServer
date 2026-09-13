@@ -1832,7 +1832,23 @@ The largest single item left on the worker in Release is `CastHelpers.IsInstance
 about 2.9 µs a packet. It is the `is T` inside `TryGetExtraData`, once per candidate scanned, and it
 is a call because `Game.PlayerData` was not sealed: for a class nothing can derive from, the same
 check is an inline comparison of the method table pointer. `scale/25-sealed-extra-data` seals every
-module's private per-player and per-arena data class. Not yet measured.
+module's private per-player and per-arena data class.
+
+**Measured: nothing.** The helper is gone from the profile and `BroadcastPosition` grew from 23.6% to
+36.8% of the worker, which is the same time under a different name; the worker sat at 19 to 20
+percent against 18 before, within the spread of repeated runs. So the stall was never the call. It is
+the memory the check touches, another player's extra-data slot and then that object's header, once
+per candidate scanned, and the helper was only the first instruction to use what was loaded, so the
+profile charged the miss to it. Inline, the miss is charged to `BroadcastPosition` instead. The
+sealing stays, since it is correct and costs nothing, but it is a tidy-up and not a gain, and a
+sample profile attributes a miss to whichever instruction consumes the load, which is not always the
+one that matters.
+
+What that leaves on the scan side is about 87 ns per candidate, for a hundred candidates a packet,
+and the line being fetched is player state the mainloop writes for every packet it handles. That is
+the sharing relationship "What none of them touched" describes, and `Net:HandlePacketsOnArenaThread`
+is the setting that removes it, measured at 13% of the server at one worker on a Debug build before
+any of the above. It has not been measured in Release, or with the yield fix in.
 
 ## What to watch next
 
