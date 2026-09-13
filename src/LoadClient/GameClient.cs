@@ -4,6 +4,7 @@ using SS.Utilities;
 using System.Net;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
+using System.Text;
 
 namespace SS.LoadClient
 {
@@ -27,6 +28,39 @@ namespace SS.LoadClient
     {
         private const byte ClientTypeVIE = 0x01;
 
+        /// <summary>
+        /// How many times the connection init is sent before giving up.
+        /// </summary>
+        private const int ConnectionInitAttempts = 5;
+
+        /// <summary>
+        /// How long to wait for a reply before sending the connection init again.
+        /// </summary>
+        /// <remarks>
+        /// Short, because the thing being recovered from is a dropped packet rather than a slow server:
+        /// waiting longer only delays the retry that was always going to be needed.
+        /// </remarks>
+        private static readonly TimeSpan ConnectionInitTimeout = TimeSpan.FromSeconds(2);
+
+        /// <summary>
+        /// How many times a reliable packet is sent before giving up on it.
+        /// </summary>
+        private const int ReliableSendAttempts = 5;
+
+        /// <summary>
+        /// How long to wait for an acknowledgement before sending a reliable packet again.
+        /// </summary>
+        private static readonly TimeSpan ReliableSendTimeout = TimeSpan.FromSeconds(3);
+
+        /// <summary>
+        /// The highest sequence number the server has acknowledged, or -1.
+        /// </summary>
+        /// <remarks>
+        /// Highest rather than a set, since acknowledgements can arrive out of order and a sender only
+        /// needs to know whether its own has gone past.
+        /// </remarks>
+        private long _highestAckedSequenceNumber = -1;
+
         private readonly Socket _socket = new(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
         private readonly byte[] _receiveBuffer = new byte[2048];
 
@@ -46,6 +80,28 @@ namespace SS.LoadClient
 
         public bool IsConnected { get; private set; }
 
+        /// <summary>
+        /// Whether the server has answered the login.
+        /// </summary>
+        /// <remarks>
+        /// Asking to enter an arena before this is set gets the request thrown away, because the player
+        /// is not yet in a state the server will accept one from. Waiting a fixed time instead is what
+        /// this used to do, and it silently stopped working under load: the server advances logins on a
+        /// ten hertz state machine, so with thousands of clients arriving at once a login takes far
+        /// longer than any delay worth hard coding, and the clients that timed out never reached an
+        /// arena at all. That understated every measurement taken with this tool.
+        /// </remarks>
+        public bool IsLoggedIn { get; private set; }
+
+        /// <summary>
+        /// Whether the server has put this client into an arena.
+        /// </summary>
+        /// <remarks>
+        /// True once the server has said who this client is, which it does on arena entry. Positions
+        /// sent before that are discarded, so there is no point starting to send them earlier.
+        /// </remarks>
+        public bool IsInArena => Volatile.Read(ref _ownPlayerId) >= 0;
+
         public string? FailureReason { get; private set; }
 
         /// <summary>
@@ -56,6 +112,16 @@ namespace SS.LoadClient
         /// skips them. Summed across clients it says how much the server is actually pushing out.
         /// </remarks>
         public long PositionUpdatesReceived;
+
+        /// <summary>
+        /// Position updates this client handed to its socket.
+        /// </summary>
+        /// <remarks>
+        /// Without this there is no way to tell a server that dropped a packet from a client that never
+        /// sent one. Both look identical from the server's counters, and the difference decides whether
+        /// a shortfall is the thing being measured or the thing doing the measuring.
+        /// </remarks>
+        public long PositionUpdatesSent;
 
         public long PacketsReceived;
         public long BytesReceived;
@@ -72,6 +138,82 @@ namespace SS.LoadClient
         private readonly List<short> _knownPlayerIds = new(64);
 
         private short _ownPlayerId = -1;
+
+        /// <summary>
+        /// Ship change notifications seen, for any player in the arena. The server tells the whole arena
+        /// about each one, so this confirms ship changes are being processed rather than refused.
+        /// </summary>
+        public long ShipChangesSeen;
+
+        /// <summary>
+        /// Freq change notifications seen, likewise for any player in the arena.
+        /// </summary>
+        public long FreqChangesSeen;
+
+        /// <summary>
+        /// Flag pickup notifications seen, for any player in the arena.
+        /// </summary>
+        public long FlagPickupsSeen;
+
+        /// <summary>
+        /// Ball updates seen. The server sends one to the arena whenever a ball is picked up or shot.
+        /// </summary>
+        public long BallUpdatesSeen;
+
+        /// <summary>
+        /// Times the server has said who this client is, which it does on every arena entry. One more
+        /// than the number of arena switches that completed.
+        /// </summary>
+        public long ArenaEntriesSeen;
+
+        /// <summary>
+        /// The ship the server last put this client in, or -1 before it has said.
+        /// </summary>
+        /// <remarks>
+        /// Kept so that a ship change can ask for a different ship. Asking for the one already in is
+        /// refused, with a warning in the server log that would then be mistaken for a defect.
+        /// </remarks>
+        private int _ownShip = -1;
+
+        /// <summary>
+        /// The freq the server last put this client on, or -1 before it has said.
+        /// </summary>
+        private int _ownFreq = -1;
+
+        private const int MaxBalls = 8;
+
+        /// <summary>
+        /// What the server last said about each ball, by ball id: who carries it and its fire time.
+        /// </summary>
+        /// <remarks>
+        /// A pickup has to quote the fire time from the server's last update of the ball, or the server
+        /// refuses it as coming from stale coordinates, and it has to be for a ball nobody is carrying.
+        /// Guarded by its own lock, since the receive loop writes it and the position loop reads it.
+        /// </remarks>
+        private readonly BallInfo[] _balls = new BallInfo[MaxBalls];
+
+        private struct BallInfo
+        {
+            public bool Seen;
+            public short CarrierId;
+            public uint Time;
+        }
+
+        public int OwnShip => Volatile.Read(ref _ownShip);
+
+        public int OwnFreq => Volatile.Read(ref _ownFreq);
+
+        private const int MaxDistinctChatMessages = 16;
+
+        /// <summary>
+        /// Chat messages received, by text, with how many times each arrived.
+        /// </summary>
+        /// <remarks>
+        /// The server explains a refused ship change, freq change, or flag touch to the player in chat
+        /// and nowhere else, so this is the only record of why a request was turned down. Capped at a
+        /// handful of distinct texts, since a message that carries a number is a new text every time.
+        /// </remarks>
+        private readonly Dictionary<string, long> _chatMessages = [];
 
         public async Task<bool> ConnectAsync(string host, int port, CancellationToken cancellationToken)
         {
@@ -106,33 +248,42 @@ namespace SS.LoadClient
                 // which is what EncryptionNull does.
                 int key = Random.Shared.Next(int.MinValue, int.MaxValue);
                 ConnectionInitPacket init = new(key, ClientTypeVIE);
-                await SendRawAsync(MemoryMarshal.AsBytes(MemoryMarshal.CreateReadOnlySpan(ref init, 1)).ToArray(), cancellationToken);
+                byte[] initBytes = MemoryMarshal.AsBytes(MemoryMarshal.CreateReadOnlySpan(ref init, 1)).ToArray();
 
-                // Wait for the response, ignoring anything else that turns up first.
-                using CancellationTokenSource timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-                timeout.CancelAfter(TimeSpan.FromSeconds(10));
-
-                try
+                // Retried, because this is UDP and it is the one packet with nothing behind it to notice
+                // it went missing. A real client retries too. Sending it once and waiting meant a single
+                // lost datagram cost that client the whole run, which showed up as a steady few percent
+                // of clients never connecting, with the server having no record of them at all.
+                for (int attempt = 0; attempt < ConnectionInitAttempts; attempt++)
                 {
-                    while (true)
+                    await SendRawAsync(initBytes, cancellationToken);
+
+                    using CancellationTokenSource attemptTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                    attemptTimeout.CancelAfter(ConnectionInitTimeout);
+
+                    try
                     {
-                        int received = await _socket.ReceiveAsync(_receiveBuffer, SocketFlags.None, timeout.Token);
-                        if (received >= 6 && _receiveBuffer[0] == 0x00 && _receiveBuffer[1] == 0x02)
+                        while (true)
                         {
-                            IsConnected = true;
-                            return true;
+                            int received = await _socket.ReceiveAsync(_receiveBuffer, SocketFlags.None, attemptTimeout.Token);
+                            if (received >= 6 && _receiveBuffer[0] == 0x00 && _receiveBuffer[1] == 0x02)
+                            {
+                                IsConnected = true;
+                                return true;
+                            }
                         }
                     }
+                    catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+                    {
+                        // This attempt timed out. Try again, unless that was the last one.
+                    }
                 }
-                catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
-                {
-                    // Our own timeout, rather than the run ending. Worth saying so specifically: by far
-                    // the most likely cause is another encryption module sitting ahead of EncryptionNull,
-                    // which answers the handshake and then expects encryption this client cannot do.
-                    // Reported as a plain cancellation, that is close to impossible to guess.
-                    FailureReason = "no connection init response; is EncryptionNull loaded before EncryptionVIE?";
-                    return false;
-                }
+
+                // The other likely cause, and worth naming because it is close to impossible to guess:
+                // another encryption module sitting ahead of EncryptionNull answers the handshake and
+                // then expects encryption this client cannot do.
+                FailureReason = $"no connection init response after {ConnectionInitAttempts} attempts; is EncryptionNull loaded before EncryptionVIE?";
+                return false;
             }
             catch (OperationCanceledException)
             {
@@ -195,6 +346,12 @@ namespace SS.LoadClient
         {
             const byte ShipWarbird = 0;
 
+            // Unknown from here until the server says, on entry, what it gave this client. Nothing that
+            // depends on being in a ship is attempted in between, because a request that arrives while
+            // the server is moving the player is refused with a warning about the player's state.
+            Volatile.Write(ref _ownShip, -1);
+            Volatile.Write(ref _ownFreq, -1);
+
             C2S_GoArenaVIE go = new(
                 shipType: ShipWarbird,
                 wavMsg: 0,
@@ -218,6 +375,8 @@ namespace SS.LoadClient
         /// </param>
         public Task SendPositionAsync(short x, short y, short xSpeed, short ySpeed, sbyte rotation, WeaponCodes weapon, CancellationToken cancellationToken)
         {
+            Interlocked.Increment(ref PositionUpdatesSent);
+
             C2S_PositionPacket position = new()
             {
                 Rotation = rotation,
@@ -308,12 +467,24 @@ namespace SS.LoadClient
             {
                 CountIfPosition(span);
 
-                if (span[0] == (byte)S2CPacketType.PlayerEntering)
+                if (span[0] == (byte)S2CPacketType.LoginResponse)
+                    IsLoggedIn = true;
+                else if (span[0] == (byte)S2CPacketType.PlayerEntering)
                     NotePlayerEntering(span);
                 else if (span[0] == (byte)S2CPacketType.WhoAmI && span.Length >= 3)
-                    _ownPlayerId = LittleEndianConverter.Convert(MemoryMarshal.Read<short>(span.Slice(1, 2)));
+                    NoteArenaEntry(LittleEndianConverter.Convert(MemoryMarshal.Read<short>(span.Slice(1, 2))));
                 else if (span[0] == (byte)S2CPacketType.Kill)
                     Interlocked.Increment(ref KillsSeen);
+                else if (span[0] == (byte)S2CPacketType.ShipChange && span.Length >= S2C_ShipChange.Length)
+                    NoteShipChange(span);
+                else if (span[0] == (byte)S2CPacketType.FreqChange && span.Length >= S2C_FreqChange.Length)
+                    NoteFreqChange(span);
+                else if (span[0] == (byte)S2CPacketType.FlagPickup)
+                    Interlocked.Increment(ref FlagPickupsSeen);
+                else if (span[0] == (byte)S2CPacketType.Ball && span.Length >= BallPacket.Length)
+                    NoteBall(span);
+                else if (span[0] == (byte)S2CPacketType.Chat && span.Length > ChatPacket.HeaderLength)
+                    NoteChat(span);
 
                 return;
             }
@@ -344,6 +515,22 @@ namespace SS.LoadClient
 
                         Parse(span.Slice(offset + 1, length), acks);
                         offset += 1 + length;
+                    }
+                    break;
+
+                case 0x04: // the server acknowledging something sent reliably
+                    if (span.Length >= AckPacket.Length)
+                    {
+                        int acked = LittleEndianConverter.Convert(MemoryMarshal.Read<int>(span.Slice(2, 4)));
+
+                        // Highest seen, since acknowledgements can arrive out of order and the senders
+                        // only care whether theirs has gone past.
+                        long previous;
+                        while ((previous = Volatile.Read(ref _highestAckedSequenceNumber)) < acked)
+                        {
+                            if (Interlocked.CompareExchange(ref _highestAckedSequenceNumber, acked, previous) == previous)
+                                break;
+                        }
                     }
                     break;
 
@@ -380,6 +567,207 @@ namespace SS.LoadClient
         }
 
         /// <summary>
+        /// Asks for a different ship, sent reliably as a real client does.
+        /// </summary>
+        /// <returns><see langword="true"/> if the server acknowledged receiving it.</returns>
+        public Task<bool> SendShipChangeAsync(sbyte ship, CancellationToken cancellationToken)
+        {
+            return SendReliableAsync([(byte)C2SPacketType.SetShip, (byte)ship], cancellationToken);
+        }
+
+        /// <summary>
+        /// Asks for a different freq, sent reliably as a real client does.
+        /// </summary>
+        /// <returns><see langword="true"/> if the server acknowledged receiving it.</returns>
+        public Task<bool> SendFreqChangeAsync(short freq, CancellationToken cancellationToken)
+        {
+            C2S_SetFreq packet = new(freq);
+            ReadOnlySpan<byte> bytes = MemoryMarshal.AsBytes(MemoryMarshal.CreateReadOnlySpan(ref packet, 1));
+            return SendReliableAsync(bytes.ToArray(), cancellationToken);
+        }
+
+        /// <summary>
+        /// Touches a flag by id, sent reliably. Whether it is on the map to be touched is the server's call.
+        /// </summary>
+        /// <returns><see langword="true"/> if the server acknowledged receiving it.</returns>
+        public Task<bool> SendTouchFlagAsync(short flagId, CancellationToken cancellationToken)
+        {
+            return SendReliableAsync([(byte)C2SPacketType.TouchFlag, (byte)flagId, (byte)(flagId >> 8)], cancellationToken);
+        }
+
+        /// <summary>
+        /// Drops every flag carried. The server does nothing if none is.
+        /// </summary>
+        public Task SendDropFlagsAsync(CancellationToken cancellationToken)
+        {
+            return SendRawAsync([(byte)C2SPacketType.DropFlags], cancellationToken);
+        }
+
+        /// <summary>
+        /// Finds a ball the server last reported loose, and the fire time a pickup of it has to quote.
+        /// </summary>
+        public bool TryGetLooseBall(out byte ballId, out uint time)
+        {
+            lock (_balls)
+            {
+                for (int i = 0; i < _balls.Length; i++)
+                {
+                    if (_balls[i].Seen && _balls[i].CarrierId < 0)
+                    {
+                        ballId = (byte)i;
+                        time = _balls[i].Time;
+                        return true;
+                    }
+                }
+            }
+
+            ballId = 0;
+            time = 0;
+            return false;
+        }
+
+        /// <summary>
+        /// Whether the server's last update of a ball said this client carries it.
+        /// </summary>
+        public bool IsCarryingBall(byte ballId)
+        {
+            lock (_balls)
+            {
+                return ballId < _balls.Length && _balls[ballId].Seen && _balls[ballId].CarrierId == _ownPlayerId;
+            }
+        }
+
+        /// <summary>
+        /// Asks to pick up a ball, sent reliably.
+        /// </summary>
+        /// <param name="ballId">The ball.</param>
+        /// <param name="time">The ball's fire time from the server's last update of it, which the server checks.</param>
+        /// <param name="cancellationToken">To stop waiting.</param>
+        /// <returns><see langword="true"/> if the server acknowledged receiving it.</returns>
+        public Task<bool> SendPickupBallAsync(byte ballId, uint time, CancellationToken cancellationToken)
+        {
+            C2S_PickupBall packet = new(ballId, time);
+            ReadOnlySpan<byte> bytes = MemoryMarshal.AsBytes(MemoryMarshal.CreateReadOnlySpan(ref packet, 1));
+            return SendReliableAsync(bytes.ToArray(), cancellationToken);
+        }
+
+        /// <summary>
+        /// Shoots a carried ball, leaving it where this client is for the next client to pick up.
+        /// </summary>
+        public Task SendShootBallAsync(byte ballId, short x, short y, CancellationToken cancellationToken)
+        {
+            BallPacket packet = new(isS2C: false, ballId, x, y, xSpeed: 0, ySpeed: 0, playerId: _ownPlayerId, time: ServerTick.Now);
+            ReadOnlySpan<byte> bytes = MemoryMarshal.AsBytes(MemoryMarshal.CreateReadOnlySpan(ref packet, 1));
+            return SendRawAsync(bytes.ToArray(), cancellationToken);
+        }
+
+        /// <summary>
+        /// Notes an arena entry, which is where the server says who this client is now. What was learned
+        /// about the previous arena is forgotten: its player ids name nobody here, and its balls are not
+        /// these.
+        /// </summary>
+        private void NoteArenaEntry(short playerId)
+        {
+            _ownPlayerId = playerId;
+            Volatile.Write(ref _ownShip, -1);
+            Volatile.Write(ref _ownFreq, -1);
+            Interlocked.Increment(ref ArenaEntriesSeen);
+
+            lock (_knownPlayerIds)
+            {
+                _knownPlayerIds.Clear();
+            }
+
+            lock (_balls)
+            {
+                Array.Clear(_balls);
+            }
+        }
+
+        private void NoteShipChange(ReadOnlySpan<byte> span)
+        {
+            Interlocked.Increment(ref ShipChangesSeen);
+
+            // Type, ship, player id, freq.
+            short playerId = LittleEndianConverter.Convert(MemoryMarshal.Read<short>(span.Slice(2, 2)));
+            if (playerId == _ownPlayerId)
+            {
+                Volatile.Write(ref _ownShip, (sbyte)span[1]);
+                Volatile.Write(ref _ownFreq, LittleEndianConverter.Convert(MemoryMarshal.Read<short>(span.Slice(4, 2))));
+            }
+        }
+
+        private void NoteFreqChange(ReadOnlySpan<byte> span)
+        {
+            Interlocked.Increment(ref FreqChangesSeen);
+
+            // Type, player id, freq.
+            short playerId = LittleEndianConverter.Convert(MemoryMarshal.Read<short>(span.Slice(1, 2)));
+            if (playerId == _ownPlayerId)
+                Volatile.Write(ref _ownFreq, LittleEndianConverter.Convert(MemoryMarshal.Read<short>(span.Slice(3, 2))));
+        }
+
+        /// <summary>
+        /// The chat messages received so far, by text, with how many times each arrived.
+        /// </summary>
+        public KeyValuePair<string, long>[] GetChatMessages()
+        {
+            lock (_chatMessages)
+            {
+                return [.. _chatMessages];
+            }
+        }
+
+        private void NoteChat(ReadOnlySpan<byte> span)
+        {
+            ReadOnlySpan<byte> messageBytes = ChatPacket.GetMessageBytes(span);
+            int end = messageBytes.IndexOf((byte)0);
+            if (end >= 0)
+                messageBytes = messageBytes[..end];
+
+            if (messageBytes.IsEmpty)
+                return;
+
+            // Allocates, which is fine here: chat is a message every so often, not a packet every tick.
+            // Digits are replaced so that "Frequency 100 is not available" and "Frequency 101 is not
+            // available" count as one message, and so that a message naming a player does not take up
+            // one of the distinct texts per player.
+            string message = string.Create(messageBytes.Length, messageBytes, static (chars, bytes) =>
+            {
+                for (int i = 0; i < bytes.Length; i++)
+                    chars[i] = bytes[i] >= (byte)'0' && bytes[i] <= (byte)'9' ? '#' : (char)bytes[i];
+            });
+
+            lock (_chatMessages)
+            {
+                if (_chatMessages.TryGetValue(message, out long count))
+                    _chatMessages[message] = count + 1;
+                else if (_chatMessages.Count < MaxDistinctChatMessages)
+                    _chatMessages[message] = 1;
+                else
+                    _chatMessages["(other messages)"] = _chatMessages.GetValueOrDefault("(other messages)") + 1;
+            }
+        }
+
+        private void NoteBall(ReadOnlySpan<byte> span)
+        {
+            Interlocked.Increment(ref BallUpdatesSeen);
+
+            // Type, ball id, x, y, x speed, y speed, the carrier's player id or -1, fire time.
+            byte ballId = span[1];
+            if (ballId >= _balls.Length)
+                return;
+
+            short carrierId = LittleEndianConverter.Convert(MemoryMarshal.Read<short>(span.Slice(10, 2)));
+            uint time = LittleEndianConverter.Convert(MemoryMarshal.Read<uint>(span.Slice(12, 4)));
+
+            lock (_balls)
+            {
+                _balls[ballId] = new BallInfo { Seen = true, CarrierId = carrierId, Time = time };
+            }
+        }
+
+        /// <summary>
         /// Records another player's id from a player entering packet, so that a death can name a killer
         /// the server will accept.
         /// </summary>
@@ -389,12 +777,21 @@ namespace SS.LoadClient
             // name, the 20 byte squad, and two four byte score fields.
             const int PlayerIdOffset = 51;
 
-            if (span.Length < PlayerIdOffset + 2)
+            if (span.Length < PlayerIdOffset + 4)
                 return;
 
             short playerId = LittleEndianConverter.Convert(MemoryMarshal.Read<short>(span.Slice(PlayerIdOffset, 2)));
-            if (playerId < 0 || playerId == _ownPlayerId)
+            if (playerId < 0)
                 return;
+
+            if (playerId == _ownPlayerId)
+            {
+                // The entry for this client itself is where the server says which ship and freq it was
+                // given: the ship is the byte after the type, and the freq follows the player id.
+                Volatile.Write(ref _ownShip, (sbyte)span[1]);
+                Volatile.Write(ref _ownFreq, LittleEndianConverter.Convert(MemoryMarshal.Read<short>(span.Slice(PlayerIdOffset + 2, 2))));
+                return;
+            }
 
             lock (_knownPlayerIds)
             {
@@ -442,15 +839,58 @@ namespace SS.LoadClient
             return SendRawAsync(MemoryMarshal.AsBytes(MemoryMarshal.CreateReadOnlySpan(ref ack, 1)).ToArray(), cancellationToken);
         }
 
+        /// <summary>
+        /// Sends a packet reliably, resending until the server acknowledges it.
+        /// </summary>
+        /// <remarks>
+        /// Resending is what makes it reliable, and this used to send once and hope. The two packets sent
+        /// this way, the login and the arena request, are the two with nothing behind them to notice they
+        /// went missing: lose either and the client sits waiting for a reply to something the server
+        /// never received. Measured over two thousand clients, twenty one lost their login and nineteen
+        /// their arena request, and every one of them was simply absent from the run afterwards.
+        /// </remarks>
+        /// <param name="payload">The packet to send, without the reliable header.</param>
+        /// <param name="cancellationToken">To stop waiting.</param>
+        /// <returns><see langword="true"/> if it was acknowledged.</returns>
         private async Task<bool> SendReliableAsync(byte[] payload, CancellationToken cancellationToken)
         {
-            byte[] buffer = new byte[ReliableHeader.Length + payload.Length];
+            int sequenceNumber = Interlocked.Increment(ref _outgoingSequenceNumber) - 1;
 
-            ReliableHeader header = new(Interlocked.Increment(ref _outgoingSequenceNumber) - 1);
+            byte[] buffer = new byte[ReliableHeader.Length + payload.Length];
+            ReliableHeader header = new(sequenceNumber);
             MemoryMarshal.AsBytes(MemoryMarshal.CreateReadOnlySpan(ref header, 1)).CopyTo(buffer);
             payload.CopyTo(buffer, ReliableHeader.Length);
 
-            return await SendRawAsync(buffer, cancellationToken);
+            for (int attempt = 0; attempt < ReliableSendAttempts; attempt++)
+            {
+                if (!await SendRawAsync(buffer, cancellationToken))
+                    return false;
+
+                // The receive loop records acknowledgements as they arrive, so this only has to watch for
+                // this one going past.
+                long deadline = Environment.TickCount64 + (long)ReliableSendTimeout.TotalMilliseconds;
+
+                while (Environment.TickCount64 < deadline)
+                {
+                    if (Volatile.Read(ref _highestAckedSequenceNumber) >= sequenceNumber)
+                        return true;
+
+                    if (cancellationToken.IsCancellationRequested)
+                        return false;
+
+                    try
+                    {
+                        await Task.Delay(50, cancellationToken);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        return false;
+                    }
+                }
+            }
+
+            FailureReason ??= $"no acknowledgement for reliable packet {sequenceNumber} after {ReliableSendAttempts} attempts";
+            return false;
         }
 
         private async Task<bool> SendRawAsync(byte[] data, CancellationToken cancellationToken)

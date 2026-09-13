@@ -155,7 +155,34 @@ fi
 
 echo "=== profiling thread $THREAD_NAME (tid $TID) of $PID for $PERF_SECONDS s at $PERF_FREQ Hz${PERF_EVENT:+ on $PERF_EVENT} ==="
 
+# How often the thread slept during the window, from the kernel's own count. A thread that blocks
+# between items pays to be woken for each of them, and that cost lands in the kernel and in the
+# runtime's wait code rather than in any method of the server's, so a profile alone cannot say
+# whether a kernel share grew because of it. Two arena workers at 42% and four at 28% doubled the
+# kernel's share per packet, and this is what tells the two readings of that apart.
+thread_switches() {
+    awk -v key="$1:" '$1 == key { print $2 }' "/proc/$PID/task/$TID/status" 2>/dev/null || echo 0
+}
+VOLUNTARY_BEFORE="$(thread_switches voluntary_ctxt_switches)"
+INVOLUNTARY_BEFORE="$(thread_switches nonvoluntary_ctxt_switches)"
+
+# Counted over the same window, beside the samples: how many times the thread gave up the processor
+# of its own accord (sched_yield), asked to be blocked (futex), was switched out, and was moved to
+# another CPU. The samples say where the thread's time went; these say how many times the events
+# that put it in the kernel happened, which is what turns "a fifth of the thread is in the kernel"
+# into a cost per event. The distinction they were added for: a thread switched out 5,000 times a
+# second that blocked only 400 of them is yielding, which is what SemaphoreSlim does for up to 140
+# iterations before it will block, and that is spinning between items rather than sleeping.
+COUNTS_FILE="$OUT/${LABEL// /_}.counts.txt"
+sudo perf stat -e syscalls:sys_enter_sched_yield,syscalls:sys_enter_futex,context-switches,cpu-migrations \
+    --tid "$TID" -o "$COUNTS_FILE" -- sleep "$PERF_SECONDS" &
+COUNTS_PID=$!
+
 sudo perf record ${PERF_EVENT:+-e "$PERF_EVENT"} -F "$PERF_FREQ" --tid "$TID" -o "$PERF_DATA" -- sleep "$PERF_SECONDS"
+
+wait "$COUNTS_PID" 2>/dev/null
+VOLUNTARY_AFTER="$(thread_switches voluntary_ctxt_switches)"
+INVOLUNTARY_AFTER="$(thread_switches nonvoluntary_ctxt_switches)"
 
 # Reported while the process is alive, because the JIT map is keyed by pid and a later run's server
 # would be a different one. Under sudo, because /proc/kallsyms is restricted to root on a default
@@ -168,13 +195,28 @@ sudo perf record ${PERF_EVENT:+-e "$PERF_EVENT"} -F "$PERF_FREQ" --tid "$TID" -o
     sudo perf report -i "$PERF_DATA" --stdio --sort dso,symbol --percent-limit 0.4 2>/dev/null
 } > "$PERF_TEXT"
 sudo chown "$(id -u):$(id -g)" "$PERF_DATA" "$PERF_TEXT"
+[ -f "$COUNTS_FILE" ] && sudo chown "$(id -u):$(id -g)" "$COUNTS_FILE"
 
 echo
 echo "--- which library $THREAD_NAME spent its time in ---"
 sed -n '/^=== by library ===/,/^=== by library and symbol ===/p' "$PERF_TEXT" | sed -n '/^ *[0-9]/p' | head -12
 echo
+echo "--- how often $THREAD_NAME slept ---"
+echo "$(( (VOLUNTARY_AFTER - VOLUNTARY_BEFORE) / PERF_SECONDS )) times/s blocked and woken, $(( (INVOLUNTARY_AFTER - INVOLUNTARY_BEFORE) / PERF_SECONDS )) times/s switched out while still runnable (preempted, or yielded)"
+if [ -s "$COUNTS_FILE" ]; then
+    awk -v seconds="$PERF_SECONDS" '
+        /<not (supported|counted)>/ { printf "%12s     %s\n", "n/a", $NF; next }
+        /sched_yield|futex|context-switches|cpu-migrations/ {
+            gsub(",", "", $1)
+            if ($1 ~ /^[0-9]+$/) printf "%12d/s  %s\n", $1 / seconds, $2
+        }' "$COUNTS_FILE"
+fi
+echo
 echo "--- and where in it ---"
 sed -n '/^=== by library and symbol ===/,$p' "$PERF_TEXT" | sed -n '/^ *[0-9]/p' | head -20
+echo
+echo "--- the kernel's part of that, since it is what changes when a thread sleeps more ---"
+sed -n '/^=== by library and symbol ===/,$p' "$PERF_TEXT" | grep '\[k\] ' | head -10
 echo
 echo "full profile: $PERF_TEXT"
 

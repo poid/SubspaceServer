@@ -495,13 +495,1533 @@ undercounted updates by about five times — and the bytes per update that came 
 the same factor in the other direction. After the fix the client's count agrees with the server's own
 `SendToOne` counter to within noise, which is the check that says both are now right.
 
+## The global player lock was taken once per recipient, and it was redundant
+
+Attributing the lock by caller found the send path taking the global player read lock 4,325,895 times
+a second at four thousand players. At two thousand the breakdown was `SendOrBufferPacket` 1,789,546 a
+second and `SendRaw` 179,967, against everything else taking it once per packet. The arithmetic named
+the source exactly — 20,001 packets a second times 89.4 recipients in view is 1,788,089 — and the
+source turned out to be re-entry. The position fan-out takes the lock once around its whole recipient
+loop and then calls `SendToOne` per recipient, and the send thread holds it across its entire pass;
+both then reached code that took it again, for a check the outer hold had already made safe.
+
+Skipping the acquisition when the calling thread already holds it, measured at four thousand players
+over forty arenas with connections arriving throughout, at the same offered load each time:
+
+| | processed pkt/s | workers busy | cores | read locks/s | cores per 1k pkt |
+|---|---|---|---|---|---|
+| 2 workers, before | 27,823 | 99% | 6.67 | 3,005,009 | 0.2397 |
+| 2 workers, after | 33,079 / 34,407 | 100% | 6.70 | 154,748 | 0.2025 |
+| 4 workers, before | 42,628 | 90-91% | 10.13 | 4,325,895 | 0.2376 |
+| 4 workers, after | 40,011 | 79-80% | 8.67 | 161,663 | 0.2167 |
+
+Read the four worker row carefully, because the lower number is the better result. 42,628 was a
+saturated server draining a backlog inside the sampled window, above the 39,677 a second the clients
+were actually sending. Afterwards the server tracks the offered load exactly, at 79% of four workers
+instead of 90%, for 8.67 cores instead of 10.13. Where the workers genuinely were the limit, at two,
+throughput rose about a fifth for the same processor time.
+
+**It did not change how the workers scale, which is what it was built to test.** Per worker core, the
+drop from two workers to four was 14,050 to 10,875 before and 16,540 to 12,582 after: 22.6% against
+23.9%. Everything became about a sixth more efficient and the shape of the curve did not move. Lock
+acquisition count is a real cost and is not the reason adding arena workers loses throughput.
+
+One measurement note. A debug-only assertion change was included at first and looked like it might be
+inflating the result, so it was reverted and re-run alone: 34,407 packets a second without it against
+33,079 with it, which is the wrong way round and inside the run to run spread. It was worth nothing
+and was dropped. All of the improvement is the skip.
+
+## The arena workers scale backwards, and the processor is not the reason
+
+> **The numbers in this section are contaminated; the conclusion is not.** Every two worker run in
+> the table below carried measurably less load than the four worker run it is compared with, for a
+> reason nothing in the output mentioned — see [Load that went missing](#load-that-went-missing). The
+> effect was afterwards re-established on runs verified clean, and reproduced twice: see
+> [The same work, more processor time](#the-same-work-more-processor-time). This section is kept for
+> the reasoning and for the causes it ruled out, which stand.
+
+The per worker efficiency loss survived removing the lock traffic, so it was measured properly. The
+unit is scans per arena-core-second — players examined by the fan-out, divided by the processor time
+the arena workers used — which normalises for how many recipients each packet has and for how hard
+the workers are being driven.
+
+| run | players | arenas | workers | busy | scans per core-second |
+|---|---|---|---|---|---|
+| half-w2 | 2,000 | 20 | 2 | 56% | 1.787M |
+| lk-w2 | 4,000 | 40 | 2 | 99% | 1.671M |
+| sat-w2 | 4,000 | 20 | 2 | 102% | 1.622M |
+| lk-w4 | 4,000 | 40 | 4 | 78% | 1.278M |
+| sat-w4 | 4,000 | 20 | 4 | 77% | 1.296M |
+
+Efficiency depends on the number of workers and on nothing else in that table. Two workers give about
+1.65M whether they are 56% busy or 102% busy and whether the players sit in twenty arenas or forty;
+four give about 1.29M under the same variations. At identical work per packet, doubling the workers
+raised throughput from 16,541 packets a second to 20,078 — 1.21 times for twice the threads.
+
+Three candidate causes were tested and all three were wrong.
+
+**Not the per recipient atomics.** Removing both the `SendToOne` counter and the bandwidth priority
+statistic — the two shared fields each recipient touches — moved the two-to-four loss from 23.5% to
+23.4% and absolute efficiency by under 2%.
+
+**Not the send path at all.** Spreading the players across the whole map cut recipients per packet
+from 89 to 20 while leaving the scan untouched. If anything done once per recipient were responsible,
+the loss would have fallen with it. It did not move: 23.5% at 89 recipients, 23.4% at 20.
+
+**Not thin loading of each worker.** The idea that a worker handling fewer items pays more per item in
+wakeups predicts that equal items per worker should cost the same. It does not: at 10,000 items a
+second per worker either way, two workers managed 1.787M scans per core-second and four managed
+1.278M, 28% apart.
+
+What is left is thread count itself, and the progression starts at the first thread added, with the
+same total work throughout:
+
+| workers | scans per core-second | against one worker |
+|---|---|---|
+| 1 | 5.263M | |
+| 2 | 4.353M | -17.3% |
+| 4 | 3.333M | -36.7% |
+
+**This machine is an i9-13900K**, which does not have equal cores: eight performance cores with two
+threads each, and sixteen efficiency cores. That looked like the answer, and it was written up here as
+such. It is wrong, and the correction is worth more than the original claim.
+
+Measured natively on Windows, where processor affinity is real and logical processor numbers map to
+the hardware — inside WSL2 they do not, and every subset of vCPUs there benchmarks within 3% of every
+other, which is what hid this. A fixed loop pinned to one processor at a time:
+
+| processors | time | |
+|---|---|---|
+| 0, 1, 2, 8, 14, 15 | 2,850-3,021 ms | performance cores |
+| 16, 17, 20, 24, 30, 31 | 7,083-7,635 ms | efficiency cores, 2.5x slower |
+
+So the machine is heterogeneous, comfortably enough to explain a 20-30% penalty. But pinning the
+server to eight distinct performance cores and the load client to the efficiency cores — which also
+removes the load generator from competing with the server, a confound in every earlier number here —
+the penalty survives. At the same delivered throughput, four thousand players over twenty arenas:
+
+| configuration | cores per 1,000 packets |
+|---|---|
+| 1 worker, 8 performance cores | 0.249 |
+| 2 workers, 8 performance cores | 0.276, 0.285 |
+| 2 workers, 16 performance cores | 0.282, 0.313 |
+
+Eleven to twenty six percent more processor time for exactly the same work, with every core identical
+and nothing else running on them. Whatever this is, it is not the cores being unequal.
+
+Treat that as preliminary rather than settled. The Windows runs did not reach a steady state inside
+two minutes: throughput ramps, peaks, then falls to a floor near twenty thousand packets a second in
+every configuration, so the window the harness picks lands in a different phase depending on the run.
+Read at their peaks instead of at the floor, two workers beat one. The comparison above is taken at
+the floor, where all configurations deliver the same amount and only the cost differs, which is the
+one place they are comparable — but it rests on a single window for the one worker case.
+
+**What this means for everything measured here.** `ArenaLoop:Workers` was tuned on this box and found
+four best with eight clearly worse. That number should still be re-measured on the machine the server
+will actually run on, but the reason is no longer that this processor is unusual. It is that the
+number is a property of the machine and the load, and nobody has yet explained why more workers cost
+more.
+
+## Load that went missing
+
+Two runs of the same configuration — four thousand clients, forty arenas, two arena workers, nothing
+different between them — settled at 18,554 packets a second and 37,677. Both perfectly steady for the
+whole run. That looks like a threading defect, because half throughput is what one of two workers
+doing nothing looks like.
+
+It was not. Per worker counters showed both workers retiring identical numbers of items with their
+queues nearly empty, so nothing was stalled and nothing was backing up. Only half as much work was
+ever queued. The reason was in the log the whole time, in a category nobody was reading:
+
+```
+I <LagAction> {7} [Load3767] specced for: ping
+I <Game>      {7} [Load3767] Changed ship/freq to ship Spec, freq 8025.
+```
+
+LagAction had specced 2,144 of the 4,000 clients for high ping, and `Game.HandlePositionPacket` says
+plainly what that costs:
+
+```csharp
+// spectators don't get their position sent to anyone
+if (player.Ship != ShipType.Spec)
+```
+
+A specced player is still connected and still sending ten position packets a second. Every one of
+them is received, checksummed, lag-collected and dispatched — and then produces no broadcast at all.
+The metric that this document calls throughput counts broadcasts.
+
+That is visible in the numbers once you know to look. `mainloop work` sat at 40,000 a second in every
+run, degraded or not, because every packet really did arrive. Only `arena work` moved:
+
+| run | workers | specced | mainloop work | arena work / pkt/s |
+|---|---|---|---|---|
+| f1 | 1 | 0 | 40,012 | 39,993 |
+| d1 | 2 | 0 | 40,054 | 40,005 |
+| d3 | 2 | 171 | 40,132 | 38,285 |
+| f2r | 2 | 231 | 40,027 | 37,677 |
+| d2 | 2 | 2,009 | 40,161 | 19,924 |
+| f2 | 2 | 2,144 | 40,053 | 18,554 |
+
+`(4000 − specced) × 10` predicts the measured rate on every one of those rows to within a tenth of a
+percent. There is nothing left to explain.
+
+### What it does to the rest of this document
+
+The specced count was never equal between the two sides of a comparison, and it ran consistently
+against the two worker runs:
+
+| pair | 2 workers | 4 workers |
+|---|---|---|
+| first worker sweep | 538 specced | 337 specced |
+| after the lock skip | 1,259 specced | 233 specced |
+| the A/B repeat | 1,058 specced | 127 specced |
+
+So each of those pairs compared a lighter load against a heavier one and read the difference as
+scaling. The throughput comparison the worker count was tuned on does not survive that.
+
+The efficiency table in the section above is hurt less, because scans per core-second divides work by
+the processor time spent on it and both fall together — but it is not clean either. The two worker
+runs were saturated at 99–102% and the four worker runs were not, at 77–78%, and that split lines up
+exactly with the spec contamination. Comparing a thread that is pinned against one that is waiting is
+a different measurement from comparing two thread counts.
+
+### And a second leak, still unexplained
+
+The saturated pair had **zero** clients specced and still broadcast far less than was offered: 40,374
+mainloop work items a second against 16,541 broadcasts at two workers, and 39,808 against 20,078 at
+four. Packets arrived, were dispatched, and produced nothing, with no spec involved and only about
+thirty malicious-packet lines in the entire log.
+
+The remaining ways out of `HandlePositionPacket` are a bad checksum, a post-death `(-1, -1)`, and a
+timestamp that is not newer than the last one recorded. The third is the plausible one: the load
+generator shares the machine, these are the runs where it works hardest, and a client whose send loop
+bursts can put two packets in the same ten millisecond tick, the second of which the server correctly
+discards. That is a guess, and it is the next thing to measure rather than something to build on.
+
+### What the harness does now
+
+It reports the specced count and the ratio of broadcast to offered on every run, and warns when the
+second falls below ninety percent — whatever the cause, spec or otherwise. It already reported
+assertion failures and error counts, and this belongs beside them for the same reason: a run that
+quietly measures three quarters of the load it asked for produces a number that looks entirely
+plausible and means nothing.
+
+## The same work, more processor time
+
+The load that went missing invalidated the runs the worker scaling claim rested on, so it had to be
+established again on runs the harness could vouch for. The configuration to do it with was already in
+the document: the players spread across the whole map, which cuts recipients per packet to about
+twenty and leaves the candidate scan as the bulk of what a worker does. Three runs, one variable.
+
+| workers | offered → broadcast | specced | scanned/pkt | in-view | read locks/s | arena worker cores |
+|---|---|---|---|---|---|---|
+| 1 | 40,000 → 39,997 | 158 | 100.0 | 19.9 | 161,321 | **76%** |
+| 2 | 39,998 → 40,046 | 176 | 100.0 | 19.9 | 161,541 | **92%** |
+| 4 | 40,001 → 39,996 | 172 | 100.0 | 19.9 | 161,399 | **120%** |
+
+Every run broadcast everything it was offered, so all three carried the same load. The work per
+packet is identical to a tenth of a recipient, the total is identical to a tenth of a percent, and the
+player lock rate — the thing this used to be blamed on — is identical to a fifth of a percent. The
+only thing that differs is how many threads it was spread over, and four of them need **1.59 times**
+the processor time that one does to do it.
+
+Repeated later on a second set of three runs: 75%, 91%, 119%. Within a point at every worker count.
+Whatever this is, it is not noise and it is not the measurement.
+
+One caveat on the first triple, found afterwards and worth stating: its settled windows varied by up
+to 36%, so a single window out of it was not safe to compare. The repeat runs varied by 2-3% and the
+pinned pair below by 0-3%, and they agree with it — but that is luck rather than method, which is why
+the harness now reports the spread on every run.
+
+### What it is not
+
+Adding to the list, because eliminating a suspect is worth as much as finding one:
+
+**Not the cost of blocking on an empty queue.** A worker takes one item at a time from a
+`BlockingCollection`, and the blocking form is expensive when the queue is empty — it builds a linked
+cancellation source and registers on the one every worker shares. That scales exactly the wrong way:
+four workers each get a quarter of the same work, so each finds its queue empty far more often than
+one worker does. It fits the shape of the problem well enough to be worth trying.
+
+It was wrong. Blocking once and then draining everything already queued, up to a batch of 128, moved
+one worker from 76% to 75%, two from 92% to 91%, and four from 120% to 119%. Nothing, at any worker
+count, so the change was reverted rather than kept for the tidiness of it.
+
+**Not the pooled object crossing the handoff.** The mainloop also gets more expensive across the same
+three runs — 18%, 22%, 23% — while its work per packet does not change at all, which points at the
+handoff between them rather than at either side. Two pooled objects cross it per position packet: the
+`PositionBroadcast` and the work item carrying it, both rented on the mainloop and returned on a
+worker. With one worker a recycled object shuttles between two cores; with four it comes back from
+four in turn. That is a cache line travelling further for the same work, and it grows with the number
+of consumers while the instruction count stays flat.
+
+Allocating both instead of pooling them, so that each is written once, read once and dies, left one
+worker at 76% and four at 120% — the pooled figures to the point. It cost 11.8 MB/s of allocation
+against 4.9, and gen0 collections roughly doubled, so the pool is earning its place; it is simply not
+what this is.
+
+**Not the load generator competing for cores.** The generator shares this machine and is the larger
+consumer, so four runnable threads asking a contended scheduler for time is not the same experiment
+as one. Per-thread counters made that look promising: from one worker to four, voluntary parking
+roughly doubled per thread, but *involuntary* switches — the scheduler taking the core away mid-work,
+each one resuming on a cold cache — went from 4-76 per ten seconds to eight and twelve thousand.
+
+Pinning the server to CPUs 16-31 and the generator to 0-15, so neither can preempt the other, made it
+slightly worse rather than better:
+
+| | 1 worker | 4 workers | ratio |
+|---|---|---|---|
+| sharing the machine | 75% | 119% | 1.59 |
+| opposite halves | **74%** | **124%** | **1.68** |
+
+So the preemption is a symptom of the workers running dry, not the cause of the cost. (`taskset`
+inside WSL2 pins to virtual processors the hypervisor still places as it likes, so this is weaker
+evidence than pinning on real hardware would be. It is enough to rule the generator out, because
+removing the competition did not remove the penalty.)
+
+### Isolating the workers makes it worse — but the experiment was broken
+
+> **Retracted.** The processors given to the workers were not four cores. CPUs 28 and 29 are threads
+> of one core and 30 and 31 are threads of another, so "one dedicated processor each" put two workers
+> on each physical core with their execution units shared. That accounts for the numbers below
+> without any theory about distance, and the conclusion drawn from them — that the cost grows with
+> how far apart the threads are put — does not follow. Kept because the reasoning is where the error
+> is, and because the same mistake is easy to repeat: `lscpu` reports this machine as sixteen cores
+> of two threads, which is not its real shape either.
+
+The obvious remaining explanation was that a worker at thirty percent duty keeps losing its core to
+something else and resumes on a cold cache, where one at seventy-five percent holds on to it. Giving
+each worker a processor nothing else in the server touches should then have closed most of the gap —
+mainloop, send threads and receive thread confined to CPUs 16-27, the workers alone on 28, 29, 30 and
+31, and the load generator on 0-15.
+
+It went the other way, and consistently:
+
+| | 1 worker | 4 workers | ratio |
+|---|---|---|---|
+| sharing the machine with the generator | 75% | 119% | 1.59 |
+| server and generator on opposite halves | 74% | 124% | 1.68 |
+| one dedicated processor per worker | 77% | **133%** | **1.73** |
+
+One worker costs the same however it is isolated, which is expected — almost nothing about its
+situation changes. Four workers cost more the further apart they are put. That kills the cold cache
+explanation, which predicts the opposite, and it kills scheduling with it.
+
+What grows when threads are pushed onto separate cores is the distance data has to travel between
+them. Pinning the mainloop to one group of processors and the workers to another guarantees that
+every work item and everything it points at crosses between them, where a free scheduler can put a
+producer and its consumer on cores that share a cache.
+
+That also means the pool result above proves less than it looked like proving. Allocating instead of
+pooling removed the *recycling* of an object between cores; it did not remove the *crossing*, since a
+freshly allocated broadcast is still written on the mainloop and read on a worker. Only one mechanism
+was eliminated, not the suspect.
+
+## Timing the loop directly, after a profiler lied about it
+
+Nine hypotheses had been eliminated without confirming anything, so the next step was to stop guessing
+and measure where the worker's own time went. Two attempts, and the first was worse than useless.
+
+**A sampling profiler cannot answer this.** `dotnet-trace` reported, with no ambiguity, that 95% of
+the arena worker's time was `DateTime.UtcNow`. It is not: a clock read costs 14 ns on this machine,
+so the two million of them in the sampled window account for 28 ms, not the 18 seconds attributed.
+The managed sampler suspends threads at garbage collection safe points, so it reports the call that
+happens to carry a poll rather than the code burning the cycles, and a tight loop with a poll every
+iteration collects all of it. The give-away was in the stacks — `Thread.PollGCWorker` sitting under
+`get_UtcNow` — but the check that caught it was arithmetic, not the tool.
+
+**Timing the loop by hand did answer it,** and found a defect worth more than the investigation. The
+wait handed to the queue take is how long until the next timer is due, and it was truncated to whole
+milliseconds. A timer due in a fraction of one became a wait of zero: the take returns immediately,
+the timer is still not due, and the worker goes round again as fast as the processor allows until it
+is. With a periodic timer per arena there is nearly always something due inside the next millisecond.
+
+Per ten seconds, at four thousand players over forty arenas:
+
+| | one worker | four workers |
+|---|---|---|
+| items of real work | 400,000 | 400,000 |
+| loop iterations, before | **2,800,000** | **4,800,000** |
+| loop iterations, after | 400,077 | 400,349 |
+| arena worker processor time | 76% → **72%** | 121% → **102%** |
+
+Four workers gained the most because the spin fills whatever idle time a worker has, and four workers
+at a quarter of the load each have three times as much of it. Rounding the wait up instead of
+truncating it is the whole fix.
+
+This had been inflating every arena worker measurement since the timers were added, and inflating it
+more the more workers were running — so every figure earlier in this document overstates the penalty.
+It does not remove it. The eliminations survive, because both sides of each comparison carried the
+same spin, but the batch drain result is now explained rather than merely negative: with one iteration
+per item there is never anything queued behind the item being taken, so batching the take had nothing
+to batch.
+
+### What is left is real, and it is the work itself
+
+With the spin gone, the time spent in the fan-out is measured directly, and it is not the same on
+both sides:
+
+| | one worker | four workers |
+|---|---|---|
+| work per item, before the fix | 15.6 µs | 22.5 µs |
+| work per item, after the fix | **15.7 µs** | **21.1 µs** |
+| total fan-out time | 63% of a core | 85% of a core |
+
+Same 400,000 items, same 100.0 candidates scanned, same 19.9 recipients, same player lock rate — and
+a third more processor time per packet to do it. That is the answer to the question this section
+started with: it is not queueing, not scheduling, not overhead around the work. The same instructions
+run slower, which is what memory-bound work spread across more cores looks like, and it fits the one
+positive signal already found — that separating the workers onto their own processors makes it worse
+rather than better.
+
+### It is the sends, and the scan gets faster
+
+Splitting `BroadcastPosition` the same way, with the four `SendToOne` calls timed individually and
+everything else counted as the scan:
+
+| | 1 worker | 4 workers | |
+|---|---|---|---|
+| per send | 0.455 µs | 0.599 µs | **+31%** |
+| per candidate scanned | 0.147 µs | 0.125 µs | **−13%** |
+
+Both movements are consistent across all four workers and both windows, and they go in opposite
+directions, which is what makes them worth trusting: a measurement artefact such as blocking on the
+player lock would inflate both.
+
+That is the sharing, laid out. The candidate scan reads player state belonging to the worker's own
+arenas, so it is private to that worker and its working set shrinks from four thousand players to one
+thousand — and it gets cheaper, by an eighth. Every send writes into a connection owned by whichever
+*send thread* holds it, which has nothing to do with arenas, so four workers write into the same set
+of connections from four cores instead of one — and that costs a third more per send.
+
+**Not the shared per-recipient counters**, re-tested because the original test predated the busy wait
+fix and the harness checks. Two of them are written once per recipient, about 800,000 times a second
+here: the `SendToOne` metric and the bandwidth priority statistic, which every position packet adds to
+the same array slot. Removing both:
+
+| arena worker processor time | counters in | counters out |
+|---|---|---|
+| one worker | 78% | 74% |
+| four workers | 123% | 121% |
+
+Four points at one worker and two at four. They are a real fixed cost on a hot path — worth removing
+on their own merits, and the metrics interface's own rule already says a loop at that rate should
+tally locally — but they are not what scales. The ratio is unchanged at 1.6, so the earlier
+elimination was right, for better reasons than it had at the time.
+
+### What is left
+
+Two pooled objects are taken per *recipient* rather than per packet, inside the connection lock in
+`SendOrBufferPacket`: a `SubspaceBuffer` and the linked list node that carries it. Both come from a
+process-wide `Pool<T>` over a `ConcurrentQueue`, both at around 800,000 a second, and both are rented
+on an arena worker and returned on a send thread once the packet has gone out.
+
+That is the same cross-core recycling that was tested on the broadcast object and found to be nothing
+— at twenty times the rate. The broadcast object is taken once per packet, forty thousand times a
+second; these are taken once per recipient. With one worker there is a single thread dequeuing; with
+four there are four, on the same queue head, each handed memory last written by a different core.
+
+It is the only remaining thing in the send path that scales with the number of workers rather than
+with the amount of work, and it is testable by giving each worker its own pool: `PooledObject` already
+records which pool it came from, so returns from the send threads find their way back without any
+bookkeeping.
+
+**Tested, and it is not that either — the sharing was helping.** One pool per renting thread, which
+cycles correctly (allocation stayed at 4.9 MB/s, against the 11.8 MB/s of the run that bypassed a
+pool entirely):
+
+| | shared pool | one pool per thread |
+|---|---|---|
+| one worker | 72% | **69%** |
+| four workers | **104%** | **113%** |
+| ratio | 1.44 | 1.64 |
+| whole server | 3.09 cores | 3.47 cores |
+| working set | 336 MB | 373 MB |
+
+Three points better at one worker and nine worse at four, so the scaling it was meant to fix got
+worse. The working set says why: splitting the pool four ways puts four times as many distinct
+buffers in circulation, and each worker gets back memory a send thread wrote last. One shared pool
+keeps a smaller, hotter set cycling, and that is worth more than the queue contention it costs.
+
+Which is the same lesson as the broadcast object, arrived at from the opposite direction: pooling
+here is not overhead to be removed or split up, it is what keeps the working set small enough to stay
+in cache. The remaining candidates in the send path are the connection lock and the outgoing queue
+themselves — real work rather than bookkeeping, and not obviously removable.
+
+## Tallying the per-recipient counters locally
+
+Not a fix for any of the above, and worth recording for the shape of the result rather than its size.
+Two things were counted on every send to every recipient: the `SendToOne` metric, and a shared array
+slot for bytes at that bandwidth priority which every position packet adds to at the same index. Both
+are single cache lines written by every thread that sends, at several million a second in the default
+configuration — the rate `IServerMetrics` itself says must be accumulated locally rather than reported
+per operation.
+
+Each thread now keeps its own counts and adds them to the shared ones every thousand sends:
+
+| | before | after |
+|---|---|---|
+| one worker | 72% | 73% |
+| four workers | **104%** | **100%** |
+| ratio | 1.44 | **1.37** |
+| whole server | 3.09 cores | **2.94 cores** |
+
+Nothing at one worker — slightly worse, in fact, because three thread-local accesses cost about what
+the two uncontended interlocked operations they replaced did. Four points at four workers, where those
+lines are genuinely bouncing between cores. That is the shape to expect from removing contention
+rather than removing work, and it is worth knowing that the *earlier* figure for this, four points at
+one worker, came from a build carrying the fan-out instrumentation and did not survive being measured
+on a clean one.
+
+The reported figures stay right: 796,111 sends a second against 796,083 before.
+
+## Removing work stops helping once there are four workers
+
+*Explained below, under "Why four workers cost more than two": the extra was never in the work. It
+was the wait between items, which spun and yielded, and none of the removals here could touch it.*
+
+The node pool was the last shared object on the send path that had not been tested — a
+`DefaultObjectPool` whose fast path is a single field settled by an interlocked compare-exchange,
+taken from once per recipient. Replacing it with plain allocation, which removes it from the path
+entirely at the cost of 42 MB/s of very short lived objects against 4.9:
+
+| | pooled | allocated |
+|---|---|---|
+| one worker | 73% | **67%** |
+| four workers | 100% | 101% |
+
+Six points better at one worker, nothing at four. Worth knowing on its own that the pool is losing to
+the allocator even uncontended — a generation zero allocation is close to a pointer bump, while the
+pool costs at least an interlocked compare-exchange and an array scan when it misses — but the ratio
+got worse, so it is not what scales.
+
+Put beside the two experiments before it, that is the useful result:
+
+| what was removed | at one worker | at four workers |
+|---|---|---|
+| the shared per-recipient counters | −4 points | −0 points |
+| the shared buffer pool, split per thread | −3 points | **+9 points** |
+| the node pool, replaced by allocation | **−6 points** | +1 point |
+
+**Every change that takes work out of the path helps at one worker and does nothing at four.** Four
+workers sit between 100% and 104% whatever is removed. Three independent attempts is enough to stop
+treating that as coincidence: at four workers the arena workers are not limited by their own
+instruction stream. They are waiting, and removing instructions from a thread that is waiting changes
+nothing.
+
+The obvious explanation was that each worker is idle three quarters of the time, wakes with nothing in
+cache, and spends its time waiting on memory. Giving each worker a processor nothing else touched
+should then have helped, and the earlier attempt at that had been discounted because it ran with the
+timer busy wait still present.
+
+Redone on the fixed build it still went the wrong way — 73% to 68% at one worker, 100% to 110% at
+four — and the reason turned out to have nothing to do with caches. **The four processors were two
+cores.** CPUs 28 and 29 are threads of one core, 30 and 31 of another, so four workers on 28 through
+31 is two workers per core sharing execution units, which is the opposite of the isolation intended.
+One worker on CPU 28 did have a whole core, with its sibling idle, which is why that side improved.
+
+Both isolation results, this one and the earlier 133%, say only that two threads on one core are
+slower than one. The experiment has to be run one thread per *physical* core to mean anything, and
+`lscpu` will not help: it reports this machine as sixteen cores of two threads, which is not the shape
+of a processor with eight performance cores and sixteen efficiency cores either. The sibling lists
+under `/sys/devices/system/cpu/*/topology` are what to read.
+
+Run properly — workers on CPUs 24, 26, 28 and 30, which are four separate cores with their sibling
+threads left idle, the rest of the server on 16-23 and the generator on 0-15 — it gives the same
+answer for a good reason instead of a bad one:
+
+| | unpinned | one physical core each |
+|---|---|---|
+| one worker | 73% | **67%** |
+| four workers | 100% | **104%** |
+
+A single worker gains six points from owning a core. Four gain nothing, which is what kills the
+explanation: idle three quarters of the time is exactly the case a private core should rescue, and it
+does not.
+
+So the table above gains two more rows and the same signature. Five interventions — remove the shared
+counters, split the buffer pool, drop the node pool, dedicate cores, dedicate them correctly — and
+every one helps a single worker while none helps four. Each worker costs about 26% of a core for ten
+thousand packets a second, and that figure has not moved for anything tried against it.
+
+### What none of them touched
+
+Every run in this document has `Net:HandlePacketsOnArenaThread` off. The mainloop is therefore what
+writes `playerData.Position` for all forty thousand packets a second, and the workers read that same
+player state while scanning — a hundred candidates a packet. Writer and readers are on different cores
+by construction, and nothing done to the reader can change that. It is the one sharing relationship
+that survives every experiment above, because every experiment above was aimed at the reader.
+
+The setting exists to move the write onto the thread that does the reading. Its own documentation says
+to try it on a debug build first, since every packet handler in the server was written when the
+mainloop was the only thread that ran them, and the threading assertions are there to find whichever
+of them is not ready for that — which is what the load tests here are, so the assertions were already
+live.
+
+### Handling packets on the arena thread is worth thirteen percent, at one worker
+
+*Re-measured in Release with the yield fix in, at two workers: a three percent loss. See "The cast
+that was a call" below. This figure was taken in Debug with the spin present.*
+
+Turned on, with no assertion failures and no errors at either worker count:
+
+| | mainloop handles packets | arena thread handles packets |
+|---|---|---|
+| one worker, the workers | 73% | 75% |
+| one worker, **whole server** | 2.94 cores | **2.57 cores** |
+| four workers, the workers | 100% | 112% |
+| four workers, whole server | 2.94 cores | 2.97 cores |
+
+At one worker the mainloop effectively disappears — 74 iterations a second against 2,686, no longer
+using enough processor to appear among the threads at all — and absorbing all of its work costs the
+arena worker two points. The whole server does the same job for thirteen percent less.
+
+At four workers, absorbing the same work costs twelve points and the total does not move. That is the
+sixth intervention with the same signature, and the first that changed what is shared rather than how
+much work is done. It behaves like all the others.
+
+**What this is good for is the configuration, not the mystery.** The cheapest way to serve this load
+is one arena worker with packets handled on it: forty thousand packets a second for 2.57 cores,
+against 2.94 to 2.97 for every four worker arrangement tried. More workers have not been worth their
+cost at any load this machine can produce.
+
+### Sending weapons and deaths through it found two real defects
+
+The positions-only run was clean, which said less than it looked like saying: one of the seventeen
+arena-scoped packet types, and none of the paths where the risk actually is. Twenty percent weapon
+fire and six deaths a client a minute found two concurrency defects, neither of which can happen while
+the mainloop handles packets, because the mainloop is also what changes the state they race against.
+
+**A packet can outlive the routing decision that placed it.** Which thread handles a packet is decided
+when it arrives, from the sender's arena at that moment. The sender can leave before the arena's
+worker gets to it, and the worker then runs a handler for a player whose state it no longer owns,
+beside whichever thread now does — the one thing a single thread per arena exists to prevent. The
+assertion caught it and took the server down with it:
+
+```
+MainloopWork_CallPacketHandlers must run on the mainloop or on the thread owning
+arena '(none)', but ran on 'ArenaLoop-0'.
+```
+
+Fixed by dropping the packet. Everything routed this way is that arena's business, so one for an arena
+the sender has left has nothing to act on, and handing it to the mainloop instead would let it
+overtake packets that went there directly while the player was leaving.
+
+**The sender's ship was read twice around an array bound.** The position handler tests `player.Ship`
+against spectator and then reads it again, four times, to index an array with one entry per ship —
+which spectator is not. The mainloop can spec a player between the test and the index; LagAction does
+it for ping and so does a death. Six `IndexOutOfRangeException` in one run, on six different players.
+Fixed by reading it once into a local.
+
+With both fixed, a sustained combat run — a thousand clients over ten arenas, 7,463 deaths, nothing
+specced — held 9,991 packets a second of the 10,001 offered, steady to within a percent across every
+window, with no assertion failures and no errors.
+
+### What combat cannot measure here
+
+At four thousand clients the same combat load collapses, and on both code paths. With packets on the
+arena thread LagAction specced 3,949 of the 4,000 and throughput fell to ten packets a second; with
+them on the mainloop it collapsed too, from something else, with only 230 specced. Two runs that both
+failed cannot be compared with each other, so there is no throughput comparison for combat at that
+scale — the thirteen percent above is a positions-only figure and should not be quoted for anything
+else.
+
+## One packet per Select was the ceiling, and it was not the buffer
+
+Chasing where the missing quarter of the load went: the listening socket's own drop counter, from
+`/proc/net/udp`, moved **1,136,376** in one six thousand client run, which is the 6,900 a second that
+never reached the mainloop. Worth noting against an earlier section of this document, which concluded
+the server was never the one losing packets because its receive *queue* read empty at every sample —
+the drops are bursty, and only the cumulative counter catches them.
+
+**Not the buffer.** Raising the receive buffer to the system maximum, four times the default, left
+throughput identical at ~41,000 packets a second and simply queued more before dropping it. More
+clients connected so more was offered, and the drops rose to match. That is a throughput limit, not a
+buffering one, and no amount of configuration fixes it.
+
+**One packet per system call was the limit.** The receive thread called `Socket.Select`, took a single
+packet, and went back to `Select` — which rebuilds and walks its socket list every call, so the whole
+zone's incoming traffic cost two system calls a packet. That also explains the shape of it: the thread
+sat at 15% of a core while its socket overflowed, because it was short of packets per call rather than
+short of processor.
+
+Draining each readable socket instead, bounded at 64 so a game socket carrying the zone cannot starve
+the ping socket beside it:
+
+| | one packet per Select | drain per wake |
+|---|---|---|
+| connected | 4,844 of 6,000 | **6,000 of 6,000** |
+| broadcast | 41,509 pkt/s | **55,069 pkt/s** |
+| socket drops | 1,136,376 | **115,137** |
+| specced for lag | 54 | **0** |
+| arena worker | 69% | **111%** |
+
+A third more throughput, every client connecting rather than one in five losing its attempt, ninety
+percent fewer drops — and the arena worker is now the limit, at 111%. That is the first time anything
+here has driven a worker to the wall, which is the condition the parked worker question was waiting
+for.
+
+## Letting the send thread's lock go fixes it, and ten thousand players work
+
+The send thread held the player read lock for its whole pass, across a socket write per connection, and
+with several of them on overlapping schedules there was never a moment when none held it. A
+`ReaderWriterLockSlim` stops admitting readers once a writer waits, but that only helps if the readers
+already inside let go, and these did not until the pass ended.
+
+Letting it go every 64 connections and taking it again is the entire fix. Ten thousand clients over a
+hundred arenas, staggered, five minute hold:
+
+| | collapsing | after |
+|---|---|---|
+| connected | 9,328 of 10,000 in 118s | **10,000 of 10,000 in 48s** |
+| broadcast | 11,052 pkt/s | **48,856 pkt/s** |
+| write waited | 11,605 ms | **0.0 ms** |
+| mainloop | 14% of a core, queue 19,061 | 53%, queue 4,602 |
+| arena workers | 12% each | **110% and 109%** |
+| specced for lag | 370 | **0** |
+
+Four times the throughput, every client connecting in a third of the time, and the arena workers are
+the limit again rather than sitting idle behind a blocked mainloop.
+
+### Bounding the queue, which changes the comparison below
+
+An overloaded worker with no queue limit does not shed, it accumulates. Offered four times what it
+could carry, one grew a two gigabyte managed heap and swung sixty percent between windows — those
+swings being collections rather than anything about the server's rate. Turning the limit on:
+
+| ten thousand players | no limit | limit of 2,000 |
+|---|---|---|
+| one worker | 27,357 pkt/s, 2,053 MB, 60% spread | **58,870 pkt/s, 187 MB, 9%** |
+| two workers | 48,856 pkt/s, 2,749 MB, 5% spread | **62,614 pkt/s, 218 MB, 8%** |
+
+Bounded memory, steady throughput, and **nothing dropped** — the mainloop's own limit was never
+reached. Nothing needed dropping, because the fan-out a full arena queue refuses runs on the mainloop
+instead: slower for that packet, free for the ones behind it. Now the default.
+
+**This changes what the worker comparison means.** With the queue bounded, adding a second worker is
+worth six percent rather than the seventy-eight the unbounded runs suggested — because in the one
+worker case the mainloop picks up the overflow and becomes a second fan-out thread in all but name:
+
+| | threads doing fan-out | throughput | per fan-out core |
+|---|---|---|---|
+| one worker + mainloop | 102% + 93% = 1.95 | 58,870 pkt/s | **30,190 pkt/s** |
+| two workers + mainloop | 103% + 103% + 40% = 2.46 | 62,614 pkt/s | **25,453 pkt/s** |
+
+Per core of fan-out, the arrangement without the second worker is sixteen percent better. The mainloop
+doing the work inline beats handing it to a worker, which is the handoff cost showing up from a
+direction none of the earlier experiments approached it from.
+
+### Everything measurable here has now been ruled out
+
+The penalty matters for a machine larger than this one: per worker-core, two workers retire 29,783
+packets a second and four retire 22,243, so four are a quarter less efficient at the thing you would
+buy more cores to do. Worth knowing what it is before scaling out.
+
+The runtime's own counters were the last untried instrument, and they close the last software
+suspect. Same load, same work per packet, one worker against four:
+
+| | one worker | four workers | |
+|---|---|---|---|
+| monitor lock contentions | 28/s | 77/s | against ~800,000 lock acquisitions a second |
+| garbage collection heap size | — | *smaller* at four | so not collection |
+| heap fragmentation | — | *lower* at four | |
+| thread pool queue | 0 | 0 | |
+
+Contention rises by less than three times, from four thousandths of a percent of acquisitions to one
+hundredth. At ten microseconds a blocking event that is under a tenth of a percent of a core, against a
+cost of twenty-five. **The connection lock and the queue behind it are not it**, and neither is the
+collector, which does less work at four workers rather than more. Nothing else in the runtime's
+instrumentation moves.
+
+So the list of things this cannot be now runs: the per recipient counters, the buffer pool, the node
+pool, dedicated processors, dedicated *physical* processors, the shared player lock, blocking on an
+empty queue, the mainloop writing what the workers read, the connection lock, and the collector.
+
+What is left is below the level anything here can see: how far the data travels between cores. That
+needs the processor's own counters, and this machine has none —
+`/sys/bus/event_source/devices` offers `software` and `tracepoint` events and no `cpu`, because WSL2
+does not expose a performance monitoring unit. It is not that `perf` is missing; there is nothing for
+it to read.
+
+**On real hardware this is one run.** `perf stat -e cache-misses,LLC-load-misses,LLC-store-misses`
+around the same comparison — four thousand players over forty arenas, spread out, one worker against
+four — would say in a single pass whether four workers take more cache misses for the same work. If
+they do, it is data moving between cores and the fix is in how arenas, connections and send threads
+are grouped. If they do not, everything above is wrong and it is something none of this has touched.
+
+### What a worker is actually worth, measured at saturation
+
+With the queue bounded and each configuration driven until it could take no more, ten thousand players
+over a hundred arenas:
+
+| workers | throughput | whole server | the workers do | the mainloop backfills |
+|---|---|---|---|---|
+| 1 | 58,870 pkt/s | 7.11 cores | 36,388/s | **22,484/s** |
+| 2 | 62,614 pkt/s | 8.19 cores | 61,353/s | 1,262/s |
+| 4 | 63,393 pkt/s | 9.26 cores | 63,393/s | 0 |
+
+**Four workers cost two and a bit more cores than one for seven percent more throughput.** Every
+earlier statement in this document about workers buying capacity sub-linearly — 1.6 times at two, 2.9
+at four — was extrapolated from cost at a fixed load because they could not be saturated at the time.
+Measured, four is 1.08 times one.
+
+The reason worker count matters so little is in the last column. A full worker queue sends the fan-out
+back to the mainloop, so the mainloop backfills whatever the workers cannot take, and the work gets
+done either way. The setting mostly decides which thread does it. That is also why one worker is not
+the answer despite being the cheapest: the mainloop is at 93% doing that backfilling, and it has a
+zone to run besides. At two it is at 40% and the workers carry essentially all of it.
+
+The default is now two rather than a share of the processor count.
+
+### The comparison as it stood on unbounded queues
+
+Both worker counts can now be driven to the wall at the same load, which was impossible while the
+receive path, the connect burst, and then the write lock each ran out first. Same ten thousand clients,
+same hundred arenas, same 46 recipients a packet, and only the worker count differing:
+
+| workers | saturated at | against one |
+|---|---|---|
+| 1 | ~27,400 pkt/s (110%) | 1.00 |
+| 2 | 48,856 pkt/s (110% + 109%) | **1.78** |
+
+So the tax is real and it does cost capacity: two workers carry about 1.78 times one, not two. Roughly
+a ninth of the second worker is lost to whatever the thirty-seven percent penalty is, which is the
+first time that has been measured rather than extrapolated.
+
+**The one worker figure is approximate.** Its windows ranged from 18,890 to 35,443 — a sixty percent
+spread — because saturating one worker means offering it nearly four times what it can take, and there
+is nothing to refuse the excess. `ArenaLoop:MaxQueueDepth` defaults to no limit, so the overflow queues
+instead: two gigabytes of managed heap in that run, and the swings are collections on it rather than
+anything about throughput. The two worker run is clean at five percent.
+
+That missing backpressure is worth fixing on its own account. A server that is offered more than it can
+carry should refuse the excess, which is what the setting exists for, rather than growing a queue until
+the collector notices.
+
+## Before the fix: around nine thousand players the write lock starved and the server stopped recovering
+
+The saturation comparison still could not be made, and this time the reason is worth more than the
+comparison would have been. Two workers need about nine thousand players to reach the wall, and at
+that population the server enters a state it does not come out of.
+
+Ten thousand clients over a hundred arenas, connections staggered three milliseconds apart, a five
+minute hold. 9,328 connected, and then:
+
+| | |
+|---|---|
+| offered | 44,260 pkt/s |
+| broadcast | **11,052 pkt/s**, a quarter of it |
+| mainloop | 75 iterations a second, 13 ms each — but **14% of a core** |
+| mainloop queue | **19,061 deep** |
+| player lock | write held 118 ms, **write waited 11,605 ms** |
+| whole server | 1.91 cores of 32 |
+
+The mainloop is busy in elapsed time and idle in processor time, which means it is blocked rather than
+working, and the lock figures say on what. Readers hold the player lock: the send threads take it
+across a whole pass, and at nine thousand connections a pass is long. The mainloop is a writer — every
+connect and player state change needs it — and it waited eleven seconds out of ten. Its queue grows
+past nineteen thousand, packets pile up behind it, and the arena workers sit at 12% each with almost
+nothing reaching them. The server does not shut down afterwards either; both runs had to be killed.
+
+**Not caused by draining the receive socket**, which was the obvious suspect since that change removed
+the packet loss that had been throttling the input. The identical load on the build immediately before
+it collapses the same way:
+
+| | before the drain change | after |
+|---|---|---|
+| connected | 9,323 of 10,000 | 9,328 of 10,000 |
+| broadcast | 11,427 pkt/s | 11,052 pkt/s |
+| arena workers | 12% + 12% | 12% + 12% |
+| mainloop | 14% of a core | 14% of a core |
+| write waited | 7,698 ms | 11,605 ms |
+
+Same collapse, same mechanism, one commit apart. The drain change lets the server reach this point
+rather than causing it.
+
+This is the ceiling that matters now, and it is not the arena workers — they are barely awake through
+it. It is the one figure this document has been watching grow for a while: the global player write
+lock, 6.5 ms of wait at three thousand players, 19.9 ms at six thousand, and eleven seconds at nine.
+
+## Before that: the workers could not be saturated, because something else ran out first
+
+The ceilings below are extrapolated from cost at a fixed load, so the obvious thing to do was measure
+them: offer one worker and then two about ten percent more than each was predicted to carry, and see
+what each actually retires. Spread out, so that a packet costs the worker a hundred candidate scans
+while costing the generator only twenty recipients to receive — which is what makes loading the server
+possible without loading the generator.
+
+Neither got close:
+
+| | offered | reached the mainloop | broadcast | arena workers | headroom |
+|---|---|---|---|---|---|
+| one worker, 6,000 clients | 48,069 | 37,056 | 36,988 | 62% of 100% | 38% |
+| two workers, 10,000 clients | 62,777 | 47,061 | 46,442 | 145% of 200% | 55% |
+
+About a quarter of what the clients sent never reached the mainloop's work queue, which drops nothing
+itself — so it was lost before that, in the receive path or on the way there. The connections tell the
+same story: 4,848 of 6,000 and 6,853 of 10,000 clients ever connected, which is the connection init
+dropping under burst arrival that this document already records.
+
+**So worker capacity is not measurable on this machine.** Not because the workers are too fast to
+load, but because nothing here can deliver enough packets to them: they still had 38% and 55% of
+themselves spare at the point where a quarter of the offered load was already going missing. The
+figures in the table below stay extrapolations.
+
+That is worth more than the measurement it failed to make. At every load this setup can produce, the
+arena workers are not the constraint — the receive path is, and it is a single thread.
+
+## What a worker costs, and what it buys
+
+Filling in the two worker case on the current build completes the picture, and it is less bleak than
+"more is not better" suggested:
+
+| workers | same work costs | against one worker | ceiling, extrapolated |
+|---|---|---|---|
+| 1 | 73% of a core | 1.00 | ~55,000 pkt/s |
+| 2 | 89% between them | 1.22 | ~90,000 pkt/s, 1.6 times |
+| 4 | 100% between them | 1.37 | ~160,000 pkt/s, 2.9 times |
+
+The marginal cost falls rather than rises — one to two costs sixteen points, two to four costs eleven
+— so workers are sub-linear rather than wasteful. Four of them buy nearly three times the ceiling for
+just over a third more processor time, which is worth paying when the ceiling is what is wanted.
+
+The ceilings are extrapolations from a worker being able to reach a whole core, and they are
+optimistic: a saturated worker costs about a fifth more per packet than one at half load, measured
+below. Treat them as an ordering rather than as numbers.
+
+What actually decides the setting is that an arena belongs to the worker it was created on for the
+rest of its life. Raising it once a zone is full does not move the arenas that are already busy, so it
+has to be sized for the peak — which is why the default takes its cue from the processor count, as a
+stand-in for how large a zone the machine was meant to host.
+
+## What one worker can carry, and why the ratios are not capacity
+
+Everything above holds the load constant and varies the worker count, which says what a worker costs
+but not what it can carry. Those two are the same thing only if cost per packet does not depend on how
+busy the worker is, and it does. One worker, identical work per packet — a hundred players an arena,
+about ninety recipients — at two very different loads:
+
+| | half load | saturated |
+|---|---|---|
+| throughput | 15,009 pkt/s | 27,494 pkt/s |
+| arena worker | 50% | **108%** |
+| **cost per packet** | **33.3 µs** | **39.3 µs** |
+| broadcast of what was offered | 100% | **91%** |
+| working set | 290 MB | 452 MB |
+
+**A saturated worker costs about a fifth more per packet than one at half load.** Nothing was specced,
+so the missing nine percent is the server itself: with no queue depth limit the backlog simply grows,
+which is what the working set is doing, and throughput settles at what the worker can actually retire.
+
+So the worker count comparisons above, all made between 25% and 73% busy, measure the cheap end of
+that range. They are still a fair comparison with each other — both sides of every pair sat in the
+same range — but the ratio between them is not a capacity ratio, and four workers will not carry four
+times 27,300 packets a second.
+
+What can be said: **one arena worker sustains around 27,300 position packets a second** at ninety
+recipients each, which is roughly 2,700 players at ten updates a second in one arena group.
+
+What cannot be said is what four carry, and not for want of trying. Four workers would saturate
+somewhere near 87,000 packets a second, which at ninety recipients is nearly eight million updates a
+second flowing back to the load generator — twice what it has ever sustained. Raising the recipients
+per packet to reach saturation at a lower packet rate makes the generator's receive side worse rather
+than better. That measurement needs a second machine.
+
+## On hardware with a real PMU: a cliff at four send threads, and it is probably the box
+
+Every cache explanation in this document up to here was a hypothesis that could not be tested, because
+WSL2 exposes no PMU — `/sys/bus/event_source/devices` has no `cpu` entry, so there is nothing for
+`perf` to read. The zone's VPS is 8 vCPUs of AMD EPYC under KVM with the counters exposed, and the
+comparison recorded at the end of the previous section has now been run there.
+
+The A/B is the send threads, not the arena workers. `ArenaLoop:Workers` was 2 in both runs. 2,000
+clients over 20 arenas, `--spread 16384`, 150 seconds, with `perf stat -e cache-misses,cache-references`
+attached to the server process for a 30 second window inside the settled part of the run.
+
+| | 2 send threads | 3 send threads | 4 send threads |
+|---|---|---|---|
+| broadcast | 20,037 pkt/s | 20,007 pkt/s | 19,995 pkt/s |
+| outgoing updates | 385,751/s | 383,449/s | 383,790/s |
+| server processor | **2.93 cores** | **2.94 cores** | **3.48 cores** |
+| busiest send thread | 85% | 61% | 58% |
+| cache references | 468.2 M/s | 488.7 M/s | 560.8 M/s |
+| cache misses | 66.6 M/s | 68.2 M/s | 76.8 M/s |
+| miss ratio | 14.23% | 13.95% | 13.70% |
+
+**The third thread is free and the fourth is not.** Two and three threads cost the same processor time
+to the hundredth of a core, while the busiest thread falls from 85% of its interval to 61%. The step
+to four costs 19%.
+
+The counters track the processor time exactly at all three points. Per outgoing update: 1,214 → 1,275
+→ 1,461 references, 173 → 178 → 200 misses. So the relationship established below holds — the work
+being done and the memory being touched move together — but it is a cliff between three and four
+threads, not a cost per thread.
+
+Per core-second the counters are flat across all three: 159.8, 166.3, 161.1 M references and 22.7,
+23.2, 22.1 M misses. **The threads are not stalling more per unit of time; the four-thread
+configuration touches more memory for the same output.** Same instructions running slower would show
+as misses per core-second going up, and that does not happen at any of the three points.
+
+The miss *ratio* falls monotonically, 14.23 → 13.95 → 13.70%. Colder caches would raise references and
+misses together and hold or worsen the ratio. References rising faster than misses is the signature of
+lines fetched but found in another core's cache rather than in memory.
+
+Where the processor time went, by thread:
+
+| | 2 threads | 3 threads | 4 threads |
+|---|---|---|---|
+| send threads | 85 + 82 = **167%** | 61 + 60 + 55 = **176%** | 58+53+53+47 = **211%** |
+| arena workers | 51 + 50 = 101% | 48 + 47 = 95% | 56 + 55 = 111% |
+| receive + mainloop | 24% | 23% | 26% |
+
+The arena workers get *cheaper* at three threads and dearer at four, which no story about the send
+threads alone explains — the producers are being affected by something that only appears at four.
+
+### The four-thread cliff is most likely the machine, not the code
+
+The two-point fit recorded here first — 22.1% of a core constant per thread plus 0.0614% per player —
+predicted 3.15 cores at three threads. The measurement is 2.94. **There is no per-thread constant.**
+Refitting on the two-and-three-thread points gives 9.0% plus 0.0745% per player, which predicts 46.3%
+per thread at four and measures 52.8%: the four-thread run is 6.5 points per thread above its own
+trend line.
+
+What is special about four is the box. `loadtest.sh` runs the load generator on the same machine, and
+2,000 clients receiving 379,000 updates a second is not cheap. At three send threads the server's hot
+threads are 3 send + 2 arena + receive + mainloop = 7 on 8 vCPUs; at four they are 8, before the
+generator, the garbage collector, the reliable thread and the sized send thread are counted.
+
+The variance says the same thing. Three runs of the four-thread configuration cost 3.48, 3.64 and 4.33
+cores; two runs of the two-thread configuration cost 2.93 and 3.09. A contended machine gives noisy
+numbers; a fixed toll would not.
+
+So the honest reading is that this pair measures **where this VPS runs out of processors while also
+generating its own load**, and the coherence signature in the counters is what oversubscription looks
+like from inside the process — threads descheduled, migrated, and refilling caches. It is not proof of
+an intrinsic cost to running more send threads, and the three-thread point is evidence against one.
+
+### What this means for the setting
+
+On this box **three send threads is strictly better than two**: the same processor time, and the
+busiest thread drops from 85% of its interval to 61%. The send threads were the binding constraint at
+two — at 85% they are close to overrunning, and an overrun means outgoing data going out late — so
+the third thread buys roughly 40% more population headroom for nothing. `Net:MaxSendThreads = 3`.
+
+Refitting capacity on the honest points: a send thread saturates near 1,220 players owned, and the
+server costs about `0.09 × threads + 0.00134 × players` cores. Three threads reach about 3,700 players
+at 5.2 cores. Beyond that this box cannot both serve and generate, so the population sweep needs the
+generator moved off it.
+
+### What this does not settle
+
+`ArenaLoop:Workers` was held at 2. The comparison named in `0ccc1ff` — one worker against four, same
+work, counters attached — has still not been run, and the three-thread result above is a reason not to
+assume the answer. The arena worker penalty was measured on a machine with 32 logical processors at
+73%, 89% and 100% of a core for one, two and four workers, which is nowhere near filling it, so
+whatever explains the four-send-thread cliff on an 8 vCPU box does not obviously explain that. **They
+are two open questions, not one**, and this section should not be read as having closed either.
+
+Nothing here separates oversubscription from an intrinsic cost, because no run recorded what the whole
+machine was doing — only what the server process was doing. Server processor time and the server's own
+cache counters both look the same whether the server is slow because of coherence traffic or slow
+because it is being descheduled.
+
+`LLC-load-misses` and `LLC-store-misses` come back `<not supported>` under this hypervisor, so only the
+aggregate generic events are available, and what they map to on a virtualised EPYC is not certain
+enough to reason about absolute values. The ratios between two runs on the same box are the usable part.
+
+### Two measurements, one of which was worthless
+
+The first attempt ran `perf` by hand in a second terminal after the harness had already printed its
+results — by which time the harness has shut the server down. `pgrep` still found a process, so the
+window attached to a stray from an earlier run and recorded 957 M references against the 14,046 M the
+same configuration produces under load. The arithmetic caught it: 10 M references per core-second is
+one every 250 cycles, which is not what a busy server looks like.
+
+The fix was to stop doing it by hand. A wrapper starts the load test, waits for the fourth `position:`
+line in the server log, attaches `perf` to the running process for 30 seconds and then waits for the
+harness. The four-thread run had in fact been timed correctly the first time and reproduces to within
+7% on references and 4% on misses across the two attempts, which is the reason to trust the pair.
+
+## The arena workers, with headroom and counters at last: two is the floor, and four is real
+
+The comparison owed since `0ccc1ff`. 1,600 clients over 16 arenas — chosen so the count divides evenly
+by one, two and four, since arenas are handed to workers round robin at creation (`ArenaLoop.cs:221`)
+— `--spread 16384`, send threads pinned at two so the adaptive supervisor could not vary them, and
+`perf` plus `/proc` over the same 30 second window inside the settled part of each run.
+
+| | 1 worker | 2 workers | 4 workers |
+|---|---|---|---|
+| broadcast | 16,016 pkt/s | 15,999 pkt/s | 16,005 pkt/s |
+| outgoing updates | 290,617/s | 289,563/s | 290,646/s |
+| **server processor** | 2.78 cores | **2.39 cores** | 3.13 cores |
+| send threads | 91 + 91 = **182%** | 74 + 74 = **148%** | 91 + 89 = **180%** |
+| arena workers | 75% | 36 + 35 = **71%** | 27 × 4 = **108%** |
+| receive + mainloop | 21% | 20% | 25% |
+| cache references | 463.0 M/s | 388.3 M/s | 469.7 M/s |
+| cache misses | 56.2 M/s | 50.4 M/s | 61.7 M/s |
+| send thread overruns | 1,063 | 902 | 1,183 |
+| working set | 231 MB | 238 MB | 294 MB |
+| **machine idle** | 1.32 cores | 2.49 cores | **1.65 cores** |
+
+**Two workers is a floor, not a compromise.** One costs 16% more processor time than two and four
+costs 31% more, for work that is identical to within a tenth of a percent. The default of two, which
+was picked for a different reason — that at one worker the mainloop was at 93% backfilling — turns out
+to be the measured optimum on this machine.
+
+**The four worker penalty is real and it is not the machine.** 1.65 cores were idle, so nothing was
+waiting for a processor. This is the first time the penalty has been measured with headroom and
+hardware counters at the same time, and it survives both. Worker processor time goes 71% → 108% for
+the same work, which is the same +50% shape seen on the development machine, and the send threads go
+up 32 points alongside it.
+
+### One worker is dear for a different reason than four
+
+The costs are not on the same thing. At four workers, **both** the workers and the send threads rise.
+At one worker the workers are *cheap* (75% against 71%, and it is one thread rather than two) and the
+whole of the excess is in the send threads, which do none of its work — 182% against 148%.
+
+The obvious explanation, that a single bursty producer makes the send threads pass over their shards
+more often, is **wrong**. Send thread iterations are 167 a second at one worker and 166 at two. Same
+passes, same sends, 34 points more processor time. It is the cost of a pass that changes, not their
+number. Note also that 167 across two threads is 83 each, against a nominal 100 — these threads are
+already overrunning their 10 ms interval at this load, in every configuration.
+
+### What the counters say about the four worker case
+
+Per outgoing update, against two workers as the baseline:
+
+| | 1 worker | 2 workers | 4 workers |
+|---|---|---|---|
+| references per update | 1,593 | 1,341 | 1,616 |
+| misses per update | 193.5 | 174.0 | 212.2 |
+| references per core-second | 166.5 M | 162.5 M | 150.1 M |
+| misses per core-second | 20.2 M | 21.1 M | 19.7 M |
+
+Four workers take 20% more references and 22% more misses per update, but **31% more processor time**.
+That gap is the new information. Where the send thread comparison showed processor time and memory
+traffic rising together, here processor time rises faster than the traffic that is supposed to explain
+it, and references per core-second *fall*. The processor is spending time not issuing memory
+references — stalled longer on each miss, or waiting on something.
+
+Longer stalls for the same misses points at where the line comes from rather than how many there are.
+The first guess was the fabric: this is an EPYC Naples part, and on that generation the L3 is not
+shared across a package but across a group of four cores, so a line owned by a core in another group
+crosses the interconnect. Eight vCPUs would be two such groups, which four workers might span and two
+might not.
+
+**The topology says no.** `shared_cpu_list` for the L3 is `0-7`, one cache for every processor, and
+`thread_siblings_list` is a single processor each, so there is no SMT either. Nothing here to span.
+
+That answer comes with a caveat which cannot be resolved from inside the guest: the machine reports
+8 MB of L3 for eight cores, where two real Naples groups would be 16 MB, so what the guest is shown is
+synthetic. The host may still be placing these vCPUs across groups, and neither reading the topology
+nor pinning inside the guest can see or change it. The hypothesis is untestable here rather than
+disproved — but it is also unactionable here, which matters more.
+
+What remains, and fits the numbers without needing any of that: the **working set grows with workers**,
+231 MB at one, 238 at two, 294 at four, against 8 MB of last level cache. A miss that used to be
+answered by another core's cache becomes a miss answered by memory, which is the same count of misses
+taking longer — exactly the shape measured. Whether that is buffers in flight or the collector giving
+each thread its own allocation budget is not established; the arena queues are nowhere near their 2,000
+item limit at 27% busy, so it is not backlog.
+
+## The firewall is a fifth of the send thread, and it has been corrupting every comparison
+
+**Read this before the two sections below it, both of which it invalidates in part.**
+
+A sampled profile of one send thread, hardware counters, 999 Hz, 30 seconds inside a settled run of
+1,600 clients over 16 arenas:
+
+```
+66.82%  [kernel.kallsyms]
+31.54%  memfd:doublemapper          <- JIT compiled code
+ 0.80%  libcoreclr.so
+
+12.31%  nft_do_chain                <- nftables walking its rule chain
+ 3.05%  expr_call_ops_eval
+ 1.96%  nft_meta_get_eval
+ 1.32%  nft_immediate_eval
+ 1.05%  __nf_conntrack_find_get
+ 0.85%  nf_hook_slow
+ 0.81%  udp_sendmsg                 <- the actual send
+```
+
+**Two thirds of the send thread is kernel, and at least a fifth of the whole thread is the firewall**,
+evaluating its chain and doing a connection tracking lookup for every datagram. `udp_sendmsg` itself
+is 0.81%. `__pv_queued_spin_lock_slowpath` at 2.14% is contention on conntrack's own locks between the
+server's threads.
+
+This is the answer to the arithmetic that could not be made to work: 13.6 µs per connection per pass
+for two 22 byte packets, against syscalls that ought to cost 2% of a core. The syscalls do cost about
+that. The firewall wrapped around them costs ten times more.
+
+### It also explains why the comparisons would not settle
+
+Same configuration, different runs: `Workers = 2` measured 2.39 cores and then 2.82, and `Workers = 1`
+measured 2.78 twice and then 2.63. **The one worker against two result reversed on repetition.** An 18%
+spread between runs of one configuration is larger than most of the differences recorded below, so:
+
+- **"One worker makes the send threads dear" is withdrawn.** It was one pair, and the pair did not hold.
+- **"Six busy threads is the bottom of a U" is withdrawn.** Every step in it — 1 to 2 workers at 16%,
+  2 to 3 send threads at 18% — is at or below the noise it was measured against.
+- **Four workers costing 31% is the only step above the spread**, and it is one run. It needs repeating
+  before it is believed either.
+
+Connection tracking is stateful and its table carries entries between runs, which is a plausible source
+of exactly this kind of run to run variation. Nothing in the harness was wrong; the machine underneath
+it was not holding still, and no amount of averaging windows *within* a run would show that.
+
+**Nothing on this machine should be compared again until the firewall is out of the packet path**, and
+then every configuration needs repeating rather than measuring once.
+
+## Threads are U shaped, and six is the bottom — WITHDRAWN, see above
+
+Adding the send thread count to the worker sweep, all at 1,600 clients over 16 arenas with the same
+instrumentation, and counting every thread that does continuous work — the arena workers, the send
+threads, the receive thread and the mainloop:
+
+| run | workers | send threads | busy threads | server processor | send | workers | references | misses | overruns |
+|---|---|---|---|---|---|---|---|---|---|
+| w1 | 1 | 2 | **5** | 2.78 cores | 182% | 75% | 463.0 M/s | 56.2 M/s | 1,063 |
+| **w2** | **2** | **2** | **6** | **2.39 cores** | **148%** | **71%** | **388.3 M/s** | **50.4 M/s** | 902 |
+| st3w2 | 2 | 3 | **7** | 2.82 cores | 175% | 82% | 444.2 M/s | 59.4 M/s | **471** |
+| w4 | 4 | 2 | **8** | 3.13 cores | 180% | 108% | 469.7 M/s | 61.7 M/s | 1,183 |
+
+Same work in every row — 16,004 to 16,016 packets a second, 289,000 to 291,000 updates delivered.
+
+**Six busy threads is the bottom of a U**, and it does not matter much which side the extra thread is
+added to: a seventh costs 18%, an eighth 31%. Server processor time and cache references move together
+across every row, which they did in the send thread comparison too.
+
+**"Three send threads are free" is withdrawn.** That was measured at 2,000 clients on a box later shown
+to be about 94% busy, where the machine rather than the setting was being measured. With headroom the
+third send thread costs 18% — the same as any other seventh thread. It does halve the overruns, 902 to
+471, so it buys latency; it does not buy capacity, and it is not free.
+
+**Adding a thread on either side makes both sides dearer.** The third send thread raised worker time
+from 71% to 82% as well as its own from 148% to 175%. Four workers raised send thread time from 148%
+to 180% as well as their own from 71% to 108%. Producers and consumers share the connection state and
+the buffers, and the cost lands on both.
+
+**One worker is the exception and is still unexplained.** It has the fewest busy threads of any row and
+is the second dearest, with the whole excess in the send threads, which do none of its work. Not
+because they run more often: 167 iterations a second against 166 at two workers. Batching is the
+suspect — `SendOutgoing` merges position packets that are already queued when it arrives
+(`Network.cs:4188`), so the producer's arrival pattern decides how much merging it does, and bytes per
+delivered update do vary with it: 21.7 at one worker, 23.2 at two, 22.4 at four. Suspect, not
+established.
+
+The arithmetic that makes it worth chasing: a send thread walks 800 connections 83.5 times a second,
+so 66,800 connection visits a second, and at 91% of a core that is **13.6 µs per connection** carrying
+about 2.2 queued packets of 22 bytes. Syscalls are not it — at roughly 20 updates packed into a
+datagram that is 7,250 sends a second per thread, under 2% of a core — and neither is the bandwidth
+limiter, whose `Iter` and `Check` are a few operations over a six integer array. Something per
+connection per pass costs far more than what it appears to do, and no amount of comparing runs will
+name it.
+
+## The worker's profile, and the first thing it said was that this is a Debug build
+
+With managed frames resolving at last (`DOTNET_EnableWriteXorExecute=0`, so that JIT code is where
+the perf map says it is), `profile-thread.sh` against `ArenaLoop-0` at 1,600 clients over 16 arenas,
+`--spread 16384`, two workers, 30 s at 999 Hz:
+
+| where | share of the worker |
+|---|---|
+| JIT code | 88.9% |
+| kernel | 7.7%, all of it timer interrupts |
+| libcoreclr | 2.3% |
+
+No system calls. A worker buffers packets and the send threads do the sending, so the firewall that
+costs a send thread a fifth of itself never touches a worker. That was argued above from first
+principles; this is the measurement.
+
+The second thing in it was the tag on every method of the server's own: `[MinOptJitted]`. The runtime
+marks each method in the perf map with how it was compiled, and that one means compiled with
+optimisation off and never to be tiered up, which is what every method of an assembly built in Debug
+gets. The BCL methods around them were `[OptimizedTier1]`. `loadtest.sh` ran `dotnet run` with no
+configuration, which is Debug, and every figure in this document was measured that way. The caveat
+was written down near the top; what the profile added was its size:
+
+| method | share of the worker | in a Release build |
+|---|---|---|
+| `LittleEndianConverter.Convert(int16)` | 7.3% | nothing: on x64 it returns its argument, and is inlined away |
+| `TryGetExtraData` and its cast helper | 14.4% | inlined at the call site |
+| `Hypot` | 7.3% | real work, in registers rather than stack slots |
+| packet getters, `Debug.Assert` string handlers | 2.8% | gone |
+
+`CONFIGURATION=Release` on `loadtest.sh` now runs the Release build, built first by the caller; the
+run says which build it was, and `profile-thread.sh` sums the `[MinOptJitted]` share of a profile and
+warns. In Release the same worker went from 52.5 µs a packet to 30, and the server from 2.61 cores
+to 2.27. The send threads did not move, because their cost is in the kernel.
+
+Per-packet figures from here on are a method's share × the worker's utilisation ÷ the packets that
+worker handled. Both the thread's total and its share of the packets change with the worker count, so
+the raw percentages mislead.
+
+## Why four workers cost more than two: the wait spun and yielded
+
+Two workers against four, same load, one worker profiled each time, Debug and then Release:
+
+| µs per packet on the worker | pw-2 (Debug) | pw-4 | rw-2b (Release) | rw-4 |
+|---|---|---|---|---|
+| whole worker | 52.5 | 70.0 | 30.0 | 37.5 |
+| kernel and runtime | 5.2 | 13.2 | 9.6 | 13.6 |
+| send side: `SendOrBufferPacket`, `OutLock`, pool, atomics | 15.4 | 19.9 | 10.6 | 13.0 |
+| scan side: `BroadcastPosition`, `Hypot`, `TryGetExtraData` | 21.9 | 23.6 | 8.5 | 9.5 |
+
+The send side grew and the scan side did not, which is what the hand timing above had said. But the
+largest mover was the kernel, and the timer interrupt's share of it was constant, so whatever it was
+scaled per packet and not per processor-second. Its symbols were the scheduler and system call entry
+and exit, with `do_sched_yield` among them. Nothing else: no networking, no memory management.
+
+The obvious reading, that an idler worker blocks and is woken for more of its items, was wrong, and
+the kernel's own counts for the thread said so: 284 blocks a second, but 2,765 times a second
+switched out while still runnable. `perf stat` on the thread over the same window:
+
+| per second, one worker of two, Release | |
+|---|---|
+| `sched_yield` | 17,942 |
+| `futex` | 539 |
+| blocked and woken | 284 |
+
+A worker waited on a `BlockingCollection`, whose wait is a `SemaphoreSlim`. When that finds nothing
+queued it spins for up to 140 iterations before it will block, and from the tenth iteration every
+other one is `Thread.Yield`: a `sched_yield` system call and a full trip through the scheduler,
+whether or not anything else can run, up to 65 of them for one empty queue. 284 × 65 is 18,460.
+Nearly every item arrives inside the first few iterations, which are pause instructions and cost
+nothing to speak of, but the few hundred gaps a second that outlast the budget cost 65 system calls
+each, about 140 µs of processor per idle transition, and that was a fifth of the worker's time. The
+budget is fixed while the gaps between one worker's items grow with the number of workers, so a
+worker at four is more often in the expensive part of its wait than a worker at two. The cost lands
+in the kernel and in the runtime's spin, never in any method of the server's, which is why six
+changes to the work each helped one worker and none helped four: the extra was never in the work.
+
+It is not a capacity cost. At saturation there are no gaps and the spin never runs, so the 1.78
+measured between one and two saturated workers above stands. It is a cost at partial load that grows
+with idleness, and every worker comparison in this document that was not at saturation was inflated
+by it, more so the more workers were running. It is also why isolating the workers on their own
+cores made it worse: a yield with nothing else to run returns at once, and the budget is spent
+faster.
+
+### The fix
+
+`scale/24-worker-wait`: a `ConcurrentQueue` and a `ManualResetEventSlim` with a spin count of ten,
+under `SpinWait`'s yield threshold, so the wait spins for a couple of microseconds on pause
+instructions, for the item that is about to arrive, and then blocks. The event is cleared before the
+queue is re-read, so a wake cannot be lost between the two.
+
+| per second on one worker, Release | rw-2c, before | fw-2, after | fw-4, after |
+|---|---|---|---|
+| `sched_yield` | 17,942 | 248 | 106 |
+| blocked and woken | 284 | 583 | 579 |
+| kernel share of the worker | 19.6% | 10.1% | 12.6% |
+
+| | rw-2b | rw-4 | fw-2 | fw-4 |
+|---|---|---|---|---|
+| µs per packet on the worker | 30.0 | 37.5 | 22.5 | 25.0 |
+| the four worker penalty | | +25% | | +11% |
+| all workers together | 48% | 60% | 36% | 40% |
+| whole server, cores | 2.32 | 2.42 | 2.11 | 2.10 |
+
+Three Release runs of two workers before the fix put the profiled worker at 24, 24 and 20 percent;
+after it, 18. The server costs the same at four workers as at two. What is left on the worker is a
+microsecond on the send side, where the pool dequeue and `SendOrBufferPacket` grew, and a microsecond
+of real block-and-wake, since a worker at four blocks twice as often per packet. The scan side is flat
+to within a percent.
+
+### The cast that was a call
+
+The largest single item left on the worker in Release is `CastHelpers.IsInstanceOfClass` at 12.65%,
+about 2.9 µs a packet. It is the `is T` inside `TryGetExtraData`, once per candidate scanned, and it
+is a call because `Game.PlayerData` was not sealed: for a class nothing can derive from, the same
+check is an inline comparison of the method table pointer. `scale/25-sealed-extra-data` seals every
+module's private per-player and per-arena data class.
+
+**Measured: nothing.** The helper is gone from the profile and `BroadcastPosition` grew from 23.6% to
+36.8% of the worker, which is the same time under a different name; the worker sat at 19 to 20
+percent against 18 before, within the spread of repeated runs. So the stall was never the call. It is
+the memory the check touches, another player's extra-data slot and then that object's header, once
+per candidate scanned, and the helper was only the first instruction to use what was loaded, so the
+profile charged the miss to it. Inline, the miss is charged to `BroadcastPosition` instead. The
+sealing stays, since it is correct and costs nothing, but it is a tidy-up and not a gain, and a
+sample profile attributes a miss to whichever instruction consumes the load, which is not always the
+one that matters.
+
+What that leaves on the scan side is about 87 ns per candidate, for a hundred candidates a packet,
+and the line being fetched is player state the mainloop writes for every packet it handles. That is
+the sharing relationship "What none of them touched" describes, and `Net:HandlePacketsOnArenaThread`
+is the setting that removes it, measured at 13% of the server at one worker on a Debug build before
+any of the above.
+
+**Measured in Release with the yield fix in, `hw-2`: a loss of about three percent.**
+
+| | sw-2, off | hw-2, on |
+|---|---|---|
+| whole server, cores | 2.17 | 2.23 |
+| mainloop | 9%, 2,891 iterations a second | below the listing, 159 a second |
+| each of two workers | 19 to 20% | 26% |
+| worker, µs per packet | 23.75 | 32.5 |
+
+The mainloop left the packet path, and the workers took on more than it gave up. Of the extra 8.75 µs
+a packet on the worker, about 2 is the handler itself: `HandlePositionPacket`, the work item, the
+advisor lookup, the player lock. The rest is the scan and the sends getting dearer on the same thread:
+`BroadcastPosition` 8.7 to 11.0 µs, the pool dequeue 1.5 to 2.5, the connection lock 1.6 to 2.3. So
+the scan's cost is not the position line the mainloop writes, and moving the write did not buy it
+back. The thirteen percent at one worker above was measured in Debug with the yield spin present,
+which confounds it. Left off.
+
+What the scan's 87 ns per candidate is remains open. `PERF_EVENT=cache-misses` on
+`profile-thread.sh` is the instrument for it, attributing samples to the instructions that missed
+rather than to whichever one consumed the load. But the worker is a fifth of a core at this load and
+each send thread is four fifths, so it is not where the next player fits, and the worker question is
+closed here: the code reason four cost more than two was the wait, it is fixed, and what remains is
+the send path's shared lines at about half a microsecond per recipient.
+
+## Everything the arena thread can be handed, and the defect it found
+
+`Net:HandlePacketsOnArenaThread` had been vetted for positions, weapons and deaths only. The load
+client can now produce the rest: `--ship-changes`, `--freq-changes`, `--arena-switches`, `--balls`
+and `--flags`, each a rate per client per minute like `--deaths`. Ship and freq changes, flag touches
+and drops, and ball pickups and shots are all handled on the arena's thread when the setting is on;
+the arena switch is a second arena request while playing, which is what `?go` sends, and it goes to
+the mainloop by design, which is exactly the race that matters: packets in flight to the old arena's
+worker while the mainloop moves the player. Two details shape the simulation. A ball pickup has to
+quote the ball's fire time from the server's last ball update, or it is refused as stale, so a client
+only tries for a ball the server last reported loose. And the ship change enforcer allows no ship
+for five seconds after a change, so a client whose arena entry lands inside that window arrives in
+spectator mode; the client asks for a ship once a second until it gets one.
+
+The first run, 200 clients over 4 arenas on a Debug build with everything on, lasted ten seconds:
+
+    FlagGameResetDelegate was fired from an arena thread and reaches handlers registered zone-wide
+
+A flag drop handled on the arena thread ended the flag game, and the reset fired
+`FlagGameResetCallback` there. The Game module respawning the winning team and the stats module
+scoring the game are both registered zone-wide and both written for the mainloop. The threading
+assertion caught it and the server went down with it, which is what the assertion is for. Fixed on
+`scale/26-flag-reset-on-arena-thread` the way the map region warp and the enter-game action were
+fixed before: a reset that begins on an arena thread hands the firing to the mainloop, and from the
+mainloop it fires in place as it always has.
+
+After the fix, 90 seconds with everything on:
+
+| | |
+|---|---|
+| assertion failures | 0 |
+| errors | 0 |
+| warnings | 2, both a ball two clients raced for |
+| clients survived | 200 of 200 |
+| kill notifications | 981/s |
+| ship and freq change notifications | 190/s |
+| flag pickups | 166/s |
+| ball updates | 137/s |
+| arena switches completed | 2.1/s |
+
+The client also keeps the chat it receives, since the server explains a refusal to the player in
+chat and nowhere else, and prints the most frequent. That showed the freq balancer refusing every
+move between two equal teams, and private freqs unavailable in the test arenas: neither a defect,
+both worth knowing before reading a warning count. Warnings from the client's own misbehaviour,
+touching flags from spec and asking for ships between arenas, went from 189 to 2 once it waited to
+be told what it was in.
+
+Not measured for cost: a run that switches arenas and changes ships has clients out of play for
+part of it, which the broadcast-versus-offered check reports, so it is a correctness run and not a
+throughput one. The 3% cost of the setting stands from `hw-2`.
+
+**On the VPS, 1,600 clients over 16 arenas, 150 seconds, Debug, everything on: 0 assertion failures,
+1,599 of 1,600 survived.** 27 warnings: 19 for a ball two clients raced for, 6 for a ship or freq
+change sent before the server's notice of the previous one had been acked, 2 for a request landing
+mid switch. The one error is the security module wanting `clients/Continuum.exe` for its checksum,
+which that box does not have. Not a throughput run in any sense: with no `--spread` the fan-out was
+88 recipients a packet, 520,000 sends a second, and two workers sat at 93% each on a Debug build,
+so only 36% of the offered positions were broadcast and the mainloop, at 1%, had nothing to
+backfill with. The one lost client is most likely a reliable packet that went unacknowledged for
+fifteen seconds on a saturated server, which is the client's own give-up rule.
+
 ## What to watch next
 
+- **A sampled profile of one send thread at one worker against two**, which is now possible and is the
+  way to finish this. `scripts/loadtest/bash/profile-thread.sh` does it: hardware sampling at 999 Hz
+  against a single thread id, with `DOTNET_PerfMapEnabled=1` so managed frames resolve. The function
+  that is hot at one worker and not at two is the answer to the paragraph above. Do not reach for
+  `dotnet-trace` instead; it has already answered this class of question wrongly once.
+- **The send thread count, re-measured at a load with headroom.** "Three are free" was measured on a
+  box that turned out to be about 94% busy, and at 1,600 clients two send threads run at 91% and make
+  83 passes a second against a nominal 100 — they are overrunning their interval in every
+  configuration above. This is the setting that decides how many players fit, so it is worth more than
+  anything left on the worker question.
+- **Why one worker makes the send threads dear**, which has nothing to do with how often they run.
+- **Whether the working set explains the four worker stalls**, since the topology did not. 294 MB
+  against 8 MB of last level cache, and the queues are not backlogged, so where the extra 56 MB comes
+  from is the question — buffers in flight, or the collector sizing per-thread budgets by thread count.
+- **Whole-machine utilisation during every run from here on.** Every measurement on the VPS records
+  only what the server process used, so a cliff caused by running out of processors and a cliff caused
+  by the code look identical. Idle time from `/proc/stat` across the `perf` window costs nothing and
+  would have answered the four-thread question in the first run rather than the third.
+- **Moving the load generator off the box.** 2,000 clients receiving 379,000 updates a second share
+  8 vCPUs with the server, so the ceiling being measured is the pair, not the server. Nothing above
+  3,000 players is worth measuring on this box until that is fixed.
+- **One arena worker against four, with the counters attached**, on the VPS. This is the run named in
+  `0ccc1ff` and the send thread A/B above is not a substitute for it.
+- **`Net:MaxSendThreads = 0` picks `ProcessorCount / 4` clamped to 1-8.** On the 8 vCPU VPS that is 2,
+  and 3 measures better — same processor time, 24 points more headroom on the busiest thread. The
+  formula has never been measured against anything on any machine.
+- **The 34 errors logged in every VPS run — read at last, and harmless.** Every one is an
+  `AttachModule failed: Unable to find module` at startup, for the matchmaking modules and the bot
+  module, which the arena configs on that box ask for and which are not loaded there.
+  Once per arena, nothing in the packet path, and nothing in any measurement above.
+- **The four worker floor — FOUND, see "Why four workers cost more than two" above.** It was the
+  wait between items, not the work: six interventions on the work helped one worker and none helped
+  four because the extra was 65 `sched_yield` calls per idle gap. Fixed on `scale/24-worker-wait`.
+  What remains is +11% per packet on the worker at four against two, nothing at the level of the
+  whole server, and it sits in the send path's shared lines.
+- **The rest of the arena-thread packet path — DONE, see "Everything the arena thread can be handed"
+  above.** Ship and freq changes, flags, balls and arena switching are all produced by the load
+  client now. They found a third defect, the flag game reset, fixed on `scale/26`, and a 90 second
+  run with everything on is clean on a Debug build, and so is 150 seconds at 1,600 clients on the
+  VPS.
+- **A combat load this machine can sustain at four thousand clients.** Both code paths collapse there,
+  so nothing about combat can be compared at that scale.
+- **What four workers can carry**, which cannot be measured on this machine. One worker saturates at
+  about 27,300 packets a second at ninety recipients each; four would need something near four times
+  that, and at ninety recipients that is eight million updates a second back to the load generator,
+  which has never sustained more than four. Making packets costlier to lower the packet rate makes
+  the generator's side worse, not better. This needs a second machine, or a generator that can
+  receive far more cheaply than it does.
+- **Re-measuring the worker scaling numbers on the fixed build.** Every figure in this document from
+  the arena workers predates the busy wait fix, and now also the yield fix, and overstates the
+  penalty, the more so the more workers were running. The saturation figures are unaffected, since a
+  saturated worker has no gaps to spin in. The direction and the eliminations hold; the magnitudes
+  need redoing, and in Release.
+- **Whether isolating the workers still makes it worse.** Explained: that result was measured with
+  the yield spin present, and a yield on an uncontended core returns at once, so the budget was spent
+  faster there. An artefact of the spin, not a clue, and not worth repeating.
+- **Where the load goes in the saturated runs**, where nothing is specced and half the offered packets
+  still produce no broadcast. A counter on each early return in `HandlePositionPacket` would say in
+  one run which of the three it is, and the timestamp check is the one to expect.
+- **A load test that reaches a steady state at high fan-out.** The Windows runs above ramp, peak and
+  then fall to a common floor rather than settling, which makes any single window unsafe to compare.
+  Longer runs, or a load the client can sustain, before trusting any more scaling numbers.
+- **Re-measuring `ArenaLoop:Workers` and the send thread count on the machine the server will run
+  on.** Both are properties of the hardware and the load, not of the code, and the value found here
+  should not be assumed to travel.
+- **The `SendToOne` metric counter**, which is an ungated interlocked increment per recipient,
+  around four million a second, against the metrics interface's own documented rule that a loop at
+  that rate must tally locally and report once. It measured as costing about two percent here, which
+  is not why the workers scale as they do, but it is still the wrong shape and
+  `PositionRecipientsInView` already reports nearly the same quantity properly.
+- **The periodic persist sync**, 5.2 seconds at ten thousand players with 2.3 of it in the commit.
+  Chunking it stops it blocking logins for the whole sweep, but the cost itself scales with how much
+  data is written, and only dirty records need writing.
 - **The receive thread**, at 20% of a core at six thousand and climbing faster than anything else.
   It is a single thread, and sharding it is the plan's Phase 7.
-- **The global player write lock**, held 6.5 ms, 14.7 ms and 19.9 ms per ten second window at 3,000,
-  4,500 and 6,000. Still under a quarter of a percent of wall time, but it is the one figure that
-  grows with player count rather than staying flat.
+- **`Mainloop:MaxQueueDepth`, still unlimited.** The arena queue is bounded now and that was enough
+  here, because the overflow lands on the mainloop and the mainloop kept up. A load that overruns the
+  mainloop itself has not been produced yet, and until it is, the last line of shedding is untested.
+- **What four workers carry**, now that saturating one and two is possible. The 1.78 measured between
+  one and two says the penalty costs capacity; whether it keeps costing the same at four is not known,
+  and four workers need about a hundred thousand packets a second to reach the wall — which is what
+  the generator can now just about offer.
 - **Connection bursts.** Only 4,909 of 6,000 clients connected, staggered 3 ms apart. The receive
   thread drops connection inits under burst arrival, which is a known limit and unrelated to steady
   state, but it will matter for a zone that fills quickly.

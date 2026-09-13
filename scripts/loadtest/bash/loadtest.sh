@@ -260,11 +260,22 @@ echo "--- what the server did ---"
 # no assertions in it, so its zero is not evidence of anything and is not reported as though it were.
 ASSERTIONS="$(grep -c 'Assertion failed' "$SERVER_LOG")"
 ERRORS="$(grep -c '^E <' "$SERVER_LOG")"
+WARNINGS="$(grep -c '^W <' "$SERVER_LOG")"
 echo
 if [ "$CONFIGURATION" = "Release" ]; then
-    echo "Assertion failures: none possible (Release build)    Errors logged: $ERRORS"
+    echo "Assertion failures: none possible (Release build)    Errors logged: $ERRORS    Warnings logged: $WARNINGS"
 else
-    echo "Assertion failures: $ASSERTIONS    Errors logged: $ERRORS"
+    echo "Assertion failures: $ASSERTIONS    Errors logged: $ERRORS    Warnings logged: $WARNINGS"
+fi
+
+# The most frequent of them, with the arena and player tags stripped so that the same message from
+# different players counts as one kind. A run that drives the handlers position packets never reach
+# is read from here: a refused ship change or a stale ball pickup is a warning naming its reason, and
+# a hundred of one kind is a pattern where one is noise.
+if [ "$ERRORS" -gt 0 ] || [ "$WARNINGS" -gt 0 ]; then
+    grep -E '^[EW] <' "$SERVER_LOG" \
+        | sed -E 's/^([EW] <[^>]+>) (\{[^}]*\} )?(\[[^]]*\] )?/\1 /' \
+        | cut -c1-110 | sort | uniq -c | sort -rn | head -6 | sed 's/^/    /'
 fi
 
 # The number this script reports is what the server broadcast, not what the clients offered, and the
