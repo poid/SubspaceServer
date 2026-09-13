@@ -138,6 +138,70 @@ namespace SS.LoadClient
 
         private short _ownPlayerId = -1;
 
+        /// <summary>
+        /// Ship change notifications seen, for any player in the arena. The server tells the whole arena
+        /// about each one, so this confirms ship changes are being processed rather than refused.
+        /// </summary>
+        public long ShipChangesSeen;
+
+        /// <summary>
+        /// Freq change notifications seen, likewise for any player in the arena.
+        /// </summary>
+        public long FreqChangesSeen;
+
+        /// <summary>
+        /// Flag pickup notifications seen, for any player in the arena.
+        /// </summary>
+        public long FlagPickupsSeen;
+
+        /// <summary>
+        /// Ball updates seen. The server sends one to the arena whenever a ball is picked up or shot.
+        /// </summary>
+        public long BallUpdatesSeen;
+
+        /// <summary>
+        /// Times the server has said who this client is, which it does on every arena entry. One more
+        /// than the number of arena switches that completed.
+        /// </summary>
+        public long ArenaEntriesSeen;
+
+        /// <summary>
+        /// The ship the server last put this client in, or -1 before it has said.
+        /// </summary>
+        /// <remarks>
+        /// Kept so that a ship change can ask for a different ship. Asking for the one already in is
+        /// refused, with a warning in the server log that would then be mistaken for a defect.
+        /// </remarks>
+        private int _ownShip = -1;
+
+        /// <summary>
+        /// The freq the server last put this client on, or -1 before it has said.
+        /// </summary>
+        private int _ownFreq = -1;
+
+        private const int MaxBalls = 8;
+
+        /// <summary>
+        /// What the server last said about each ball, by ball id: who carries it and its fire time.
+        /// </summary>
+        /// <remarks>
+        /// A pickup has to quote the fire time from the server's last update of the ball, or the server
+        /// refuses it as coming from stale coordinates, and it has to be for a ball nobody is carrying.
+        /// Guarded by its own lock, since the receive loop writes it and the position loop reads it.
+        /// </remarks>
+        private readonly BallInfo[] _balls = new BallInfo[MaxBalls];
+
+        private struct BallInfo
+        {
+            public bool Seen;
+            public short CarrierId;
+            public uint Time;
+        }
+
+        public int OwnShip => Volatile.Read(ref _ownShip);
+
+        public int OwnFreq => Volatile.Read(ref _ownFreq);
+
         public async Task<bool> ConnectAsync(string host, int port, CancellationToken cancellationToken)
         {
             try
@@ -389,9 +453,17 @@ namespace SS.LoadClient
                 else if (span[0] == (byte)S2CPacketType.PlayerEntering)
                     NotePlayerEntering(span);
                 else if (span[0] == (byte)S2CPacketType.WhoAmI && span.Length >= 3)
-                    _ownPlayerId = LittleEndianConverter.Convert(MemoryMarshal.Read<short>(span.Slice(1, 2)));
+                    NoteArenaEntry(LittleEndianConverter.Convert(MemoryMarshal.Read<short>(span.Slice(1, 2))));
                 else if (span[0] == (byte)S2CPacketType.Kill)
                     Interlocked.Increment(ref KillsSeen);
+                else if (span[0] == (byte)S2CPacketType.ShipChange && span.Length >= S2C_ShipChange.Length)
+                    NoteShipChange(span);
+                else if (span[0] == (byte)S2CPacketType.FreqChange && span.Length >= S2C_FreqChange.Length)
+                    NoteFreqChange(span);
+                else if (span[0] == (byte)S2CPacketType.FlagPickup)
+                    Interlocked.Increment(ref FlagPickupsSeen);
+                else if (span[0] == (byte)S2CPacketType.Ball && span.Length >= BallPacket.Length)
+                    NoteBall(span);
 
                 return;
             }
@@ -474,6 +546,163 @@ namespace SS.LoadClient
         }
 
         /// <summary>
+        /// Asks for a different ship, sent reliably as a real client does.
+        /// </summary>
+        /// <returns><see langword="true"/> if the server acknowledged receiving it.</returns>
+        public Task<bool> SendShipChangeAsync(sbyte ship, CancellationToken cancellationToken)
+        {
+            return SendReliableAsync([(byte)C2SPacketType.SetShip, (byte)ship], cancellationToken);
+        }
+
+        /// <summary>
+        /// Asks for a different freq, sent reliably as a real client does.
+        /// </summary>
+        /// <returns><see langword="true"/> if the server acknowledged receiving it.</returns>
+        public Task<bool> SendFreqChangeAsync(short freq, CancellationToken cancellationToken)
+        {
+            C2S_SetFreq packet = new(freq);
+            ReadOnlySpan<byte> bytes = MemoryMarshal.AsBytes(MemoryMarshal.CreateReadOnlySpan(ref packet, 1));
+            return SendReliableAsync(bytes.ToArray(), cancellationToken);
+        }
+
+        /// <summary>
+        /// Touches a flag by id, sent reliably. Whether it is on the map to be touched is the server's call.
+        /// </summary>
+        /// <returns><see langword="true"/> if the server acknowledged receiving it.</returns>
+        public Task<bool> SendTouchFlagAsync(short flagId, CancellationToken cancellationToken)
+        {
+            return SendReliableAsync([(byte)C2SPacketType.TouchFlag, (byte)flagId, (byte)(flagId >> 8)], cancellationToken);
+        }
+
+        /// <summary>
+        /// Drops every flag carried. The server does nothing if none is.
+        /// </summary>
+        public Task SendDropFlagsAsync(CancellationToken cancellationToken)
+        {
+            return SendRawAsync([(byte)C2SPacketType.DropFlags], cancellationToken);
+        }
+
+        /// <summary>
+        /// Finds a ball the server last reported loose, and the fire time a pickup of it has to quote.
+        /// </summary>
+        public bool TryGetLooseBall(out byte ballId, out uint time)
+        {
+            lock (_balls)
+            {
+                for (int i = 0; i < _balls.Length; i++)
+                {
+                    if (_balls[i].Seen && _balls[i].CarrierId < 0)
+                    {
+                        ballId = (byte)i;
+                        time = _balls[i].Time;
+                        return true;
+                    }
+                }
+            }
+
+            ballId = 0;
+            time = 0;
+            return false;
+        }
+
+        /// <summary>
+        /// Whether the server's last update of a ball said this client carries it.
+        /// </summary>
+        public bool IsCarryingBall(byte ballId)
+        {
+            lock (_balls)
+            {
+                return ballId < _balls.Length && _balls[ballId].Seen && _balls[ballId].CarrierId == _ownPlayerId;
+            }
+        }
+
+        /// <summary>
+        /// Asks to pick up a ball, sent reliably.
+        /// </summary>
+        /// <param name="ballId">The ball.</param>
+        /// <param name="time">The ball's fire time from the server's last update of it, which the server checks.</param>
+        /// <param name="cancellationToken">To stop waiting.</param>
+        /// <returns><see langword="true"/> if the server acknowledged receiving it.</returns>
+        public Task<bool> SendPickupBallAsync(byte ballId, uint time, CancellationToken cancellationToken)
+        {
+            C2S_PickupBall packet = new(ballId, time);
+            ReadOnlySpan<byte> bytes = MemoryMarshal.AsBytes(MemoryMarshal.CreateReadOnlySpan(ref packet, 1));
+            return SendReliableAsync(bytes.ToArray(), cancellationToken);
+        }
+
+        /// <summary>
+        /// Shoots a carried ball, leaving it where this client is for the next client to pick up.
+        /// </summary>
+        public Task SendShootBallAsync(byte ballId, short x, short y, CancellationToken cancellationToken)
+        {
+            BallPacket packet = new(isS2C: false, ballId, x, y, xSpeed: 0, ySpeed: 0, playerId: _ownPlayerId, time: ServerTick.Now);
+            ReadOnlySpan<byte> bytes = MemoryMarshal.AsBytes(MemoryMarshal.CreateReadOnlySpan(ref packet, 1));
+            return SendRawAsync(bytes.ToArray(), cancellationToken);
+        }
+
+        /// <summary>
+        /// Notes an arena entry, which is where the server says who this client is now. What was learned
+        /// about the previous arena is forgotten: its player ids name nobody here, and its balls are not
+        /// these.
+        /// </summary>
+        private void NoteArenaEntry(short playerId)
+        {
+            _ownPlayerId = playerId;
+            Interlocked.Increment(ref ArenaEntriesSeen);
+
+            lock (_knownPlayerIds)
+            {
+                _knownPlayerIds.Clear();
+            }
+
+            lock (_balls)
+            {
+                Array.Clear(_balls);
+            }
+        }
+
+        private void NoteShipChange(ReadOnlySpan<byte> span)
+        {
+            Interlocked.Increment(ref ShipChangesSeen);
+
+            // Type, ship, player id, freq.
+            short playerId = LittleEndianConverter.Convert(MemoryMarshal.Read<short>(span.Slice(2, 2)));
+            if (playerId == _ownPlayerId)
+            {
+                Volatile.Write(ref _ownShip, (sbyte)span[1]);
+                Volatile.Write(ref _ownFreq, LittleEndianConverter.Convert(MemoryMarshal.Read<short>(span.Slice(4, 2))));
+            }
+        }
+
+        private void NoteFreqChange(ReadOnlySpan<byte> span)
+        {
+            Interlocked.Increment(ref FreqChangesSeen);
+
+            // Type, player id, freq.
+            short playerId = LittleEndianConverter.Convert(MemoryMarshal.Read<short>(span.Slice(1, 2)));
+            if (playerId == _ownPlayerId)
+                Volatile.Write(ref _ownFreq, LittleEndianConverter.Convert(MemoryMarshal.Read<short>(span.Slice(3, 2))));
+        }
+
+        private void NoteBall(ReadOnlySpan<byte> span)
+        {
+            Interlocked.Increment(ref BallUpdatesSeen);
+
+            // Type, ball id, x, y, x speed, y speed, the carrier's player id or -1, fire time.
+            byte ballId = span[1];
+            if (ballId >= _balls.Length)
+                return;
+
+            short carrierId = LittleEndianConverter.Convert(MemoryMarshal.Read<short>(span.Slice(10, 2)));
+            uint time = LittleEndianConverter.Convert(MemoryMarshal.Read<uint>(span.Slice(12, 4)));
+
+            lock (_balls)
+            {
+                _balls[ballId] = new BallInfo { Seen = true, CarrierId = carrierId, Time = time };
+            }
+        }
+
+        /// <summary>
         /// Records another player's id from a player entering packet, so that a death can name a killer
         /// the server will accept.
         /// </summary>
@@ -483,12 +712,21 @@ namespace SS.LoadClient
             // name, the 20 byte squad, and two four byte score fields.
             const int PlayerIdOffset = 51;
 
-            if (span.Length < PlayerIdOffset + 2)
+            if (span.Length < PlayerIdOffset + 4)
                 return;
 
             short playerId = LittleEndianConverter.Convert(MemoryMarshal.Read<short>(span.Slice(PlayerIdOffset, 2)));
-            if (playerId < 0 || playerId == _ownPlayerId)
+            if (playerId < 0)
                 return;
+
+            if (playerId == _ownPlayerId)
+            {
+                // The entry for this client itself is where the server says which ship and freq it was
+                // given: the ship is the byte after the type, and the freq follows the player id.
+                Volatile.Write(ref _ownShip, (sbyte)span[1]);
+                Volatile.Write(ref _ownFreq, LittleEndianConverter.Convert(MemoryMarshal.Read<short>(span.Slice(PlayerIdOffset + 2, 2))));
+                return;
+            }
 
             lock (_knownPlayerIds)
             {

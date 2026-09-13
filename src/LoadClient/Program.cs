@@ -122,6 +122,11 @@ namespace SS.LoadClient
             long[] receivedBaseline = new long[startedClients.Length];
             long[] bytesBaseline = new long[startedClients.Length];
             long[] killsBaseline = new long[startedClients.Length];
+            long[] shipChangesBaseline = new long[startedClients.Length];
+            long[] freqChangesBaseline = new long[startedClients.Length];
+            long[] flagPickupsBaseline = new long[startedClients.Length];
+            long[] ballUpdatesBaseline = new long[startedClients.Length];
+            long[] arenaEntriesBaseline = new long[startedClients.Length];
 
             for (int i = 0; i < startedClients.Length; i++)
             {
@@ -129,6 +134,11 @@ namespace SS.LoadClient
                 receivedBaseline[i] = Interlocked.Read(ref startedClients[i].PositionUpdatesReceived);
                 bytesBaseline[i] = Interlocked.Read(ref startedClients[i].BytesReceived);
                 killsBaseline[i] = Interlocked.Read(ref startedClients[i].KillsSeen);
+                shipChangesBaseline[i] = Interlocked.Read(ref startedClients[i].ShipChangesSeen);
+                freqChangesBaseline[i] = Interlocked.Read(ref startedClients[i].FreqChangesSeen);
+                flagPickupsBaseline[i] = Interlocked.Read(ref startedClients[i].FlagPickupsSeen);
+                ballUpdatesBaseline[i] = Interlocked.Read(ref startedClients[i].BallUpdatesSeen);
+                arenaEntriesBaseline[i] = Interlocked.Read(ref startedClients[i].ArenaEntriesSeen);
             }
 
             Console.WriteLine(options.Duration > TimeSpan.Zero
@@ -150,6 +160,11 @@ namespace SS.LoadClient
             long positionUpdatesSent = 0;
             long bytes = 0;
             long kills = 0;
+            long shipChanges = 0;
+            long freqChanges = 0;
+            long flagPickups = 0;
+            long ballUpdates = 0;
+            long arenaEntries = 0;
             int stillUp = 0;
 
             for (int i = 0; i < startedClients.Length; i++)
@@ -160,6 +175,11 @@ namespace SS.LoadClient
                 positionUpdatesSent += Interlocked.Read(ref client.PositionUpdatesSent) - sentBaseline[i];
                 bytes += Interlocked.Read(ref client.BytesReceived) - bytesBaseline[i];
                 kills += Interlocked.Read(ref client.KillsSeen) - killsBaseline[i];
+                shipChanges += Interlocked.Read(ref client.ShipChangesSeen) - shipChangesBaseline[i];
+                freqChanges += Interlocked.Read(ref client.FreqChangesSeen) - freqChangesBaseline[i];
+                flagPickups += Interlocked.Read(ref client.FlagPickupsSeen) - flagPickupsBaseline[i];
+                ballUpdates += Interlocked.Read(ref client.BallUpdatesSeen) - ballUpdatesBaseline[i];
+                arenaEntries += Interlocked.Read(ref client.ArenaEntriesSeen) - arenaEntriesBaseline[i];
 
                 if (client.IsConnected && client.FailureReason is null)
                     stillUp++;
@@ -175,6 +195,24 @@ namespace SS.LoadClient
 
             if (options.DeathsPerMinute > 0)
                 Console.WriteLine($"Kill notifications seen: {kills / seconds:F0}/s, which confirms deaths were processed rather than rejected.");
+
+            // Each of these is something the server told every client in the arena, so it is counted once
+            // per client that saw it. They confirm the server processed the requests rather than refusing
+            // them: a refusal is a warning in the server log and nothing here.
+            if (options.ShipChangesPerMinute > 0)
+                Console.WriteLine($"Ship change notifications seen: {shipChanges / seconds:F0}/s.");
+
+            if (options.FreqChangesPerMinute > 0)
+                Console.WriteLine($"Freq change notifications seen: {freqChanges / seconds:F0}/s.");
+
+            if (options.FlagsPerMinute > 0)
+                Console.WriteLine($"Flag pickup notifications seen: {flagPickups / seconds:F0}/s.");
+
+            if (options.BallsPerMinute > 0)
+                Console.WriteLine($"Ball updates seen: {ballUpdates / seconds:F0}/s.");
+
+            if (options.ArenaSwitchesPerMinute > 0)
+                Console.WriteLine($"Arena entries: {arenaEntries / seconds:F1}/s, each one a completed switch.");
 
             await Task.WhenAll(startedClients.Select(c => c.DisconnectAsync(CancellationToken.None)));
 
@@ -265,8 +303,20 @@ namespace SS.LoadClient
                 double angle = index;
                 int tick = 0;
 
-                // Deaths per minute, converted to a probability per 10Hz tick.
+                // Deaths per minute, converted to a probability per 10Hz tick. The rest likewise.
                 double deathChancePerTick = options.DeathsPerMinute / 60d / 10d;
+                double shipChangeChancePerTick = options.ShipChangesPerMinute / 60d / 10d;
+                double freqChangeChancePerTick = options.FreqChangesPerMinute / 60d / 10d;
+                double arenaSwitchChancePerTick = options.Arenas.Length > 1 ? options.ArenaSwitchesPerMinute / 60d / 10d : 0d;
+                double ballChancePerTick = options.BallsPerMinute / 60d / 10d;
+                double flagChancePerTick = options.FlagsPerMinute / 60d / 10d;
+
+                int currentArena = index % options.Arenas.Length;
+
+                // A ball pickup and a flag touch are each followed by their release a tick later, so that
+                // the server sees both halves and the ball or flag is there for the next client.
+                int ballToShoot = -1;
+                bool flagToDrop = false;
 
                 try
                 {
@@ -293,6 +343,59 @@ namespace SS.LoadClient
 
                         if (deathChancePerTick > 0d && Random.Shared.NextDouble() < deathChancePerTick)
                             await client.SendDeathAsync(token);
+
+                        // At most one of these a tick. The server refuses a ship or freq change until the
+                        // client has acked the previous one, and an arena switch makes both moot.
+                        if (arenaSwitchChancePerTick > 0d && Random.Shared.NextDouble() < arenaSwitchChancePerTick)
+                        {
+                            currentArena = (currentArena + 1 + Random.Shared.Next(options.Arenas.Length - 1)) % options.Arenas.Length;
+                            ballToShoot = -1;
+                            flagToDrop = false;
+                            await client.GoToArenaAsync(options.Arenas[currentArena], options.ViewWidth, options.ViewHeight, token);
+                        }
+                        else if (shipChangeChancePerTick > 0d && Random.Shared.NextDouble() < shipChangeChancePerTick)
+                        {
+                            // A different ship from the current one, and never spectator mode, which would
+                            // take the client out of the fan out and have it refused flags and balls.
+                            int ship = client.OwnShip;
+                            if (ship >= 0)
+                                await client.SendShipChangeAsync((sbyte)((ship + 1 + Random.Shared.Next(7)) % 8), token);
+                        }
+                        else if (freqChangeChancePerTick > 0d && Random.Shared.NextDouble() < freqChangeChancePerTick)
+                        {
+                            int freq = client.OwnFreq;
+                            if (freq >= 0)
+                                await client.SendFreqChangeAsync((short)(freq == 0 ? 1 : 0), token);
+                        }
+
+                        if (ballToShoot >= 0)
+                        {
+                            // Only if the server's own update since says this client got it. Another client
+                            // may have asked first, and shooting a ball not carried is refused.
+                            if (client.IsCarryingBall((byte)ballToShoot))
+                                await client.SendShootBallAsync((byte)ballToShoot, x, y, token);
+
+                            ballToShoot = -1;
+                        }
+                        else if (ballChancePerTick > 0d && Random.Shared.NextDouble() < ballChancePerTick
+                            && client.TryGetLooseBall(out byte ballId, out uint ballTime))
+                        {
+                            if (await client.SendPickupBallAsync(ballId, ballTime, token))
+                                ballToShoot = ballId;
+                        }
+
+                        if (flagToDrop)
+                        {
+                            await client.SendDropFlagsAsync(token);
+                            flagToDrop = false;
+                        }
+                        else if (flagChancePerTick > 0d && Random.Shared.NextDouble() < flagChancePerTick)
+                        {
+                            // Flag ids start at zero. The test arena is configured with at least five; an id
+                            // past what an arena has is refused with a note in the log, not an error.
+                            if (await client.SendTouchFlagAsync((short)Random.Shared.Next(5), token))
+                                flagToDrop = true;
+                        }
                     }
                 }
                 catch (OperationCanceledException)

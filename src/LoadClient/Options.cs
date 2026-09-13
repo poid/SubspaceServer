@@ -62,6 +62,47 @@
         /// </remarks>
         public int DeathsPerMinute { get; private set; }
 
+        /// <summary>
+        /// Ship changes per client per minute, or zero for none.
+        /// </summary>
+        /// <remarks>
+        /// Each is a request for a different ship, so it runs the freq manager, the ship change
+        /// enforcers, and the reliable notification to the arena.
+        /// </remarks>
+        public int ShipChangesPerMinute { get; private set; }
+
+        /// <summary>
+        /// Freq changes per client per minute, or zero for none.
+        /// </summary>
+        public int FreqChangesPerMinute { get; private set; }
+
+        /// <summary>
+        /// Arena switches per client per minute, or zero for none. Needs more than one arena.
+        /// </summary>
+        /// <remarks>
+        /// A switch is a second arena request while playing, which is what ?go sends. It leaves one
+        /// arena and enters another while the client's position packets are still arriving, so it is
+        /// the test of a packet outliving the arena it was routed for.
+        /// </remarks>
+        public int ArenaSwitchesPerMinute { get; private set; }
+
+        /// <summary>
+        /// Ball pickups per client per minute, or zero for none. Each is followed by a shot a tick later.
+        /// </summary>
+        /// <remarks>
+        /// Only attempted when the server has last reported the ball loose, and quoting the fire time it
+        /// reported, since a pickup that does not is refused as stale. The arena needs Soccer:BallCount.
+        /// </remarks>
+        public int BallsPerMinute { get; private set; }
+
+        /// <summary>
+        /// Flag touches per client per minute, or zero for none. Each is followed by a drop a tick later.
+        /// </summary>
+        /// <remarks>
+        /// The arena needs a carry flag game with flags on the map: Flag:CarryFlags and Flag:FlagCount.
+        /// </remarks>
+        public int FlagsPerMinute { get; private set; }
+
         public string Host { get; private set; } = "127.0.0.1";
 
         /// <summary>
@@ -205,6 +246,31 @@
                         i++;
                         break;
 
+                    case "--ship-changes" when next is not null && int.TryParse(next, out int shipChanges) && shipChanges >= 0:
+                        options.ShipChangesPerMinute = shipChanges;
+                        i++;
+                        break;
+
+                    case "--freq-changes" when next is not null && int.TryParse(next, out int freqChanges) && freqChanges >= 0:
+                        options.FreqChangesPerMinute = freqChanges;
+                        i++;
+                        break;
+
+                    case "--arena-switches" when next is not null && int.TryParse(next, out int arenaSwitches) && arenaSwitches >= 0:
+                        options.ArenaSwitchesPerMinute = arenaSwitches;
+                        i++;
+                        break;
+
+                    case "--balls" when next is not null && int.TryParse(next, out int balls) && balls >= 0:
+                        options.BallsPerMinute = balls;
+                        i++;
+                        break;
+
+                    case "--flags" when next is not null && int.TryParse(next, out int flagTouches) && flagTouches >= 0:
+                        options.FlagsPerMinute = flagTouches;
+                        i++;
+                        break;
+
                     case "--spread" when next is not null && int.TryParse(next, out int spread) && spread > 0:
                         options.SpreadPixels = spread;
                         i++;
@@ -292,6 +358,24 @@
                                            costs far more than the percentage suggests. Default 0
                   --deaths <per minute>    Deaths per client per minute, which drives the kill
                                            advisors, scoring, prizes and respawn. Default 0
+                  --ship-changes <per min> Ship changes per client per minute. Default 0
+                  --freq-changes <per min> Freq changes per client per minute. Default 0
+                  --arena-switches <per min>
+                                           Arena switches per client per minute, between the arenas
+                                           given. A switch is what ?go sends: a second arena request
+                                           while playing. Needs more than one arena. Default 0
+                  --balls <per minute>     Ball pickups per client per minute, each followed by a
+                                           shot. Only attempted when the server last reported the ball
+                                           loose. The arena needs Soccer:BallCount. Default 0
+                  --flags <per minute>     Flag touches per client per minute, each followed by a
+                                           drop. The arena needs a carry flag game with flags on the
+                                           map. Default 0
+
+                  Every one of these runs a handler that position packets never reach, and all of them
+                  except the arena switch are handled on the arena's thread when
+                  Net:HandlePacketsOnArenaThread is on. Together with --weapons and --deaths they are
+                  the test of that setting: run it on a Debug build, where the threading assertions are
+                  live, and read the server log for assertion failures and warnings.
 
                 Examples:
                   Position load over the network, which is the main measurement:
@@ -299,6 +383,9 @@
 
                   The same with fighting, which roughly doubles the send side:
                     SS.LoadClient --protocol game --clients 500 --arenas 0,1,2,3 --weapons 20 --deaths 6 --duration 60
+
+                  Everything the arena thread can be handed, for testing Net:HandlePacketsOnArenaThread:
+                    SS.LoadClient --protocol game --clients 500 --arenas 0,1,2,3 --weapons 20 --deaths 6 --ship-changes 4 --freq-changes 4 --arena-switches 1 --balls 6 --flags 6 --duration 120
 
                   Drive the player life cycle with 200 chat clients over four arenas:
                     SS.LoadClient --clients 200 --arenas 0,1,2,3 --duration 120
