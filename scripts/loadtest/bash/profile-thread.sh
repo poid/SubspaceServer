@@ -20,10 +20,17 @@
 # so a longer name should be given as its first 15.
 #
 # Environment:
-#   ZONE_DIR, LOADTEST_OUT   as loadtest.sh
+#   ZONE_DIR, LOADTEST_OUT, CONFIGURATION   as loadtest.sh
 #   PERF_SECONDS             length of the sample window. Default: 30
 #   PERF_FREQ                samples per second. Default: 999, deliberately not 1000 so that the
 #                            sampling cannot lock step with anything running on a 1 ms period.
+#   PERF_EVENT               what to sample on. Default: perf's own, which is cycles wherever there is
+#                            a PMU, and attributes time to the instruction that was executing. Set it
+#                            to cache-misses to attribute instead to the instructions that missed. That
+#                            is the question when a thread is suspected of being memory bound rather
+#                            than instruction bound: a cycles profile shows a stall as time in whichever
+#                            method the stalled instruction sits in, indistinguishable from that method
+#                            simply doing more work.
 
 set -u
 
@@ -32,9 +39,10 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 OUT="${LOADTEST_OUT:-$REPO_ROOT/loadtest-results}"
 PERF_SECONDS="${PERF_SECONDS:-30}"
 PERF_FREQ="${PERF_FREQ:-999}"
+PERF_EVENT="${PERF_EVENT:-}"
 
 usage() {
-    grep '^#' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' | sed -n '2,26p'
+    grep '^#' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' | sed -n '2,33p'
     exit 1
 }
 
@@ -145,9 +153,9 @@ if grep -q doublemapper "/proc/$PID/maps" 2>/dev/null; then
     echo "         then perf inject --jit." >&2
 fi
 
-echo "=== profiling thread $THREAD_NAME (tid $TID) of $PID for $PERF_SECONDS s at $PERF_FREQ Hz ==="
+echo "=== profiling thread $THREAD_NAME (tid $TID) of $PID for $PERF_SECONDS s at $PERF_FREQ Hz${PERF_EVENT:+ on $PERF_EVENT} ==="
 
-sudo perf record -F "$PERF_FREQ" --tid "$TID" -o "$PERF_DATA" -- sleep "$PERF_SECONDS"
+sudo perf record ${PERF_EVENT:+-e "$PERF_EVENT"} -F "$PERF_FREQ" --tid "$TID" -o "$PERF_DATA" -- sleep "$PERF_SECONDS"
 
 # Reported while the process is alive, because the JIT map is keyed by pid and a later run's server
 # would be a different one. Under sudo, because /proc/kallsyms is restricted to root on a default
@@ -170,11 +178,28 @@ sed -n '/^=== by library and symbol ===/,$p' "$PERF_TEXT" | sed -n '/^ *[0-9]/p'
 echo
 echo "full profile: $PERF_TEXT"
 
-if ! grep -q 'perf-.*\.map' "$PERF_TEXT"; then
+# perf names the frames it resolved through /tmp/perf-<pid>.map as belonging to "[JIT] tid <pid>", so
+# that, and not the map's own file name, is the sign that the map was used.
+if ! grep -qE 'perf-.*\.map|\[JIT\] tid' "$PERF_TEXT"; then
     echo
     echo "NOTE: no JIT map appears in the profile, so managed frames are unresolved. If most of the"
     echo "      time is in libcoreclr.so with no symbols, install the runtime's debug symbols to name"
     echo "      them; if it is in the kernel, the symbols are already there now that report runs as root."
+fi
+
+# The map tags every method with how it was compiled, and [MinOptJitted] is code the JIT compiled with
+# optimisation off and will never tier up: nothing inlined, every local kept in memory. The runtime does
+# that to every method of an assembly built in Debug. It is why a Debug profile shows methods that a
+# Release build would have inlined out of existence, at percentages that say nothing about the server
+# that will be deployed. Measured over every symbol, not only the ones printed above.
+MINOPT_PERCENT="$(sudo perf report -i "$PERF_DATA" --stdio --sort symbol --percent-limit 0 2>/dev/null \
+    | awk '/MinOptJitted/ { sum += $1 } END { printf "%.0f", sum }')"
+if [ "${MINOPT_PERCENT:-0}" -ge 5 ]; then
+    echo
+    echo "WARNING: ${MINOPT_PERCENT}% of the samples are in methods compiled without optimisation"
+    echo "         ([MinOptJitted]), which is what every method of a Debug built assembly gets. The"
+    echo "         proportions above are a Debug build's, not the deployed server's. For those, build"
+    echo "         with 'dotnet build -c Release src/SubspaceServer.slnx' and run with CONFIGURATION=Release."
 fi
 
 wait "$LOADTEST_PID"

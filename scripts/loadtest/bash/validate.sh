@@ -23,6 +23,7 @@
 #   ZONE_DIR       the zone directory. Default: <repo>/src/SubspaceServer/Zone
 #   LOADTEST_OUT   where logs and results go. Default: <repo>/loadtest-results
 #   PERF_SECONDS   length of the counter window. Default: 30
+#   CONFIGURATION  which build to run, Debug or Release, passed through to loadtest.sh. Default: Debug
 #
 # Requirements:
 #   - Everything loadtest.sh requires, and it does not build either.
@@ -41,7 +42,7 @@ GLOBAL_CONF="$ZONE_DIR/conf/global.conf"
 PERF_SECONDS="${PERF_SECONDS:-30}"
 
 usage() {
-    grep '^#' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' | sed -n '2,29p'
+    grep '^#' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' | sed -n '2,32p'
     exit 1
 }
 
