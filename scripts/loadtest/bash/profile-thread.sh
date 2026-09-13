@@ -88,7 +88,7 @@ export DOTNET_EnableWriteXorExecute=0
 # taken of configurations that differed in a second setting left over from the run before.
 GLOBAL_CONF="${ZONE_DIR:-$REPO_ROOT/src/SubspaceServer/Zone}/conf/global.conf"
 if [ -f "$GLOBAL_CONF" ]; then
-    echo "config: $(grep -E '^[[:space:]]*(SendThreads|MaxSendThreads|Workers|HandlePacketsOnArenaThread)[[:space:]]*=' \
+    echo "config: $(grep -E '^[[:space:]]*(SendThreads|MaxSendThreads|Workers|HandlePacketsOnArenaThread|UseArenaLocalPlayerIds)[[:space:]]*=' \
         "$GLOBAL_CONF" | tr -s ' ' | paste -sd'; ' -)"
 else
     echo "WARNING: no global.conf at $GLOBAL_CONF; set ZONE_DIR if the zone is elsewhere." >&2

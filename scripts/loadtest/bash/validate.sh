@@ -72,7 +72,7 @@ fi
 
 # Say what is actually being measured, so a label cannot misdescribe a run.
 if [ -f "$GLOBAL_CONF" ]; then
-    echo "config: $(grep -E '^[[:space:]]*(SendThreads|MaxSendThreads|Workers|HandlePacketsOnArenaThread)[[:space:]]*=' \
+    echo "config: $(grep -E '^[[:space:]]*(SendThreads|MaxSendThreads|Workers|HandlePacketsOnArenaThread|UseArenaLocalPlayerIds)[[:space:]]*=' \
         "$GLOBAL_CONF" | tr -s ' ' | paste -sd'; ' -)"
 else
     echo "WARNING: no global.conf at $GLOBAL_CONF; set ZONE_DIR if the zone is elsewhere." >&2
