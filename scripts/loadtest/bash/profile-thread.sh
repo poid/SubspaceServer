@@ -131,6 +131,20 @@ if [ ! -f "/tmp/perf-$PID.map" ]; then
     echo "         The server was probably started without DOTNET_PerfMapEnabled=1." >&2
 fi
 
+# The map is consulted only for addresses perf cannot attribute to a file. JIT code in the double
+# mapping belongs to a memfd, which is a file, so the map is never reached and every managed frame
+# reports as an offset into "memfd:doublemapper". Say so here, with the evidence, rather than leaving
+# it to be inferred from the report.
+if grep -q doublemapper "/proc/$PID/maps" 2>/dev/null; then
+    echo "WARNING: JIT code is still double mapped, so managed frames will report as" >&2
+    echo "         'memfd:doublemapper' and the perf map will not be used." >&2
+    echo "         DOTNET_EnableWriteXorExecute in this process's environment:" >&2
+    echo "         $(tr '\0' '\n' < "/proc/$PID/environ" 2>/dev/null | grep -E '^DOTNET_(EnableWriteXorExecute|PerfMapEnabled)=' | paste -sd' ' - || echo '(not set - it did not reach the process)')" >&2
+    echo "         If it is set to 0 and this warning still appears, the runtime is ignoring it and" >&2
+    echo "         the jitdump route is needed instead: DOTNET_PerfMapEnabled=3, perf record -k 1," >&2
+    echo "         then perf inject --jit." >&2
+fi
+
 echo "=== profiling thread $THREAD_NAME (tid $TID) of $PID for $PERF_SECONDS s at $PERF_FREQ Hz ==="
 
 sudo perf record -F "$PERF_FREQ" --tid "$TID" -o "$PERF_DATA" -- sleep "$PERF_SECONDS"
