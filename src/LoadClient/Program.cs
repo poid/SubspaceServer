@@ -188,6 +188,21 @@ namespace SS.LoadClient
             }
 
             Console.WriteLine($"Finished. {stillUp}/{connected} client(s) survived.");
+
+            // Why the rest did not, by reason, since a run where clients fell over is read from this
+            // line first and there was nothing to read.
+            if (stillUp < connected)
+            {
+                Dictionary<string, int> failures = [];
+                foreach (GameClient client in startedClients)
+                {
+                    if (client.FailureReason is not null)
+                        failures[client.FailureReason] = failures.GetValueOrDefault(client.FailureReason) + 1;
+                }
+
+                foreach ((string reason, int count) in failures.OrderByDescending(pair => pair.Value).Take(5))
+                    Console.WriteLine($"  {count,6}  {reason}");
+            }
             Console.WriteLine($"Server sent {positionUpdates / seconds:F0} position updates/s and {bytes / seconds / 1024d:F0} KB/s to these clients ({positionUpdates / (double)Math.Max(connected, 1) / seconds:F1} updates/s each).");
 
             // Reported so that a shortfall in what the server received can be told apart from a shortfall
