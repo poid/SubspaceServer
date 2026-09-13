@@ -1877,6 +1877,57 @@ each send thread is four fifths, so it is not where the next player fits, and th
 closed here: the code reason four cost more than two was the wait, it is fixed, and what remains is
 the send path's shared lines at about half a microsecond per recipient.
 
+## Everything the arena thread can be handed, and the defect it found
+
+`Net:HandlePacketsOnArenaThread` had been vetted for positions, weapons and deaths only. The load
+client can now produce the rest: `--ship-changes`, `--freq-changes`, `--arena-switches`, `--balls`
+and `--flags`, each a rate per client per minute like `--deaths`. Ship and freq changes, flag touches
+and drops, and ball pickups and shots are all handled on the arena's thread when the setting is on;
+the arena switch is a second arena request while playing, which is what `?go` sends, and it goes to
+the mainloop by design, which is exactly the race that matters: packets in flight to the old arena's
+worker while the mainloop moves the player. Two details shape the simulation. A ball pickup has to
+quote the ball's fire time from the server's last ball update, or it is refused as stale, so a client
+only tries for a ball the server last reported loose. And the ship change enforcer allows no ship
+for five seconds after a change, so a client whose arena entry lands inside that window arrives in
+spectator mode; the client asks for a ship once a second until it gets one.
+
+The first run, 200 clients over 4 arenas on a Debug build with everything on, lasted ten seconds:
+
+    FlagGameResetDelegate was fired from an arena thread and reaches handlers registered zone-wide
+
+A flag drop handled on the arena thread ended the flag game, and the reset fired
+`FlagGameResetCallback` there. The Game module respawning the winning team and the stats module
+scoring the game are both registered zone-wide and both written for the mainloop. The threading
+assertion caught it and the server went down with it, which is what the assertion is for. Fixed on
+`scale/26-flag-reset-on-arena-thread` the way the map region warp and the enter-game action were
+fixed before: a reset that begins on an arena thread hands the firing to the mainloop, and from the
+mainloop it fires in place as it always has.
+
+After the fix, 90 seconds with everything on:
+
+| | |
+|---|---|
+| assertion failures | 0 |
+| errors | 0 |
+| warnings | 2, both a ball two clients raced for |
+| clients survived | 200 of 200 |
+| kill notifications | 981/s |
+| ship and freq change notifications | 190/s |
+| flag pickups | 166/s |
+| ball updates | 137/s |
+| arena switches completed | 2.1/s |
+
+The client also keeps the chat it receives, since the server explains a refusal to the player in
+chat and nowhere else, and prints the most frequent. That showed the freq balancer refusing every
+move between two equal teams, and private freqs unavailable in the test arenas: neither a defect,
+both worth knowing before reading a warning count. Warnings from the client's own misbehaviour,
+touching flags from spec and asking for ships between arenas, went from 189 to 2 once it waited to
+be told what it was in.
+
+Not measured for cost: a run that switches arenas and changes ships has clients out of play for
+part of it, which the broadcast-versus-offered check reports, so it is a correctness run and not a
+throughput one. The 3% cost of the setting stands from `hw-2`.
+
 ## What to watch next
 
 - **A sampled profile of one send thread at one worker against two**, which is now possible and is the
@@ -1914,11 +1965,10 @@ the send path's shared lines at about half a microsecond per recipient.
   four because the extra was 65 `sched_yield` calls per idle gap. Fixed on `scale/24-worker-wait`.
   What remains is +11% per packet on the worker at four against two, nothing at the level of the
   whole server, and it sits in the send path's shared lines.
-- **The rest of the arena-thread packet path still.** Weapons and deaths have now been run through it
-  and found two defects, both fixed, with a sustained combat run clean afterwards. Ship and freq
-  changes, flags, balls, and above all switching arena while packets are in flight — which is what the
-  first defect was — are still untested, and arena switching is the one the load generator cannot
-  currently produce.
+- **The rest of the arena-thread packet path — DONE, see "Everything the arena thread can be handed"
+  above.** Ship and freq changes, flags, balls and arena switching are all produced by the load
+  client now. They found a third defect, the flag game reset, fixed on `scale/26`, and a 90 second
+  run with everything on is clean on a Debug build. Still to run on the VPS at 1,600 clients.
 - **A combat load this machine can sustain at four thousand clients.** Both code paths collapse there,
   so nothing about combat can be compared at that scale.
 - **What four workers can carry**, which cannot be measured on this machine. One worker saturates at
