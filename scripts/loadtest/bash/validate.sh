@@ -11,6 +11,10 @@
 #   - The server's own processor time cannot tell "slow because of memory traffic" from "slow because
 #     it is being descheduled", and loadtest.sh runs the load generator on the same machine as the
 #     server. Whole-machine idle is what separates those, and it costs nothing to record.
+#   - At the edge of what the machine can do, clients receiving less than the server sent can be the
+#     generator's sockets overflowing rather than the server falling short. The kernel counts every
+#     datagram it discarded for want of buffer, machine-wide, and that count over the window is what
+#     tells the two apart.
 #
 # Usage:
 #   validate.sh <label> [clients] [arenas] [duration-seconds] [extra load client arguments...]
@@ -42,7 +46,7 @@ GLOBAL_CONF="$ZONE_DIR/conf/global.conf"
 PERF_SECONDS="${PERF_SECONDS:-30}"
 
 usage() {
-    grep '^#' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' | sed -n '2,32p'
+    grep '^#' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' | sed -n '2,36p'
     exit 1
 }
 
@@ -119,9 +123,25 @@ process_ticks() {
     echo $(( fields[11] + fields[12] ))
 }
 
+# The kernel's UDP counters for the whole machine. /proc/net/snmp gives them as a line of names and
+# a line of values, so the two are read together and the ones wanted are picked out by name rather
+# than by position, which has changed between kernels.
+udp_counters() {
+    awk '/^Udp:/ {
+        if (!have_names) {
+            for (i = 2; i <= NF; i++) name[i] = $i
+            have_names = 1
+        } else {
+            for (i = 2; i <= NF; i++) value[name[i]] = $i
+            print value["InDatagrams"], value["OutDatagrams"], value["InErrors"], value["RcvbufErrors"], value["SndbufErrors"]
+        }
+    }' /proc/net/snmp
+}
+
 echo "=== attaching to $PID at steady state, $PERF_SECONDS s ==="
 
 read -ra CPU_BEFORE < /proc/stat
+read -r UDP_IN_BEFORE UDP_OUT_BEFORE UDP_INERR_BEFORE UDP_RCVBUF_BEFORE UDP_SNDBUF_BEFORE <<< "$(udp_counters)"
 PROC_BEFORE="$(process_ticks "$PID")"
 WALL_BEFORE="$(date +%s%N)"
 
@@ -129,6 +149,7 @@ sudo perf stat -e cache-misses,cache-references -p "$PID" -- sleep "$PERF_SECOND
 
 WALL_AFTER="$(date +%s%N)"
 PROC_AFTER="$(process_ticks "$PID")"
+read -r UDP_IN_AFTER UDP_OUT_AFTER UDP_INERR_AFTER UDP_RCVBUF_AFTER UDP_SNDBUF_AFTER <<< "$(udp_counters)"
 read -ra CPU_AFTER < /proc/stat
 
 # Divide by the window that was actually bracketed, not the one that was asked for, so that anything
@@ -168,6 +189,28 @@ if [ "$(echo "$idle_cores < 1" | bc)" -eq 1 ]; then
     echo "WARNING: under one core idle. This run measures where the machine ran out of processors,"
     echo "         not the change being tested. The load generator runs here too and at this load it"
     echo "         costs more than the server does. Lower the client count or move it to another box."
+fi
+
+# InErrors includes the buffer overflows, so the remainder is every other reason a datagram was
+# refused: checksum, no socket, memory.
+if [ -n "${UDP_IN_AFTER:-}" ] && [ -n "${UDP_IN_BEFORE:-}" ]; then
+    overflows=$(( UDP_RCVBUF_AFTER - UDP_RCVBUF_BEFORE ))
+    other_errors=$(( (UDP_INERR_AFTER - UDP_INERR_BEFORE) - overflows ))
+    echo
+    echo "--- the machine's UDP over the same window ---"
+    printf '%s datagrams/s in, %s out; receive buffer overflows %s, other receive errors %s, send buffer errors %s\n' \
+        "$(echo "($UDP_IN_AFTER - $UDP_IN_BEFORE) / $ELAPSED" | bc)" \
+        "$(echo "($UDP_OUT_AFTER - $UDP_OUT_BEFORE) / $ELAPSED" | bc)" \
+        "$overflows" \
+        "$other_errors" \
+        "$(( UDP_SNDBUF_AFTER - UDP_SNDBUF_BEFORE ))"
+
+    if [ "$overflows" -gt 0 ]; then
+        echo "NOTE: an overflow is the kernel discarding a datagram that arrived faster than its socket was"
+        echo "      drained. The server's socket has its own drop counter in ?metrics; if that did not move,"
+        echo "      these were the load generator's sockets, and any shortfall in what the clients received"
+        echo "      is the generator's, not the server's."
+    fi
 fi
 
 wait "$LOADTEST_PID"
