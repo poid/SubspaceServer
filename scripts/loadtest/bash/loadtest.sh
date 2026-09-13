@@ -21,6 +21,11 @@
 # Environment:
 #   LOADTEST_OUT   where to put logs and results. Default: <repo>/loadtest-results
 #   ZONE_DIR       the zone directory. Default: <repo>/src/SubspaceServer/Zone
+#   CONFIGURATION  which build of the server and load client to run, Debug or Release. Default: Debug,
+#                  which is what dotnet run picks when not told otherwise. The runtime compiles every
+#                  method of a Debug built assembly without optimisation and never tiers it up, so a
+#                  Debug run measures a server that is slower everywhere, by an amount that differs
+#                  from one method to the next. Build the one asked for first; this script does not.
 #
 # Requirements:
 #   - The server and the load client must already be built. This script does not build them, so that a
@@ -39,6 +44,7 @@ ZONE_DIR="${ZONE_DIR:-$REPO_ROOT/src/SubspaceServer/Zone}"
 OUT="${LOADTEST_OUT:-$REPO_ROOT/loadtest-results}"
 RESULTS="$OUT/results.txt"
 GLOBAL_CONF="$ZONE_DIR/conf/global.conf"
+CONFIGURATION="${CONFIGURATION:-Debug}"
 
 # How long to allow, beyond the requested hold, for connecting and for shutdown. Connecting several
 # thousand clients is not instant, and a run killed partway through reports whatever it had reached
@@ -46,7 +52,7 @@ GLOBAL_CONF="$ZONE_DIR/conf/global.conf"
 STARTUP_ALLOWANCE=420
 
 usage() {
-    grep '^#' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' | sed -n '2,32p'
+    grep '^#' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' | sed -n '2,37p'
     exit 1
 }
 
@@ -208,16 +214,16 @@ if [ ! -s "$RESULTS" ]; then
     printf 'label\tpos_pkt_s\tscanned_pkt\tinview_pkt\tsendtoone_s\toverruns\tlockread_s\twrite_waited_ms\tcores\tworkset_mb\tml_iter_s\tml_mean_ms\tthreads\n' > "$RESULTS"
 fi
 
-echo "Load test '$LABEL': $CLIENTS clients over $ARENA_COUNT arenas, holding $DURATION s."
+echo "Load test '$LABEL': $CLIENTS clients over $ARENA_COUNT arenas, holding $DURATION s, $CONFIGURATION build."
 
 wait_for_port_free
 rm -f "$SERVER_LOG"
 
-( cd "$ZONE_DIR/.." && timeout $((DURATION + STARTUP_ALLOWANCE + 60)) dotnet run --project SubspaceServer.csproj --no-build -- "$(basename "$ZONE_DIR")" > "$SERVER_LOG" 2>&1 & )
+( cd "$ZONE_DIR/.." && timeout $((DURATION + STARTUP_ALLOWANCE + 60)) dotnet run --project SubspaceServer.csproj --no-build -c "$CONFIGURATION" -- "$(basename "$ZONE_DIR")" > "$SERVER_LOG" 2>&1 & )
 
 wait_for_listening || exit 1
 
-( cd "$REPO_ROOT" && timeout $((DURATION + STARTUP_ALLOWANCE)) dotnet run --project src/LoadClient/LoadClient.csproj --no-build -- \
+( cd "$REPO_ROOT" && timeout $((DURATION + STARTUP_ALLOWANCE)) dotnet run --project src/LoadClient/LoadClient.csproj --no-build -c "$CONFIGURATION" -- \
     --protocol game --clients "$CLIENTS" --arenas "$ARENAS" --duration "$DURATION" "$@" > "$CLIENT_LOG" 2>&1 )
 
 sleep 3
@@ -250,11 +256,16 @@ echo "--- what the server did ---"
 [ -n "$ROW" ] && printf '%s\n' "$ROW"
 
 # Worth checking every time. An assertion failure means a debug build caught the server doing something
-# its own threading contract forbids, which no timing number will tell you about.
+# its own threading contract forbids, which no timing number will tell you about. A Release build has
+# no assertions in it, so its zero is not evidence of anything and is not reported as though it were.
 ASSERTIONS="$(grep -c 'Assertion failed' "$SERVER_LOG")"
 ERRORS="$(grep -c '^E <' "$SERVER_LOG")"
 echo
-echo "Assertion failures: $ASSERTIONS    Errors logged: $ERRORS"
+if [ "$CONFIGURATION" = "Release" ]; then
+    echo "Assertion failures: none possible (Release build)    Errors logged: $ERRORS"
+else
+    echo "Assertion failures: $ASSERTIONS    Errors logged: $ERRORS"
+fi
 
 # The number this script reports is what the server broadcast, not what the clients offered, and the
 # two can differ by a lot without anything failing visibly. The known way is lag: a player specced for
