@@ -1967,8 +1967,8 @@ fifteen seconds on a saturated server, which is the client's own give-up rule.
   and 3 measures better — same processor time, 24 points more headroom on the busiest thread. The
   formula has never been measured against anything on any machine.
 - **The 34 errors logged in every VPS run — read at last, and harmless.** Every one is an
-  `AttachModule failed: Unable to find module` at startup, for `SS.Matchmaking.Modules.*` and
-  `SS.Bots.BotsModule`, which the arena configs on that box ask for and which are not loaded there.
+  `AttachModule failed: Unable to find module` at startup, for the matchmaking modules and the bot
+  module, which the arena configs on that box ask for and which are not loaded there.
   Once per arena, nothing in the packet path, and nothing in any measurement above.
 - **The four worker floor — FOUND, see "Why four workers cost more than two" above.** It was the
   wait between items, not the work: six interventions on the work helped one worker and none helped
