@@ -2055,7 +2055,44 @@ difference is entirely that loopback has no packet rate.
 `Net:SendInterval` is the lever against a packet rate limit, added on `scale/28`. Each pass sends
 every connection what queued since the last, merged into as few datagrams as fit, so a twenty
 millisecond pass sends about half the datagrams for the same positions, each carrying twice as
-much, at up to ten milliseconds more delay before a position goes out. Not yet measured.
+much, at up to ten milliseconds more delay before a position goes out.
+
+**Measured at twenty milliseconds:**
+
+| | 4,000 at 10 ms | 4,000 at 20 ms | 5,000 at 20 ms |
+|---|---|---|---|
+| datagrams out per second | 271k | 190k | 225k |
+| send socket refusals | 12,600/s | 0 | 0 |
+| server cores | 4.98 | 3.91 | 4.65 |
+| send threads | 6 at 49% | 5 at 46% | 6 at 43% |
+| workers, each | 46% | 60% | 69% |
+| idle on the VPS | 2.19 | 3.77 | 3.04 |
+| delivered of sent | 71% | 100% | 78% |
+| loss s2c / c2s, server's view of one client | 9.0 / 0.5 | 1.6 / 1.5 | no reply |
+| specced | 3,772 | 316 | 4,465 |
+| broadcast of offered | 80%, spread 87% | 95%, spread 2% | 83%, spread 78% |
+
+At 4,000 the interval moved the wall as predicted: 30% fewer datagrams, no refusals, everything
+delivered, and a core less on the server for the same positions. The workers rose from 46% to 60%,
+because a pass now holds each connection's lock for twice the packets and the workers wait on it
+more; at two workers that is the next thing on the server's side to run out, near 5,500, and four
+is the answer when it does.
+
+At 5,000 the VPS was still under its limits, no refusals at 225,000 datagrams out, six send threads
+at 43%, three cores idle, and the run collapsed anyway: 4,465 specced, 2,222 of them for
+server-to-client loss, 1,353 for ping and 890 for spikes. Those packets left the VPS and were lost
+on the way into this machine, whose own sockets overflowed nothing, so the loss is in WSL2's NAT
+path before the sockets. That path carried 225,000 to 250,000 datagrams a second in every run
+from 3,000 up whatever the population, which is its ceiling. The 316 specs at 4,000 were the same
+thing beginning: the clients' position stamps arriving a second old with the reliable round trip
+at 29 ms, since their sends were queuing in that path.
+
+**So the remote series ends where the generator's path ends, not where the server does.** With
+the box to itself, at twenty millisecond passes, the server on this VPS is clean at 4,000 and
+under every one of its own limits at 5,000; where it runs out is not known, because nothing that
+can be aimed at it from here gets that far. What it needs to find out is a generator that is not
+behind WSL2's NAT: the same load client on Windows itself, WSL2 in mirrored networking mode, or a
+second Linux machine. The next server-side setting on that run is `Workers = 4`.
 
 ## What to watch next
 
@@ -2076,9 +2113,14 @@ much, at up to ten milliseconds more delay before a position goes out. Not yet m
 - **Moving the load generator off the box — DONE, see "With the generator on another machine"
   above.** Clean to 3,000; the VPS's interface stops taking packets at about 270,000 a second, which
   the server reaches near 3,500 at ten millisecond passes with its own threads at half load.
-- **`Net:SendInterval = 20` at 4,000 and 5,000.** Half the datagrams for the same positions, up to
-  ten milliseconds more delay. If the interface is the wall, this moves it; the run says by how much,
-  and the send socket's refusals and the server's lag view of one client are the two lines to read.
+- **`Net:SendInterval = 20` — MEASURED.** It moved the interface's wall: 4,000 clean where 10 ms
+  had refused 12,600 datagrams a second, and 5,000 with the VPS under all of its own limits. What
+  stopped the 5,000 run was the generator's path through WSL2's NAT at about 240,000 datagrams a
+  second. Not yet measured: the latency the interval adds as a player would feel it, which the
+  harness does not see.
+- **A generator that is not behind WSL2's NAT.** The load client on Windows itself, WSL2 in mirrored
+  networking mode, or a second Linux machine. Until then the server's limit on this VPS at twenty
+  millisecond passes is above 5,000 and not known, and `Workers = 4` is the next setting on that run.
 - **Position latency, which the send side degrades by and nothing here sees.** Past its interval a
   send thread stretches its pass and batches more per datagram, so delivery stays above 99% while
   every position arrives later. The load client could stamp each position it sends and read the age
