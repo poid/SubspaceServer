@@ -2094,6 +2094,17 @@ can be aimed at it from here gets that far. What it needs to find out is a gener
 behind WSL2's NAT: the same load client on Windows itself, WSL2 in mirrored networking mode, or a
 second Linux machine. The next server-side setting on that run is `Workers = 4`.
 
+The first of those turned out to be a one-line change to the harness. The load client's dll is
+the same IL on every platform, Windows has the .NET 10 runtime, and WSL's interop runs Windows
+executables from a Linux shell, so `CLIENT_DOTNET=dotnet.exe` makes `remote-loadtest.sh` hand the
+Release-built `SS.LoadClient.dll` to Windows' own `dotnet.exe` instead of this one. The client's
+sockets are then on Windows' stack, on the physical interface, with nothing of WSL2's between them
+and the VPS. Two hundred clients aimed that way at a server inside WSL2 gave two hundred survivors,
+no loss and a round trip of a millisecond, which proves the mode and nothing about the ceiling: a
+Windows process is invisible to `/proc` here, so the harness skips the generator's machine window
+in that mode, and the generator's own limit on this path is now a thing to be found rather than a
+number already known.
+
 ## What to watch next
 
 - **A sampled profile of one send thread — DONE.** `profile-thread.sh` did it and found the firewall,
@@ -2118,8 +2129,9 @@ second Linux machine. The next server-side setting on that run is `Workers = 4`.
   stopped the 5,000 run was the generator's path through WSL2's NAT at about 240,000 datagrams a
   second. Not yet measured: the latency the interval adds as a player would feel it, which the
   harness does not see.
-- **A generator that is not behind WSL2's NAT.** The load client on Windows itself, WSL2 in mirrored
-  networking mode, or a second Linux machine. Until then the server's limit on this VPS at twenty
+- **A generator that is not behind WSL2's NAT — AVAILABLE, not yet run at scale.** The load client
+  on Windows itself, through `CLIENT_DOTNET=dotnet.exe` in `remote-loadtest.sh`, proven at two
+  hundred clients. Until the 5,000 run is repeated that way the server's limit on this VPS at twenty
   millisecond passes is above 5,000 and not known, and `Workers = 4` is the next setting on that run.
 - **Position latency, which the send side degrades by and nothing here sees.** Past its interval a
   send thread stretches its pass and batches more per datagram, so delivery stays above 99% while

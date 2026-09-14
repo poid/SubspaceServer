@@ -23,6 +23,12 @@
 #   SERVER_PORT     the game port. Default: 5000
 #   CONFIGURATION   Debug or Release, for both the server there and the load client here. Default: Debug
 #   LOADTEST_OUT    where logs and results go here. Default: <repo>/loadtest-results
+#   CLIENT_DOTNET   a dotnet to run the load client with instead of this one, given the dll built
+#                   here, which is the same IL on any platform. From WSL, "dotnet.exe" runs it on
+#                   Windows itself, with its sockets on Windows' stack rather than behind WSL's NAT,
+#                   which was measured to lose packets at about 240,000 datagrams a second in total.
+#                   The machine window for the load client is skipped then, since a Windows process is
+#                   not visible from here.
 #
 # Requirements:
 #   - SSH to the server machine. One connection is opened and shared for the whole run, so a password
@@ -131,8 +137,20 @@ if [ "$ready" -ne 1 ]; then
     exit 1
 fi
 
-( cd "$REPO_ROOT" && timeout $((DURATION + STARTUP_ALLOWANCE)) dotnet run --project src/LoadClient/LoadClient.csproj --no-build -c "$CONFIGURATION" -- \
-    --protocol game --host "$SERVER_IP" --port "$SERVER_PORT" --clients "$CLIENTS" --arenas "$ARENAS" --duration "$DURATION" "$@" > "$CLIENT_LOG" 2>&1 ) &
+if [ -n "${CLIENT_DOTNET:-}" ]; then
+    # The dll built here, handed to another runtime by a path that runtime understands. wslpath turns
+    # a WSL path into the Windows one when the other runtime is Windows'; anywhere else it is absent
+    # and the path is used as it is.
+    CLIENT_DLL="$REPO_ROOT/src/LoadClient/bin/$CONFIGURATION/net10.0/SS.LoadClient.dll"
+    if command -v wslpath >/dev/null 2>&1; then
+        CLIENT_DLL="$(wslpath -w "$CLIENT_DLL")"
+    fi
+    ( cd "$REPO_ROOT" && timeout $((DURATION + STARTUP_ALLOWANCE)) "$CLIENT_DOTNET" "$CLIENT_DLL" \
+        --protocol game --host "$SERVER_IP" --port "$SERVER_PORT" --clients "$CLIENTS" --arenas "$ARENAS" --duration "$DURATION" "$@" 2>&1 | tr -d '\r' > "$CLIENT_LOG" ) &
+else
+    ( cd "$REPO_ROOT" && timeout $((DURATION + STARTUP_ALLOWANCE)) dotnet run --project src/LoadClient/LoadClient.csproj --no-build -c "$CONFIGURATION" -- \
+        --protocol game --host "$SERVER_IP" --port "$SERVER_PORT" --clients "$CLIENTS" --arenas "$ARENAS" --duration "$DURATION" "$@" > "$CLIENT_LOG" 2>&1 ) &
+fi
 CLIENT_PID=$!
 
 # This machine over a window too, once the clients are in. The generator is the other half of every
@@ -146,7 +164,9 @@ for _ in $(seq 1 $((STARTUP_ALLOWANCE / 2))); do
 done
 
 GENERATOR_WINDOW=""
-if grep -q '^Holding' "$CLIENT_LOG" 2>/dev/null; then
+if [ -n "${CLIENT_DOTNET:-}" ]; then
+    GENERATOR_WINDOW="(the load client ran under $CLIENT_DOTNET, outside this environment, so its machine was not measured)"
+elif grep -q '^Holding' "$CLIENT_LOG" 2>/dev/null; then
     sleep 20
     # dotnet run starts the built executable as a child, named after the project; that child is the
     # one doing the work, not the dotnet run process above it.
