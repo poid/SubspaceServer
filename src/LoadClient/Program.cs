@@ -47,12 +47,13 @@ namespace SS.LoadClient
                 cancellationTokenSource.Cancel();
             };
 
-            if (options.Duration > TimeSpan.Zero)
-                cancellationTokenSource.CancelAfter(options.Duration);
-
+            // The duration is the hold, and starts once the clients are in: each protocol's run
+            // arms it after its connect phase. Counted from here it included the connect ramp,
+            // which for five thousand clients against a remote server is forty seconds or more, and
+            // a "150 s" hold was then 110.
             return options.Protocol == LoadProtocol.Game
-                ? await RunGameAsync(options, cancellationTokenSource.Token)
-                : await RunAsync(options, cancellationTokenSource.Token);
+                ? await RunGameAsync(options, cancellationTokenSource)
+                : await RunAsync(options, cancellationTokenSource);
         }
 
         /// <summary>
@@ -63,8 +64,10 @@ namespace SS.LoadClient
         /// measure the server's send side: how many position updates it pushed back out, which is the
         /// half of the cost that fake players cannot produce.
         /// </remarks>
-        private static async Task<int> RunGameAsync(Options options, CancellationToken cancellationToken)
+        private static async Task<int> RunGameAsync(Options options, CancellationTokenSource cancellationTokenSource)
         {
+            CancellationToken cancellationToken = cancellationTokenSource.Token;
+
             Console.WriteLine($"Connecting {options.ClientCount} game client(s) to {options.Host}:{options.Port} over UDP, arenas: {string.Join(", ", options.Arenas)}");
             Console.WriteLine($"Spread {options.SpreadPixels}px, view {options.ViewWidth}x{options.ViewHeight}. The server needs the EncryptionNull module loaded.");
 
@@ -116,6 +119,9 @@ namespace SS.LoadClient
             GameClient[] startedClients = clients.Where(c => c is not null).ToArray()!;
 
             Console.WriteLine($"Connected {connected}/{options.ClientCount} in {Stopwatch.GetElapsedTime(startTimestamp).TotalSeconds:F1}s");
+
+            if (options.Duration > TimeSpan.Zero)
+                cancellationTokenSource.CancelAfter(options.Duration);
 
             if (connected == 0)
             {
@@ -310,7 +316,17 @@ namespace SS.LoadClient
                 }
             }
 
-            await Task.WhenAll(startedClients.Select(c => c.DisconnectAsync(CancellationToken.None)));
+            // Paced, not all at once. Five thousand goodbyes in the same millisecond is a burst that a
+            // home router's queue does not take: two thirds of them went missing on the way to a remote
+            // server, and the server carried those players for its drop timeout, then kicked them all in
+            // one go. A millisecond between every sixteen keeps the burst at what the path passes.
+            for (int i = 0; i < startedClients.Length; i++)
+            {
+                await startedClients[i].DisconnectAsync(CancellationToken.None);
+
+                if ((i & 15) == 15)
+                    await Task.Delay(1);
+            }
 
             foreach (GameClient client in startedClients)
                 client.Dispose();
@@ -527,8 +543,10 @@ namespace SS.LoadClient
             }
         }
 
-        private static async Task<int> RunAsync(Options options, CancellationToken cancellationToken)
+        private static async Task<int> RunAsync(Options options, CancellationTokenSource cancellationTokenSource)
         {
+            CancellationToken cancellationToken = cancellationTokenSource.Token;
+
             Console.WriteLine($"Connecting {options.ClientCount} client(s) to {options.Host}:{options.Port}, arenas: {string.Join(", ", options.Arenas)}");
 
             ChatClient[] clients = new ChatClient[options.ClientCount];
@@ -576,6 +594,9 @@ namespace SS.LoadClient
             }
 
             Console.WriteLine($"Connected {connected}/{options.ClientCount}, logged in {loggedIn}, in {Stopwatch.GetElapsedTime(startTimestamp).TotalSeconds:F1}s");
+
+            if (options.Duration > TimeSpan.Zero)
+                cancellationTokenSource.CancelAfter(options.Duration);
 
             async Task SetupClientAsync(ChatClient client, int index)
             {

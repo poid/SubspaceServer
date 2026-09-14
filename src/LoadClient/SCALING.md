@@ -2170,6 +2170,40 @@ the fix in place: the workers waited on the write lock, then found nothing to se
 exception. This is the third defect the worker path has surfaced, after the flag reset callback
 and the send thread's pass-long lock hold, and the first at shutdown.
 
+### The second run from Windows measured the wrong thirty seconds
+
+The rerun with the fix and the new windows (`win-5000` again, same settings) held the whole
+offered load for three windows once everyone was in, 49,774 positions a second, then specced 2,941
+players inside one ten second window and stepped down to 19,700. The `?lag` probe at twenty
+seconds had loss in *both* directions this time, 1.84% server to client and 2.43% client to
+server, with the reliable stream at 3.74% and one client-to-server stall of a full second. Loss
+towards the server is the new fact: the VPS takes in only 50,000 datagrams a second, a rate its
+interface refused nothing at, so whatever is dropping client-to-server packets is on the path, and
+the same path carries the server-to-client ones. A home router forwarding 275,000 packets a second
+through its NAT is the obvious suspect; the interface counters at both ends over a window inside
+the hold are what would say so, and this run did not take them inside the hold.
+
+Both windows were taken after the run. The client's output reaches its log through `tr`, which
+buffers by the block when writing to a file, and the "Holding" line the harness waits for is a few
+hundred bytes in, so it arrived only when the client exited; the harness then signalled the server
+side, waited its twenty seconds, and both machines measured a server sending 30,000 datagrams a
+second of reliable retries to five thousand clients that had gone, which Windows counted, all of
+them, as datagrams for ports nothing was listening on. That is what "2 datagrams a second in" at the
+VPS and "82 in" at Windows were. The fix is `stdbuf`. The Windows window also failed to find the
+client's process, a quoting slip in the PowerShell filter, now fixed and checked against a running
+client.
+
+The after-run window did show two things worth having. Only 1,705 of the 5,000 goodbyes reached
+the server: the client sent all five thousand in the same millisecond, and a burst like that is what
+a router's queue drops. The server then carried 3,295 players for its thirty second drop timeout
+and kicked them all in one go, and because the kick is applied on the mainloop and the send thread
+checks a flag the mainloop sets, every pass until the mainloop got there asked again: a hundred and
+eighty four "Kicked for no data" lines per player, three hundred thousand in ten seconds. The client
+now paces its goodbyes, a millisecond every sixteen, and the connection remembers that a kick is
+pending (`scale/30-kick-once`), so a mass drop logs each player once. The hold also now begins
+when the connects end rather than when the process starts, since a "150 s" hold that includes a
+forty second connect is a 110 s hold.
+
 ## What to watch next
 
 - **A sampled profile of one send thread — DONE.** `profile-thread.sh` did it and found the firewall,

@@ -35,7 +35,7 @@ windows_snapshot() {
         "cpus=$($p.Count)"
         "idle=$(($p | Measure-Object -Property PercentIdleTime -Sum).Sum)"
         "ts=$($p[0].Timestamp_Sys100NS)"
-        $c = Get-CimInstance Win32_Process -Filter "Name = ''dotnet.exe''" | Where-Object { $_.CommandLine -like "*SS.LoadClient*" } | Select-Object -First 1
+        $c = Get-CimInstance Win32_Process | Where-Object { $_.Name -eq "dotnet.exe" -and $_.CommandLine -like "*SS.LoadClient*" } | Select-Object -First 1
         if ($c) {
             $pr = Get-Process -Id $c.ProcessId
             "client_cpu=$($pr.TotalProcessorTime.TotalSeconds)"

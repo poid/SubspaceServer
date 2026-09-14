@@ -148,8 +148,11 @@ if [ -n "${CLIENT_DOTNET:-}" ]; then
     if command -v wslpath >/dev/null 2>&1; then
         CLIENT_DLL="$(wslpath -w "$CLIENT_DLL")"
     fi
+    # stdbuf, because tr writing to a file buffers by the block, and the "Holding" line this script
+    # waits for is a few hundred bytes into the output: without it the line reached the file only
+    # when the client exited, and both machines' windows were taken after the run instead of in it.
     ( cd "$REPO_ROOT" && timeout $((DURATION + STARTUP_ALLOWANCE)) "$CLIENT_DOTNET" "$CLIENT_DLL" \
-        --protocol game --host "$SERVER_IP" --port "$SERVER_PORT" --clients "$CLIENTS" --arenas "$ARENAS" --duration "$DURATION" "$@" 2>&1 | tr -d '\r' > "$CLIENT_LOG" ) &
+        --protocol game --host "$SERVER_IP" --port "$SERVER_PORT" --clients "$CLIENTS" --arenas "$ARENAS" --duration "$DURATION" "$@" 2>&1 | stdbuf -oL tr -d '\r' > "$CLIENT_LOG" ) &
 else
     ( cd "$REPO_ROOT" && timeout $((DURATION + STARTUP_ALLOWANCE)) dotnet run --project src/LoadClient/LoadClient.csproj --no-build -c "$CONFIGURATION" -- \
         --protocol game --host "$SERVER_IP" --port "$SERVER_PORT" --clients "$CLIENTS" --arenas "$ARENAS" --duration "$DURATION" "$@" > "$CLIENT_LOG" 2>&1 ) &
