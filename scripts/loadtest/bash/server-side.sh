@@ -110,23 +110,30 @@ mapfile -t PIDS < <(pgrep -x SubspaceServer)
 # loss that lasts seconds rather than a window, and to say which side of the path it was on.
 sample_seconds() {
     local pid="$1" iface
-    local in_prev out_prev ovf_prev qd_prev rq_prev txd_prev
-    local in out ovf qd rq txd
+    local in_prev out_prev ovf_prev qd_prev rq_prev txd_prev txb_prev rxb_prev
+    local in out ovf qd rq txd txb rxb
     iface="$(net_interface)"
     read -r in_prev out_prev _ ovf_prev _ <<< "$(udp_counters)"
     read -r qd_prev rq_prev <<< "$(qdisc_counters "$iface")"
     read -r _ _ _ txd_prev _ _ <<< "$(interface_counters "$iface")"
+    read -r txb_prev < "/sys/class/net/$iface/statistics/tx_bytes" 2>/dev/null || txb_prev=0
+    read -r rxb_prev < "/sys/class/net/$iface/statistics/rx_bytes" 2>/dev/null || rxb_prev=0
     [ "$qd_prev" = "-" ] && qd_prev=0 && rq_prev=0
     while kill -0 "$pid" 2>/dev/null; do
         sleep 1
         read -r in out _ ovf _ <<< "$(udp_counters)"
         read -r qd rq <<< "$(qdisc_counters "$iface")"
         read -r _ _ _ txd _ _ <<< "$(interface_counters "$iface")"
+        read -r txb < "/sys/class/net/$iface/statistics/tx_bytes" 2>/dev/null || txb=0
+        read -r rxb < "/sys/class/net/$iface/statistics/rx_bytes" 2>/dev/null || rxb=0
         [ "$qd" = "-" ] && qd=0 && rq=0
-        printf '%s out=%d in=%d overflows=%d qdisc_dropped=%d requeues=%d tx_dropped=%d\n' \
+        # The bytes are the interface's, so they carry the IP and UDP headers the payload does not,
+        # which at forty bytes of payload a datagram is most of what the wire carries.
+        printf '%s out=%d in=%d out_bytes=%d in_bytes=%d overflows=%d qdisc_dropped=%d requeues=%d tx_dropped=%d\n' \
             "$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)" \
-            $(( out - out_prev )) $(( in - in_prev )) $(( ovf - ovf_prev )) $(( qd - qd_prev )) $(( rq - rq_prev )) $(( txd - txd_prev ))
-        in_prev=$in; out_prev=$out; ovf_prev=$ovf; qd_prev=$qd; rq_prev=$rq; txd_prev=$txd
+            $(( out - out_prev )) $(( in - in_prev )) $(( txb - txb_prev )) $(( rxb - rxb_prev )) \
+            $(( ovf - ovf_prev )) $(( qd - qd_prev )) $(( rq - rq_prev )) $(( txd - txd_prev ))
+        in_prev=$in; out_prev=$out; ovf_prev=$ovf; qd_prev=$qd; rq_prev=$rq; txd_prev=$txd; txb_prev=$txb; rxb_prev=$rxb
     done
 }
 SECONDS_LOG="$OUT/${LABEL// /_}.server-seconds.log"

@@ -2284,6 +2284,58 @@ all beside a server that still specs. Two clocks and two samplers put up to a se
 between the series, so the totals over the hold are the figure to trust and single seconds are
 read with that in mind. The next 5,000 run is the first with it.
 
+### Fifth run: the wall is the generator's internet connection
+
+The seconds settled it in one run. Over 161 seconds with everyone in, the VPS sent 209,311
+datagrams a second and the clients received 180,536: 13.7% short. In the seconds when the VPS sent
+235,000, the clients received 185,000, 22% short, and the VPS's own counters on those seconds were
+clean: its interface transmitted every datagram its sockets sent, the queue discipline dropped
+1,870 over the whole hold against 34 million sent, requeues a few dozen a second. Delivered against
+offered, in steps of the offered rate:
+
+| VPS sent, datagrams/s | clients received | seconds |
+|---|---|---|
+| 140,000-160,000 | 152,700 | 27 |
+| 160,000-180,000 | 164,750 | 28 |
+| 180,000-200,000 | 177,000 | 4 |
+| 220,000-240,000 | 188,300 | 106 |
+| 240,000-260,000 | 185,000 | 3 |
+
+Delivery follows the offered rate to about 160,000 and stops at 185,000 to 190,000 whatever is
+offered above it. That is a ceiling on the path between the VPS's interface and this machine, and
+its size says what kind: the datagrams average 42.6 bytes of payload, which with the 28 bytes of IP
+and UDP headers is 70 bytes each, and 188,000 of them a second is 13 MB/s, 105 Mbit/s at the IP
+layer, about 130 at the Ethernet frame. That is the shape of a home internet connection's
+downstream rate, or of the shaping in front of it: a hard cap with no standing queue, since the
+reliable round trip stayed at 19-25 ms throughout. The next run's byte counters at both ends will
+put the exact figure on it, but the conclusion does not wait for them.
+
+So every spec wave in the remote series was this. Above about 4,000 players at nineteen in view,
+the server sends more bytes to this machine than its connection delivers, the difference is lost,
+the server's `LagAction` specs the players who report the loss, the broadcast falls until the
+offered rate fits the link, and the run settles there: the clean tail of the third run was the
+population that fits, not the population that was asked for. The 4,000 run at twenty millisecond
+passes was clean because 190,000 datagrams a second fit; the 5,000 runs were not because 235,000
+do not. **The server on this VPS was never the limit in any of them**: at 5,000 it had four vCPUs
+idle, its send threads under half their interval, and its interface passing everything.
+
+The one number in the fifth run that was not what it looked like was the position age: 6.6
+seconds, constant, every second of the hold, beside a reliable round trip of 25 ms. A delay that
+large would have shown in the round trip; it did not, so it was a clock. A client whose first time
+sync was lost, and at 5,000 connects some were, stamped its positions with its own clock, the
+server turned the difference into that client's latency and subtracted it from the stamp on every
+position it forwarded, and everyone in view of that client read the result as six seconds of age.
+The client now repeats the sync every second until the first reply and ignores a reply to a
+request more than five seconds old, and the age is read for what it is: the path's delay plus this
+machine's queueing, for positions from clients whose clocks are known.
+
+What is left to measure needs a generator on a connection that can take the server's output.
+Five thousand players at nineteen in view is 13 MB/s of these datagrams and ten thousand is twice
+that: a second VPS at the same provider, on the same network, running this harness against the
+first, is the straightforward way, and the harness already runs from any Linux machine with SSH to
+the server. A longer `SendInterval` would fit more players through this link by carrying more
+positions per datagram, at the cost of latency, and the link would still be the thing measured.
+
 ## What to watch next
 
 - **A sampled profile of one send thread — DONE.** `profile-thread.sh` did it and found the firewall,
@@ -2308,13 +2360,13 @@ read with that in mind. The next 5,000 run is the first with it.
   stopped the 5,000 run was the generator's path through WSL2's NAT at about 240,000 datagrams a
   second. Not yet measured: the latency the interval adds as a player would feel it, which the
   harness does not see.
-- **A generator that is not behind WSL2's NAT — RUN at 5,000.** The load client on Windows itself,
-  through `CLIENT_DOTNET=dotnet.exe` in `remote-loadtest.sh`: 4,999 of 5,000 survived, the server
-  under all of its own limits, and 1,752 specced for loss that Windows' counters show was not lost
-  here. The loss is between the VPS's sockets and this machine's adapter, and the WSL2 run's loss at
-  the same population now looks like the same thing. Both ends' interface and queue discipline
-  counters are in the harness now; the next 5,000 run says whether it is the VPS's egress. If it
-  is, `SendInterval` is the lever that was already measured to move it.
+- **A generator that is not behind WSL2's NAT — RUN at 5,000, five times, and SETTLED.** The loss
+  in every remote run above 4,000 is the generator's internet connection: delivery to this machine
+  stops at about 185,000 of these 70-byte datagrams a second, 105 Mbit/s at the IP layer, whatever
+  the VPS sends above it, with the VPS's interface and queue discipline clean and no standing
+  queue. The server on this VPS was not the limit in any of them. What is left needs a generator
+  on a connection that takes the server's output: a second VPS at the same provider running this
+  harness.
 - **Position latency, which the send side degrades by and nothing here sees.** Past its interval a
   send thread stretches its pass and batches more per datagram, so delivery stays above 99% while
   every position arrives later. The load client could stamp each position it sends and read the age

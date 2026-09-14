@@ -117,7 +117,7 @@ REMOTE_PID=$!
 stop_remote_server() {
     remote "pkill -x SubspaceServer" 2>/dev/null || true
 }
-trap 'stop_remote_server; kill "$REMOTE_PID" 2>/dev/null' EXIT
+trap 'stop_remote_server; windows_seconds_stop; kill "$REMOTE_PID" 2>/dev/null' EXIT
 
 # Wait for READY, or for the server side to give up.
 ready=0
@@ -151,6 +151,10 @@ if [ -n "${CLIENT_DOTNET:-}" ]; then
     # stdbuf, because tr writing to a file buffers by the block, and the "Holding" line this script
     # waits for is a few hundred bytes into the output: without it the line reached the file only
     # when the client exited, and both machines' windows were taken after the run instead of in it.
+    # Windows' own seconds alongside, for the path section of the report.
+    if windows_window_available; then
+        windows_seconds_start "$OUT/${LABEL// /_}.windows-seconds.log"
+    fi
     ( cd "$REPO_ROOT" && timeout $((DURATION + STARTUP_ALLOWANCE)) "$CLIENT_DOTNET" "$CLIENT_DLL" \
         --protocol game --host "$SERVER_IP" --port "$SERVER_PORT" --clients "$CLIENTS" --arenas "$ARENAS" --duration "$DURATION" "$@" 2>&1 | stdbuf -oL tr -d '\r' > "$CLIENT_LOG" ) &
 else
@@ -199,6 +203,7 @@ if grep -q '^Holding' "$CLIENT_LOG" 2>/dev/null; then
 fi
 
 wait "$CLIENT_PID"
+windows_seconds_stop
 
 # Let the last window with the clients in it be written, then stop the server so the log ends there
 # rather than trailing empty windows, which is what the local harness's timing gives the extraction.

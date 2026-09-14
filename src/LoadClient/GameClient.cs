@@ -90,6 +90,7 @@ namespace SS.LoadClient
         /// same way this now does.
         /// </remarks>
         private uint _serverTickOffset;
+        private bool _hasServerTickOffset;
 
         public string Name { get; } = name;
 
@@ -450,8 +451,11 @@ namespace SS.LoadClient
             long sent = Interlocked.Increment(ref PositionUpdatesSent);
 
             // Clocks drift and the first sync can be lost, so it is repeated every thirty seconds at this
-            // client's ten hertz. Not awaited: the reply sets the offset whenever it arrives.
-            if (sent % 300 == 1)
+            // client's ten hertz, and every second until the first reply: a client without an estimate
+            // stamps its positions with its own clock, the server makes latency out of the difference,
+            // and everyone it is sent to reads that as delay. Not awaited: the reply sets the offset
+            // whenever it arrives.
+            if (sent % 300 == 1 || (sent % 10 == 1 && !Volatile.Read(ref _hasServerTickOffset)))
                 _ = SendTimeSyncAsync(cancellationToken);
 
             C2S_PositionPacket position = new()
@@ -619,9 +623,20 @@ namespace SS.LoadClient
                         uint serverTime = LittleEndianConverter.Convert(MemoryMarshal.Read<uint>(span.Slice(6, 4)));
 
                         // The server's time when it answered against ours when we asked, so this is off by
-                        // one trip one way. A tick is ten milliseconds and the trip is a few, so adding
-                        // half the round trip is not worth the arithmetic.
-                        Volatile.Write(ref _serverTickOffset, serverTime - clientTime);
+                        // one trip one way: the request's, which is a few milliseconds. Not corrected by
+                        // half the round trip, since the reply's trip is the one that varies, behind a
+                        // connection's login traffic, and the estimate does not depend on it. A reply to a
+                        // request that sat somewhere for seconds would put the estimate seconds ahead, and
+                        // every position this client then stamped would be turned by the server into
+                        // seconds of latency and read by everyone it was sent to as seconds of delay, so
+                        // once there is an estimate a reply to a request more than five seconds old is not
+                        // used.
+                        uint roundTrip = (uint)ServerTick.Now - clientTime;
+                        if (!Volatile.Read(ref _hasServerTickOffset) || roundTrip < 500)
+                        {
+                            Volatile.Write(ref _serverTickOffset, serverTime - clientTime);
+                            Volatile.Write(ref _hasServerTickOffset, true);
+                        }
                     }
                     break;
 

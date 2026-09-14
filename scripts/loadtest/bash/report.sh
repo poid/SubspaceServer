@@ -122,56 +122,133 @@ PY
 # not in step put up to a second of skew between the series, so single seconds are read with that
 # in mind and the totals over the hold are the figure to trust.
 align_seconds() {
-    python3 - "$SERVER_SECONDS_LOG" "$CLIENT_LOG" <<'PY'
+    python3 - "$SERVER_SECONDS_LOG" "$CLIENT_LOG" "${WINDOWS_SECONDS_LOG:-}" <<'PY'
 import re
 import sys
+from datetime import datetime, timezone
 
+def stamp(text):
+    return datetime.strptime(text, "%Y-%m-%dT%H:%M:%S.%f").replace(tzinfo=timezone.utc).timestamp()
+
+# The server machine: differences over roughly a second, keyed by the second they were taken in.
 server = {}
 for line in open(sys.argv[1], errors="replace"):
-    m = re.match(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)\.\d+Z out=(\d+) in=(\d+) overflows=(\d+) qdisc_dropped=(\d+) requeues=(\d+) tx_dropped=(\d+)", line)
+    m = re.match(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)\.\d+Z out=(\d+) in=(\d+) out_bytes=(\d+) in_bytes=(\d+) overflows=(\d+) qdisc_dropped=(\d+) requeues=(\d+) tx_dropped=(\d+)", line)
     if m:
-        server[m.group(1)] = tuple(int(x) for x in m.groups()[1:])
+        v = [int(x) for x in m.groups()[1:]]
+        server[m.group(1)] = dict(out=v[0], inn=v[1], out_bytes=v[2], in_bytes=v[3], overflows=v[4], qdrop=v[5], requeues=v[6], txdrop=v[7])
 
+# The load client: the same, from its own watcher.
 client = {}
 for line in open(sys.argv[2], errors="replace"):
-    m = re.match(r"\s+second (\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)\.\d+Z \(\+(\d+) s, (\d+) in\): received (\d+) datagrams, sent (\d+)", line)
+    m = re.match(r"\s+second (\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)\.\d+Z \(\+(\d+) s, (\d+) in\): received (\d+) datagrams \((\d+) KB\), sent (\d+)", line)
     if m:
-        client[m.group(1)] = (int(m.group(2)), int(m.group(3)), int(m.group(4)), int(m.group(5)))
+        client[m.group(1)] = dict(t=int(m.group(2)), inn=int(m.group(3)), rx=int(m.group(4)), rx_kb=int(m.group(5)), tx=int(m.group(6)))
+
+# Windows, when the client ran there: cumulative counts at irregular moments, turned into per-second
+# amounts by interpolating the cumulative count at each whole second.
+windows = {}
+if len(sys.argv) > 3 and sys.argv[3]:
+    samples = []
+    try:
+        for line in open(sys.argv[3], errors="replace"):
+            m = re.match(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d+)Z adapter_in=(\d+) adapter_bytes_in=(\d+) adapter_discarded=(\d+) adapter_errors=(\d+) udp_in=(\d+) udp_errors=(\d+) udp_noport=(\d+)", line)
+            if m:
+                samples.append((stamp(m.group(1)), [int(x) for x in m.groups()[1:]]))
+    except OSError:
+        samples = []
+    samples.sort()
+    if len(samples) >= 2:
+        def at(t):
+            # Linear interpolation of the cumulative counts at time t, between the samples around it.
+            lo, hi = 0, len(samples) - 1
+            if t <= samples[0][0] or t >= samples[-1][0]:
+                return None
+            while hi - lo > 1:
+                mid = (lo + hi) // 2
+                if samples[mid][0] <= t:
+                    lo = mid
+                else:
+                    hi = mid
+            (t0, a), (t1, b) = samples[lo], samples[hi]
+            f = (t - t0) / (t1 - t0) if t1 > t0 else 0.0
+            return [x + (y - x) * f for x, y in zip(a, b)]
+        first = int(samples[0][0]) + 1
+        last = int(samples[-1][0])
+        for sec in range(first, last):
+            a, b = at(float(sec)), at(float(sec + 1))
+            if a is None or b is None:
+                continue
+            d = [y - x for x, y in zip(a, b)]
+            key = datetime.fromtimestamp(sec, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+            windows[key] = dict(adapter=d[0], adapter_bytes=d[1], adapter_discarded=d[2], adapter_errors=d[3], udp=d[4], udp_errors=d[5], noport=d[6])
 
 # Only the hold, and only once the clients are all in: the ramp's rates change too fast within a
 # second for the two clocks' skew.
-peak = max((c[1] for c in client.values()), default=0)
-seconds = sorted(k for k in server if k in client and client[k][1] >= peak and server[k][0] > 1000)
+peak = max((c["inn"] for c in client.values()), default=0)
+seconds = sorted(k for k in server if k in client and client[k]["inn"] >= peak and server[k]["out"] > 1000)
 if not seconds:
     print("no second had both machines' counters; the server-seconds log or the client's second lines are missing")
     sys.exit(0)
 
-out_total = sum(server[k][0] for k in seconds)
-rx_total = sum(client[k][2] for k in seconds)
-in_total = sum(server[k][1] for k in seconds)
-tx_total = sum(client[k][3] for k in seconds)
-qdrop = sum(server[k][3] for k in seconds)
-requeues = sum(server[k][4] for k in seconds)
-txdrop = sum(server[k][5] for k in seconds)
-overflows = sum(server[k][2] for k in seconds)
+n = len(seconds)
+def total(series, field, keys):
+    return sum(series[k][field] for k in keys if k in series)
+def pct(short, whole):
+    return 100.0 * short / whole if whole else 0.0
+def mbit(bytes_per_second):
+    return bytes_per_second * 8 / 1_000_000
 
-def pct(short, total):
-    return 100.0 * short / total if total else 0.0
+out = total(server, "out", seconds)
+out_bytes = total(server, "out_bytes", seconds)
+rx = total(client, "rx", seconds)
+rx_bytes = total(client, "rx_kb", seconds) * 1024
+inn = total(server, "inn", seconds)
+tx = total(client, "tx", seconds)
 
-print(f"Over {len(seconds)} seconds with everyone in: the server machine sent {out_total // len(seconds):,} datagrams/s and the clients received {rx_total // len(seconds):,}"
-      f" ({pct(out_total - rx_total, out_total):.1f}% short); the clients sent {tx_total // len(seconds):,}/s and the server machine received {in_total // len(seconds):,} ({pct(tx_total - in_total, tx_total):.1f}% short).")
-print(f"On the server machine over those seconds: queue discipline dropped {qdrop}, requeues {requeues}, interface dropped {txdrop} on send, socket receive overflows {overflows}.")
+print(f"Over {n} seconds with everyone in, server machine to clients: sent {out // n:,} datagrams/s ({mbit(out_bytes / n):.0f} Mbit/s on its interface, headers included),"
+      f" received {rx // n:,}/s ({mbit(rx_bytes / n):.0f} Mbit/s of payload), {pct(out - rx, out):.1f}% short.")
+print(f"Clients to server machine: sent {tx // n:,}/s, received {inn // n:,}/s, {pct(tx - inn, tx):.1f}% short.")
+print(f"The server machine's own drops over those seconds: queue discipline {total(server, 'qdrop', seconds)}, requeues {total(server, 'requeues', seconds)},"
+      f" interface {total(server, 'txdrop', seconds)} on send, socket receive overflows {total(server, 'overflows', seconds)}.")
 
-bad = [(k, pct(server[k][0] - client[k][2], server[k][0])) for k in seconds]
+wkeys = [k for k in seconds if k in windows]
+if wkeys:
+    wn = len(wkeys)
+    w_out = total(server, "out", wkeys)
+    w_adapter = total(windows, "adapter", wkeys)
+    w_udp = total(windows, "udp", wkeys)
+    w_rx = total(client, "rx", wkeys)
+    print(f"Where the shortfall sits, over the {wn} of those seconds Windows sampled too: before this machine's adapter {pct(w_out - w_adapter, w_out):.1f}%,"
+          f" between the adapter and the sockets {pct(w_adapter - w_udp, w_out):.1f}%, between the sockets and the client {pct(w_udp - w_rx, w_out):.1f}%"
+          f" (adapter received {w_adapter / wn:,.0f}/s at {mbit(total(windows, 'adapter_bytes', wkeys) / wn):.0f} Mbit/s; Windows' UDP errors {total(windows, 'udp_errors', wkeys):.0f}, no listener {total(windows, 'noport', wkeys):.0f}, adapter discards {total(windows, 'adapter_discarded', wkeys):.0f}).")
+elif len(sys.argv) > 3 and sys.argv[3]:
+    print("Windows' seconds did not overlap the hold, so the shortfall is not split by where it sits.")
+
+# What was delivered against what was offered, in steps of the offered rate: a ceiling shows as the
+# delivered rate stopping where the offered rate keeps going.
+buckets = {}
+for k in seconds:
+    b = (server[k]["out"] // 20000) * 20000
+    buckets.setdefault(b, []).append(client[k]["rx"])
+rows = [(b, v) for b, v in sorted(buckets.items()) if len(v) >= 2]
+if len(rows) >= 2:
+    print("Delivered against offered (server machine sent, datagrams/s -> clients received, mean; seconds):")
+    for b, v in rows:
+        print(f"  {b:>8,}-{b + 19999:<8,} -> {sum(v) // len(v):>8,}   {len(v)}")
+
+bad = [(k, pct(server[k]["out"] - client[k]["rx"], server[k]["out"])) for k in seconds]
 bad = [(k, p) for k, p in bad if p >= 8.0]
 if bad:
     worst = max(bad, key=lambda kp: kp[1])
-    print(f"Seconds where the clients received at least 8% less than the server machine sent: {len(bad)}, worst {worst[1]:.0f}% at {worst[0]}Z (+{client[worst[0]][0]} s).")
-    for k, p in bad[:12]:
+    print(f"Seconds where the clients received at least 8% less than the server machine sent: {len(bad)} of {n}, worst {worst[1]:.0f}% at {worst[0]}Z (+{client[worst[0]]['t']} s).")
+    for k, p in bad[:8]:
         s = server[k]
-        print(f"  {k}Z (+{client[k][0]} s): sent {s[0]:,}, received {client[k][2]:,} ({p:.0f}% short); server machine qdisc dropped {s[3]}, requeues {s[4]}, overflows {s[2]}")
-    if len(bad) > 12:
-        print(f"  ... and {len(bad) - 12} more")
+        w = windows.get(k)
+        where = f"; adapter got {w['adapter']:,.0f}, Windows delivered {w['udp']:,.0f}" if w else ""
+        print(f"  {k}Z (+{client[k]['t']} s): sent {s['out']:,}, received {client[k]['rx']:,} ({p:.0f}% short); server machine qdisc dropped {s['qdrop']}, requeues {s['requeues']}, overflows {s['overflows']}{where}")
+    if len(bad) > 8:
+        print(f"  ... and {len(bad) - 8} more")
 else:
     print("No second where the clients received 8% or more less than the server machine sent.")
 PY

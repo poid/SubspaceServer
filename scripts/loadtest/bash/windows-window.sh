@@ -48,6 +48,40 @@ windows_snapshot() {
     ' 2>/dev/null | tr -d '\r'
 }
 
+# Every second for the life of a run, from one PowerShell process kept running, so that Windows'
+# seconds can be set beside the server machine's and the load client's: what the adapters
+# received, in packets and bytes, and what Windows' UDP layer delivered to sockets and what it
+# could not. Cumulative counts, stamped by the wall clock; the report takes the differences. A
+# sample is a few CIM queries, well under a second, and the sleep between them is short of a second
+# so that no second goes without one.
+windows_seconds_start() {
+    WINDOWS_SECONDS_LOG="$1"
+    powershell.exe -NoProfile -NonInteractive -Command '
+        while ($true) {
+            $u = Get-CimInstance Win32_PerfRawData_Tcpip_UDPv4
+            $packets = 0; $bytes = 0; $discarded = 0; $errors = 0
+            foreach ($n in Get-CimInstance Win32_PerfRawData_Tcpip_NetworkInterface) {
+                $packets += $n.PacketsReceivedPerSec; $bytes += $n.BytesReceivedPerSec
+                $discarded += $n.PacketsReceivedDiscarded; $errors += $n.PacketsReceivedErrors
+            }
+            "{0} adapter_in={1} adapter_bytes_in={2} adapter_discarded={3} adapter_errors={4} udp_in={5} udp_errors={6} udp_noport={7}" -f (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ"), $packets, $bytes, $discarded, $errors, $u.DatagramsReceivedPerSec, $u.DatagramsReceivedErrors, $u.DatagramsNoPortPerSec
+            Start-Sleep -Milliseconds 850
+        }
+    ' 2>/dev/null | stdbuf -oL tr -d '\r' > "$WINDOWS_SECONDS_LOG" &
+    WINDOWS_SECONDS_PID=$!
+}
+
+windows_seconds_stop() {
+    if [ -n "${WINDOWS_SECONDS_PID:-}" ]; then
+        kill "$WINDOWS_SECONDS_PID" 2>/dev/null
+        # The PowerShell process is the other end of that pipe and is killed by name, since it is
+        # not this shell's child once the pipe is gone.
+        pkill -f 'Win32_PerfRawData_Tcpip_UDPv4' 2>/dev/null
+        wait "$WINDOWS_SECONDS_PID" 2>/dev/null
+        WINDOWS_SECONDS_PID=""
+    fi
+}
+
 windows_window_begin() {
     WIN_BEFORE="$(windows_snapshot)"
 }

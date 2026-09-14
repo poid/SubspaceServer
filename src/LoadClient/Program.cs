@@ -723,6 +723,7 @@ namespace SS.LoadClient
             TimeSpan lastGcPause = GC.GetTotalPauseDuration();
             long lastReceived = 0;
             long lastSent = 0;
+            long lastBytes = 0;
 
             try
             {
@@ -742,6 +743,7 @@ namespace SS.LoadClient
                     // machines keep by NTP, with no window offset to argue about.
                     long received = 0;
                     long sent = 0;
+                    long bytes = 0;
                     long ageCs = 0;
                     int connected = 0;
                     foreach (GameClient? client in clients)
@@ -754,6 +756,7 @@ namespace SS.LoadClient
 
                         received += Interlocked.Read(ref client.PacketsReceived);
                         sent += Interlocked.Read(ref client.PacketsSent);
+                        bytes += Interlocked.Read(ref client.BytesReceived);
 
                         long clientAgeCs = Interlocked.Exchange(ref client.MaxPositionAgeCs, 0);
                         if (clientAgeCs > ageCs)
@@ -762,8 +765,10 @@ namespace SS.LoadClient
 
                     long receivedThisSecond = received - lastReceived;
                     long sentThisSecond = sent - lastSent;
+                    long bytesThisSecond = bytes - lastBytes;
                     lastReceived = received;
                     lastSent = sent;
+                    lastBytes = bytes;
 
                     totals.MaxTickLatenessMs = Math.Max(totals.MaxTickLatenessMs, lateMs);
                     totals.MaxPositionAgeMs = Math.Max(totals.MaxPositionAgeMs, ageCs * 10);
@@ -773,7 +778,7 @@ namespace SS.LoadClient
                         totals.StallSeconds++;
 
                     Console.WriteLine($"  second {DateTime.UtcNow:yyyy-MM-dd'T'HH:mm:ss.fff'Z'} (+{Stopwatch.GetElapsedTime(startTimestamp).TotalSeconds:F0} s, {connected} in): "
-                        + $"received {receivedThisSecond} datagrams, sent {sentThisSecond}, ticks late up to {lateMs} ms, positions aged up to {ageCs * 10} ms, GC paused {gcPausedMs:F0} ms"
+                        + $"received {receivedThisSecond} datagrams ({bytesThisSecond / 1024} KB), sent {sentThisSecond}, ticks late up to {lateMs} ms, positions aged up to {ageCs * 10} ms, GC paused {gcPausedMs:F0} ms"
                         + (stalled ? " STALL" : ""));
                 }
             }
