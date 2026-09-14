@@ -3609,6 +3609,7 @@ namespace SS.Core.Modules
 
                 // Process lagouts
                 if (player.WhenLoggedIn == PlayerState.Uninitialized // acts as flag to prevent dups
+                    && !conn.IsKickPending // the flag above is set on the mainloop, which may not have got to it yet
                     && player.Status < PlayerState.LeavingZone // don't kick them if they're already on the way out
                     && (hitMaxRetries || hitMaxOutlist || Stopwatch.GetElapsedTime(Interlocked.Read(ref conn.LastReceiveTimestamp), now) > _config.DropTimeout))
                 {
@@ -3641,6 +3642,7 @@ namespace SS.Core.Modules
                     }
 
                     _logManager.LogP(LogLevel.Info, nameof(Network), player, $"Kicked for {reason}.");
+                    conn.IsKickPending = true;
                     return true;
                 }
 
@@ -6491,6 +6493,19 @@ namespace SS.Core.Modules
             /// </remarks>
             public int SendShard = -1;
 
+            /// <summary>
+            /// Whether the send thread has asked for the player to be kicked for lag and the mainloop
+            /// has not yet acted on it.
+            /// </summary>
+            /// <remarks>
+            /// The kick is applied on the mainloop, and until it is, nothing in the player's state says
+            /// it was asked for, so the send thread asked again on every pass: with three thousand
+            /// players dropping at the same moment that was a hundred and eighty log lines for each of
+            /// them inside a few seconds. Only accessed by the send thread that owns the connection,
+            /// apart from the reset when the connection is reused.
+            /// </remarks>
+            public bool IsKickPending;
+
             public void Initialize(IEncrypt? encryptor, string? encryptorName, IBandwidthLimiter bandwidthLimiter)
             {
                 Initialize();
@@ -6506,6 +6521,7 @@ namespace SS.Core.Modules
                 Encryptor = null;
                 AlternateTimerModeEnabled = false;
                 SendShard = -1;
+                IsKickPending = false;
 
                 return base.TryReset();
             }
