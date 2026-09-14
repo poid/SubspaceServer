@@ -165,6 +165,15 @@ namespace SS.LoadClient
         public long LastReceiveTicks;
 
         /// <summary>
+        /// How long after the server stamped it the most delayed position received arrived, in
+        /// centiseconds, since the stall watcher last looked. That is the path's delay plus any time
+        /// the datagram spent queued on this machine before the receive loop got to it, which is what
+        /// a generator that has fallen behind looks like. Written on the receive loop, read and reset
+        /// by the watcher.
+        /// </summary>
+        public long MaxPositionAgeCs;
+
+        /// <summary>
         /// Kill notifications seen, which confirms deaths are actually being processed rather than
         /// silently rejected.
         /// </summary>
@@ -947,15 +956,43 @@ namespace SS.LoadClient
                 || packetType == (byte)S2CPacketType.Weapon)
             {
                 Interlocked.Increment(ref PositionUpdatesReceived);
+
+                // The time the server stamped the position with: sixteen bits of its clock, in
+                // centiseconds, after the type and rotation bytes.
+                if (packetType == (byte)S2CPacketType.Position && span.Length >= S2C_PositionPacket.Length)
+                    NotePositionAge(System.Buffers.Binary.BinaryPrimitives.ReadUInt16LittleEndian(span.Slice(2, 2)), 0xFFFF);
             }
             else if (packetType == (byte)S2CPacketType.BatchedSmallPosition)
             {
-                Interlocked.Add(ref PositionUpdatesReceived, (span.Length - 1) / SmallPosition.Length);
+                int count = (span.Length - 1) / SmallPosition.Length;
+                Interlocked.Add(ref PositionUpdatesReceived, count);
+
+                // Ten bits of the clock per position here, the low bits of the item's first bit field,
+                // which follows its player id; so the age wraps at ten seconds. The first in the batch
+                // is enough, since they were sent together.
+                if (count > 0)
+                    NotePositionAge((ushort)(System.Buffers.Binary.BinaryPrimitives.ReadUInt16LittleEndian(span.Slice(2, 2)) & 0x3FF), 0x3FF);
             }
             else if (packetType == (byte)S2CPacketType.BatchedLargePosition)
             {
                 Interlocked.Add(ref PositionUpdatesReceived, (span.Length - 1) / LargePosition.Length);
             }
+        }
+
+        /// <summary>
+        /// Records how long ago, by the server's clock, a position just received was stamped, keeping
+        /// the largest for the stall watcher. The client's view of the server's clock comes from the
+        /// time sync and runs late by about a round trip, so an age here is never negative; a value
+        /// near the wrap is one anyway, from a stamp ahead of that view, and is ignored.
+        /// </summary>
+        private void NotePositionAge(ushort stampedCs, int mask)
+        {
+            long ageCs = ((uint)ServerTime - stampedCs) & mask;
+            if (ageCs > mask - (mask >> 4))
+                return;
+
+            if (ageCs > MaxPositionAgeCs)
+                MaxPositionAgeCs = ageCs;
         }
 
         private Task SendAckAsync(int sequenceNumber, CancellationToken cancellationToken)

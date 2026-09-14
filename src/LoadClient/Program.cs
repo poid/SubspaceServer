@@ -15,6 +15,11 @@ namespace SS.LoadClient
     /// </remarks>
     internal static class Program
     {
+        // What the generator did to itself: ticks that came late, and the worst by how much. Written by
+        // every client's tick loop, read and reset by the stall watcher once a second.
+        private static long s_lateTicks;
+        private static long s_maxTickLatenessMs;
+
         private static async Task<int> Main(string[] args)
         {
             // The packet structs encode strings as Windows-1252, which .NET does not carry by default.
@@ -80,6 +85,12 @@ namespace SS.LoadClient
 
             int connected = 0;
             long startTimestamp = Stopwatch.GetTimestamp();
+
+            // The generator watches itself from here, through the connects and the hold, for the
+            // stalls the server would otherwise be blamed for.
+            StallTotals stallTotals = new();
+            using CancellationTokenSource watchCancellation = new();
+            Task watchTask = WatchForStallsAsync(clients, startTimestamp, stallTotals, watchCancellation.Token);
 
             Task?[] setupTasks = new Task?[options.ClientCount];
 
@@ -168,7 +179,8 @@ namespace SS.LoadClient
             // the server's own ping and packet loss figures for a client of this generator, which is the
             // only way to tell a path that really loses packets from a generator that reports its counts
             // wrongly, and the two look identical from the spec count.
-            GameClient lagProbe = startedClients[0];
+            // The first client that actually got in; the first one made can be among the few that did not.
+            GameClient lagProbe = Array.Find(startedClients, c => c.IsLoggedIn) ?? startedClients[0];
             _ = Task.Run(async () =>
             {
                 try
@@ -193,6 +205,9 @@ namespace SS.LoadClient
             {
                 // Expected on shutdown.
             }
+
+            watchCancellation.Cancel();
+            await watchTask;
 
             double seconds = Stopwatch.GetElapsedTime(measureStart).TotalSeconds;
             long endTicks = Environment.TickCount64;
@@ -294,6 +309,11 @@ namespace SS.LoadClient
                 Console.WriteLine($"Clients the server stopped reaching before the end: {silentAt.Count} of {startedClients.Length}; "
                     + $"they last heard from it {silentAt[silentAt.Count / 2]:F0} s into the hold (earliest {silentAt[0]:F0}, latest {silentAt[^1]:F0}).");
             }
+
+            Console.WriteLine($"Generator: {stallTotals.StallSeconds} second(s) with a stall (the lines above marked 'stall at'); "
+                + $"ticks late by more than 50 ms: {Interlocked.Read(ref s_lateTicks)}, worst {stallTotals.MaxTickLatenessMs} ms; "
+                + $"positions arrived up to {stallTotals.MaxPositionAgeMs} ms after the server stamped them; "
+                + $"GC paused {stallTotals.GcPause.TotalMilliseconds:F0} ms in all, {stallTotals.Gen2Collections} gen2 collections.");
 
             // The server explains a refusal to the player in chat and nowhere else, so what the clients
             // were told is the only record of why a request was turned down. Over the whole run, not the
@@ -437,9 +457,22 @@ namespace SS.LoadClient
                 {
                     // 10Hz, matching a real client's SendPositionDelay of 10.
                     using PeriodicTimer timer = new(TimeSpan.FromMilliseconds(100));
+                    long lastTickTimestamp = Stopwatch.GetTimestamp();
 
                     while (await timer.WaitForNextTickAsync(token))
                     {
+                        // How late this tick came against the hundred milliseconds it was due at. A
+                        // late tick is the generator stalling, which the server sees as a spike or as
+                        // positions arriving late, so it is recorded here to be told apart from those.
+                        long tickTimestamp = Stopwatch.GetTimestamp();
+                        long lateMs = (long)Stopwatch.GetElapsedTime(lastTickTimestamp, tickTimestamp).TotalMilliseconds - 100;
+                        lastTickTimestamp = tickTimestamp;
+                        if (lateMs > 50)
+                        {
+                            Interlocked.Increment(ref s_lateTicks);
+                            RaiseToMax(ref s_maxTickLatenessMs, lateMs);
+                        }
+
                         angle += 0.1d;
                         tick++;
 
@@ -671,6 +704,92 @@ namespace SS.LoadClient
             Console.WriteLine($"Finished. {stillUp}/{loggedIn} client(s) survived the run.");
 
             return 0;
+        }
+
+        /// <summary>
+        /// Watches the generator itself, once a second, for the stalls the server would otherwise be
+        /// blamed for: a tick loop that came late, a garbage collection pause, or positions arriving
+        /// long after the server stamped them, which is what a receive backlog on this machine looks
+        /// like. Prints a line for each second that had one, with the time since the run began, so it
+        /// can be put beside the server's log.
+        /// </summary>
+        private static async Task WatchForStallsAsync(GameClient[] clients, long startTimestamp, StallTotals totals, CancellationToken cancellationToken)
+        {
+            TimeSpan lastGcPause = GC.GetTotalPauseDuration();
+
+            try
+            {
+                using PeriodicTimer timer = new(TimeSpan.FromSeconds(1));
+
+                while (await timer.WaitForNextTickAsync(cancellationToken))
+                {
+                    TimeSpan gcPause = GC.GetTotalPauseDuration();
+                    double gcPausedMs = (gcPause - lastGcPause).TotalMilliseconds;
+                    lastGcPause = gcPause;
+
+                    long lateMs = Interlocked.Exchange(ref s_maxTickLatenessMs, 0);
+
+                    long ageCs = 0;
+                    int connected = 0;
+                    foreach (GameClient? client in clients)
+                    {
+                        if (client is null)
+                            continue;
+
+                        if (client.IsConnected)
+                            connected++;
+
+                        long clientAgeCs = Interlocked.Exchange(ref client.MaxPositionAgeCs, 0);
+                        if (clientAgeCs > ageCs)
+                            ageCs = clientAgeCs;
+                    }
+
+                    totals.MaxTickLatenessMs = Math.Max(totals.MaxTickLatenessMs, lateMs);
+                    totals.MaxPositionAgeMs = Math.Max(totals.MaxPositionAgeMs, ageCs * 10);
+
+                    if (lateMs > 500 || gcPausedMs > 250 || ageCs > 100)
+                    {
+                        totals.StallSeconds++;
+                        Console.WriteLine($"  stall at {Stopwatch.GetElapsedTime(startTimestamp).TotalSeconds:F0} s ({connected} clients in): "
+                            + $"ticks late by up to {lateMs} ms, GC paused {gcPausedMs:F0} ms, positions arrived up to {ageCs * 10} ms after the server stamped them");
+                    }
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                // The run is over.
+            }
+
+            totals.GcPause = GC.GetTotalPauseDuration();
+            totals.Gen2Collections = GC.CollectionCount(2);
+        }
+
+        /// <summary>
+        /// What the stall watcher accumulated over a run, for the summary.
+        /// </summary>
+        private sealed class StallTotals
+        {
+            public int StallSeconds;
+            public long MaxTickLatenessMs;
+            public long MaxPositionAgeMs;
+            public TimeSpan GcPause;
+            public int Gen2Collections;
+        }
+
+        /// <summary>
+        /// Raises a shared maximum to <paramref name="value"/> if that is higher, without a lock.
+        /// </summary>
+        private static void RaiseToMax(ref long maximum, long value)
+        {
+            long current = Volatile.Read(ref maximum);
+            while (value > current)
+            {
+                long seen = Interlocked.CompareExchange(ref maximum, value, current);
+                if (seen == current)
+                    return;
+
+                current = seen;
+            }
         }
 
         /// <summary>

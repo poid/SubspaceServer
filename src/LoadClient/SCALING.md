@@ -2204,6 +2204,49 @@ pending (`scale/30-kick-once`), so a mass drop logs each player once. The hold a
 when the connects end rather than when the process starts, since a "150 s" hold that includes a
 forty second connect is a 110 s hold.
 
+### Third run from Windows: the windows landed, the path was clean, and the wave was the generator's
+
+With the windows inside the hold, the path answered. Over the same thirty seconds the VPS's
+interface sent every datagram its sockets did, its queue discipline dropped nothing (363 requeues,
+the driver's ring momentarily full, which delays but does not lose), and this machine's adapter
+received at least as many packets a second as the VPS sent, within the few seconds by which the two
+windows are offset. Neither end dropped a packet on receive. What the VPS did show was 4,683
+receive buffer overflows in the window, 156 a second against 59,000 in: its socket's receive buffer
+is `Net:ReceiveBufferSize`, one megabyte by default, a fifth of a second at that rate, and the
+receive thread was held off that long while the mainloop took the write lock for a wave of ship
+changes (24 writes a second, 173 ms waited, in the window). Four megabytes is the setting for the
+next run; it is what the send side already asks for.
+
+The run itself: 4,990 of 5,000 connected, in 52 s; 4,987 survived; the clients sent 10.0 a second
+each, the timer request having worked; and the last seventy seconds of the hold were clean at the
+full load, 49,900 positions a second at 18.9 in view, 942,000 sends a second, six send threads at
+45-49%, four workers at 43-45%, four vCPUs idle, no loss and no specs. **The server on this VPS
+carries 5,000 at twenty millisecond passes with room left.** What preceded that was a wave: 2,179
+players specced for server-to-client loss in the first ten seconds of the hold and 515 more twenty
+seconds later, after which they asked for ships again and came back.
+
+The wave was not loss. The specced players were the oldest three thousand, the first to connect,
+and not the youngest, whose connections were the ones under the most recent load; and the server
+had logged 916 spikes for those same players thirty seconds earlier, during the connect ramp, a
+spike being a client that stopped sending for longer than the arena's limit. So the generator
+stalled for some seconds twenty to thirty seconds into its connects, with two thousand clients in.
+A stalled generator stops reading as well as sending; its sockets fill on this machine, which
+Windows does not count as a drop, and when the tick loops resume, each client's next time sync
+reports what it had read so far, short of what the server had sent by the length of the stall. For
+a client thirty seconds old a five second backlog is a sixth of everything it was ever sent, the
+server reads it as loss, and `LagAction` specs at fifteen percent. The younger clients connected
+after the stall and never carried the shortfall. It is the same signature as the WSL2 run's wave,
+which fell on the youngest clients instead, consistent with a stall at a different moment.
+
+The load client now watches itself for exactly this, once a second from its first connect: the
+worst lateness of any tick loop, the garbage collector's pause time, and how long after the server
+stamped them positions arrive, which is the path's delay plus whatever time the datagram sat on
+this machine before the receive loop reached it. A second with a stall is printed as it happens,
+with the time since the run began, and the summary carries the totals. The cause of the stall,
+whether a collection, the thread pool, or the connects themselves, is what the next run's lines
+say; until it is known, the population at which this generator is trusted is the one where those
+lines stay empty.
+
 ## What to watch next
 
 - **A sampled profile of one send thread — DONE.** `profile-thread.sh` did it and found the firewall,

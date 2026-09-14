@@ -138,7 +138,7 @@ report_run() {
 
     echo
     echo "--- what the load client saw ---"
-    grep -E "Connected|survived|clients sent|Server sent|stopped reaching|lag view|^  [A-Za-z0-9]+: (avg|s2c|c2s|rel|effective|ploss|reliable)" "$CLIENT_LOG"
+    grep -E "Connected|survived|clients sent|Server sent|stopped reaching|stall at|^Generator:|lag view|^  [A-Za-z0-9]+: (avg|s2c|c2s|rel|effective|ploss|reliable)" "$CLIENT_LOG"
 
     echo
     echo "--- what the server did ---"
