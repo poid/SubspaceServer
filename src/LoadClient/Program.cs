@@ -310,7 +310,7 @@ namespace SS.LoadClient
                     + $"they last heard from it {silentAt[silentAt.Count / 2]:F0} s into the hold (earliest {silentAt[0]:F0}, latest {silentAt[^1]:F0}).");
             }
 
-            Console.WriteLine($"Generator: {stallTotals.StallSeconds} second(s) with a stall (the lines above marked 'stall at'); "
+            Console.WriteLine($"Generator: {stallTotals.StallSeconds} second(s) with a stall (the 'second' lines above marked STALL); "
                 + $"ticks late by more than 50 ms: {Interlocked.Read(ref s_lateTicks)}, worst {stallTotals.MaxTickLatenessMs} ms; "
                 + $"positions arrived up to {stallTotals.MaxPositionAgeMs} ms after the server stamped them; "
                 + $"GC paused {stallTotals.GcPause.TotalMilliseconds:F0} ms in all, {stallTotals.Gen2Collections} gen2 collections.");
@@ -449,6 +449,7 @@ namespace SS.LoadClient
                 // the server sees both halves and the ball or flag is there for the next client.
                 int ballToShoot = -1;
                 bool flagToDrop = false;
+                Task<bool>? shipRequest = null;
 
                 // Ships are 0 to 7 and 8 is spectator mode.
                 const int SpectatorShip = 8;
@@ -504,10 +505,13 @@ namespace SS.LoadClient
                         {
                             // Put in spectator mode without asking. The ship change enforcer allows no
                             // ship for five seconds after a change, and an arena entry inside that window
-                            // lands in spec. Ask for a ship once a second until one is given, and try
-                            // nothing else meanwhile, since flags and balls are refused from spec.
-                            if (tick % 10 == 0)
-                                await client.SendShipChangeAsync((sbyte)Random.Shared.Next(SpectatorShip), token);
+                            // lands in spec. Ask for a ship every five seconds until one is given, without
+                            // waiting for the server's acknowledgement: a reliable send waits up to three
+                            // seconds an attempt for it, and a tick loop that waits sends no positions,
+                            // which the server reads as a spike and specs again. Try nothing else
+                            // meanwhile, since flags and balls are refused from spec.
+                            if (tick % 50 == 0 && (shipRequest is null || shipRequest.IsCompleted))
+                                shipRequest = client.SendShipChangeAsync((sbyte)Random.Shared.Next(SpectatorShip), token);
 
                             continue;
                         }
@@ -710,12 +714,15 @@ namespace SS.LoadClient
         /// Watches the generator itself, once a second, for the stalls the server would otherwise be
         /// blamed for: a tick loop that came late, a garbage collection pause, or positions arriving
         /// long after the server stamped them, which is what a receive backlog on this machine looks
-        /// like. Prints a line for each second that had one, with the time since the run began, so it
-        /// can be put beside the server's log.
+        /// like. Prints a line every second, stamped with the wall clock and the time since the run
+        /// began, carrying the datagrams the clients received and sent in it, so it can be put beside
+        /// the same second of the server machine's counters; a second with a stall is marked.
         /// </summary>
         private static async Task WatchForStallsAsync(GameClient[] clients, long startTimestamp, StallTotals totals, CancellationToken cancellationToken)
         {
             TimeSpan lastGcPause = GC.GetTotalPauseDuration();
+            long lastReceived = 0;
+            long lastSent = 0;
 
             try
             {
@@ -729,6 +736,12 @@ namespace SS.LoadClient
 
                     long lateMs = Interlocked.Exchange(ref s_maxTickLatenessMs, 0);
 
+                    // Every datagram the clients received and sent, summed, so that the second can be
+                    // set beside the same second of the server machine's counters: the difference
+                    // between what it sent and what arrived here is the path's loss, on a clock both
+                    // machines keep by NTP, with no window offset to argue about.
+                    long received = 0;
+                    long sent = 0;
                     long ageCs = 0;
                     int connected = 0;
                     foreach (GameClient? client in clients)
@@ -739,20 +752,29 @@ namespace SS.LoadClient
                         if (client.IsConnected)
                             connected++;
 
+                        received += Interlocked.Read(ref client.PacketsReceived);
+                        sent += Interlocked.Read(ref client.PacketsSent);
+
                         long clientAgeCs = Interlocked.Exchange(ref client.MaxPositionAgeCs, 0);
                         if (clientAgeCs > ageCs)
                             ageCs = clientAgeCs;
                     }
 
+                    long receivedThisSecond = received - lastReceived;
+                    long sentThisSecond = sent - lastSent;
+                    lastReceived = received;
+                    lastSent = sent;
+
                     totals.MaxTickLatenessMs = Math.Max(totals.MaxTickLatenessMs, lateMs);
                     totals.MaxPositionAgeMs = Math.Max(totals.MaxPositionAgeMs, ageCs * 10);
 
-                    if (lateMs > 500 || gcPausedMs > 250 || ageCs > 100)
-                    {
+                    bool stalled = lateMs > 500 || gcPausedMs > 250 || ageCs > 100;
+                    if (stalled)
                         totals.StallSeconds++;
-                        Console.WriteLine($"  stall at {Stopwatch.GetElapsedTime(startTimestamp).TotalSeconds:F0} s ({connected} clients in): "
-                            + $"ticks late by up to {lateMs} ms, GC paused {gcPausedMs:F0} ms, positions arrived up to {ageCs * 10} ms after the server stamped them");
-                    }
+
+                    Console.WriteLine($"  second {DateTime.UtcNow:yyyy-MM-dd'T'HH:mm:ss.fff'Z'} (+{Stopwatch.GetElapsedTime(startTimestamp).TotalSeconds:F0} s, {connected} in): "
+                        + $"received {receivedThisSecond} datagrams, sent {sentThisSecond}, ticks late up to {lateMs} ms, positions aged up to {ageCs * 10} ms, GC paused {gcPausedMs:F0} ms"
+                        + (stalled ? " STALL" : ""));
                 }
             }
             catch (OperationCanceledException)

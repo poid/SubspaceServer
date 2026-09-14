@@ -229,4 +229,8 @@ if ! scp "${SSH_OPTS[@]}" "$SERVER_SSH:$REMOTE_REPO/loadtest-results/${LABEL// /
     exit 1
 fi
 
+# The server machine's second-by-second counters, for the path section of the report.
+SERVER_SECONDS_LOG="$OUT/${LABEL// /_}.server-seconds.log"
+scp "${SSH_OPTS[@]}" "$SERVER_SSH:$REMOTE_REPO/loadtest-results/${LABEL// /_}.server-seconds.log" "$SERVER_SECONDS_LOG" >/dev/null 2>&1 || SERVER_SECONDS_LOG=""
+
 report_run

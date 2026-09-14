@@ -55,7 +55,7 @@ if [ "$(pgrep -xc SubspaceServer || true)" -gt 0 ]; then
 fi
 
 if [ -f "$GLOBAL_CONF" ]; then
-    echo "config: $(grep -E '^[[:space:]]*(SendThreads|MaxSendThreads|Workers|HandlePacketsOnArenaThread|UseArenaLocalPlayerIds|SendInterval)[[:space:]]*=' \
+    echo "config: $(grep -E '^[[:space:]]*(SendThreads|MaxSendThreads|Workers|HandlePacketsOnArenaThread|UseArenaLocalPlayerIds|SendInterval|ReceiveBufferSize|SendBufferSize)[[:space:]]*=' \
         "$GLOBAL_CONF" | tr -s ' ' | paste -sd'; ' -)"
 else
     echo "FAILED: no global.conf at $GLOBAL_CONF; set ZONE_DIR if the zone is elsewhere."
@@ -103,6 +103,37 @@ fi
 echo "READY"
 
 mapfile -t PIDS < <(pgrep -x SubspaceServer)
+
+# Every second for the life of the server, stamped with the wall clock: what this machine sent and
+# received, and what it dropped on the way out or refused on the way in. The client side writes the
+# same seconds from its end, and the report puts the two together, which is the only way to see a
+# loss that lasts seconds rather than a window, and to say which side of the path it was on.
+sample_seconds() {
+    local pid="$1" iface
+    local in_prev out_prev ovf_prev qd_prev rq_prev txd_prev
+    local in out ovf qd rq txd
+    iface="$(net_interface)"
+    read -r in_prev out_prev _ ovf_prev _ <<< "$(udp_counters)"
+    read -r qd_prev rq_prev <<< "$(qdisc_counters "$iface")"
+    read -r _ _ _ txd_prev _ _ <<< "$(interface_counters "$iface")"
+    [ "$qd_prev" = "-" ] && qd_prev=0 && rq_prev=0
+    while kill -0 "$pid" 2>/dev/null; do
+        sleep 1
+        read -r in out _ ovf _ <<< "$(udp_counters)"
+        read -r qd rq <<< "$(qdisc_counters "$iface")"
+        read -r _ _ _ txd _ _ <<< "$(interface_counters "$iface")"
+        [ "$qd" = "-" ] && qd=0 && rq=0
+        printf '%s out=%d in=%d overflows=%d qdisc_dropped=%d requeues=%d tx_dropped=%d\n' \
+            "$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)" \
+            $(( out - out_prev )) $(( in - in_prev )) $(( ovf - ovf_prev )) $(( qd - qd_prev )) $(( rq - rq_prev )) $(( txd - txd_prev ))
+        in_prev=$in; out_prev=$out; ovf_prev=$ovf; qd_prev=$qd; rq_prev=$rq; txd_prev=$txd
+    done
+}
+SECONDS_LOG="$OUT/${LABEL// /_}.server-seconds.log"
+if [ "${#PIDS[@]}" -eq 1 ]; then
+    sample_seconds "${PIDS[0]}" > "$SECONDS_LOG" 2>/dev/null &
+    SAMPLER_PID=$!
+fi
 if [ "${#PIDS[@]}" -ne 1 ]; then
     echo "FAILED: expected exactly one SubspaceServer, found ${#PIDS[@]}."
     exit 1
@@ -143,6 +174,7 @@ while kill -0 "$PID" 2>/dev/null; do
     sleep 2
 done
 
+[ -n "${SAMPLER_PID:-}" ] && { kill "$SAMPLER_PID" 2>/dev/null; wait "$SAMPLER_PID" 2>/dev/null; }
 restore_conf
 trap - EXIT
 echo "DONE $SERVER_LOG"

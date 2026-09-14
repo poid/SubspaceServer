@@ -991,6 +991,12 @@ namespace SS.LoadClient
             if (ageCs > mask - (mask >> 4))
                 return;
 
+            // A stamp the server made from a sender whose own clock was wrong, which a client just
+            // in and not yet synced can be, reads as minutes of age here. No socket on this machine
+            // holds thirty seconds of a client's traffic, so nothing above that is a backlog.
+            if (ageCs > 3000)
+                return;
+
             if (ageCs > MaxPositionAgeCs)
                 MaxPositionAgeCs = ageCs;
         }

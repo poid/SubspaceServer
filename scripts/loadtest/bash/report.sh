@@ -115,6 +115,68 @@ print("\t".join([
 PY
 }
 
+# The server machine's seconds (server-side.sh's sampler) beside the load client's (its stall
+# watcher), matched by wall clock. What the server machine sent minus what the clients received in
+# the same second is the path's loss in that second; the server machine's own drop counters on the
+# same line say whether it was lost before it left. Two clocks kept by NTP and two samplers that are
+# not in step put up to a second of skew between the series, so single seconds are read with that
+# in mind and the totals over the hold are the figure to trust.
+align_seconds() {
+    python3 - "$SERVER_SECONDS_LOG" "$CLIENT_LOG" <<'PY'
+import re
+import sys
+
+server = {}
+for line in open(sys.argv[1], errors="replace"):
+    m = re.match(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)\.\d+Z out=(\d+) in=(\d+) overflows=(\d+) qdisc_dropped=(\d+) requeues=(\d+) tx_dropped=(\d+)", line)
+    if m:
+        server[m.group(1)] = tuple(int(x) for x in m.groups()[1:])
+
+client = {}
+for line in open(sys.argv[2], errors="replace"):
+    m = re.match(r"\s+second (\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)\.\d+Z \(\+(\d+) s, (\d+) in\): received (\d+) datagrams, sent (\d+)", line)
+    if m:
+        client[m.group(1)] = (int(m.group(2)), int(m.group(3)), int(m.group(4)), int(m.group(5)))
+
+# Only the hold, and only once the clients are all in: the ramp's rates change too fast within a
+# second for the two clocks' skew.
+peak = max((c[1] for c in client.values()), default=0)
+seconds = sorted(k for k in server if k in client and client[k][1] >= peak and server[k][0] > 1000)
+if not seconds:
+    print("no second had both machines' counters; the server-seconds log or the client's second lines are missing")
+    sys.exit(0)
+
+out_total = sum(server[k][0] for k in seconds)
+rx_total = sum(client[k][2] for k in seconds)
+in_total = sum(server[k][1] for k in seconds)
+tx_total = sum(client[k][3] for k in seconds)
+qdrop = sum(server[k][3] for k in seconds)
+requeues = sum(server[k][4] for k in seconds)
+txdrop = sum(server[k][5] for k in seconds)
+overflows = sum(server[k][2] for k in seconds)
+
+def pct(short, total):
+    return 100.0 * short / total if total else 0.0
+
+print(f"Over {len(seconds)} seconds with everyone in: the server machine sent {out_total // len(seconds):,} datagrams/s and the clients received {rx_total // len(seconds):,}"
+      f" ({pct(out_total - rx_total, out_total):.1f}% short); the clients sent {tx_total // len(seconds):,}/s and the server machine received {in_total // len(seconds):,} ({pct(tx_total - in_total, tx_total):.1f}% short).")
+print(f"On the server machine over those seconds: queue discipline dropped {qdrop}, requeues {requeues}, interface dropped {txdrop} on send, socket receive overflows {overflows}.")
+
+bad = [(k, pct(server[k][0] - client[k][2], server[k][0])) for k in seconds]
+bad = [(k, p) for k, p in bad if p >= 8.0]
+if bad:
+    worst = max(bad, key=lambda kp: kp[1])
+    print(f"Seconds where the clients received at least 8% less than the server machine sent: {len(bad)}, worst {worst[1]:.0f}% at {worst[0]}Z (+{client[worst[0]][0]} s).")
+    for k, p in bad[:12]:
+        s = server[k]
+        print(f"  {k}Z (+{client[k][0]} s): sent {s[0]:,}, received {client[k][2]:,} ({p:.0f}% short); server machine qdisc dropped {s[3]}, requeues {s[4]}, overflows {s[2]}")
+    if len(bad) > 12:
+        print(f"  ... and {len(bad) - 12} more")
+else:
+    print("No second where the clients received 8% or more less than the server machine sent.")
+PY
+}
+
 report_run() {
     # The row is held rather than appended straight away, so that a failed extraction cannot leave the
     # report reading the previous run's row out of the results file and presenting it as this one's.
@@ -138,7 +200,13 @@ report_run() {
 
     echo
     echo "--- what the load client saw ---"
-    grep -E "Connected|survived|clients sent|Server sent|stopped reaching|stall at|^Generator:|lag view|^  [A-Za-z0-9]+: (avg|s2c|c2s|rel|effective|ploss|reliable)" "$CLIENT_LOG"
+    grep -E "Connected|survived|clients sent|Server sent|stopped reaching|STALL|^Generator:|lag view|^  [A-Za-z0-9]+: (avg|s2c|c2s|rel|effective|ploss|reliable)" "$CLIENT_LOG"
+
+    if [ -n "${SERVER_SECONDS_LOG:-}" ] && [ -f "$SERVER_SECONDS_LOG" ]; then
+        echo
+        echo "--- the path, second by second ---"
+        align_seconds
+    fi
 
     echo
     echo "--- what the server did ---"

@@ -2247,6 +2247,43 @@ whether a collection, the thread pool, or the connects themselves, is what the n
 say; until it is known, the population at which this generator is trusted is the one where those
 lines stay empty.
 
+### Fourth run: the stall was not a stall, and the loss is measured by the second now
+
+The watcher's lines came back and said the opposite of what the third run's reading predicted.
+Positions arrived 90 to 200 milliseconds after the server stamped them, every second of the hold,
+wave included: no receive backlog on this machine, at any point. The collector paused 331 ms in
+the whole run. And the "late ticks" were 2,966, 5,990, 9,008, 12,027 and 14,990 ms: multiples of
+three seconds, which is the client's reliable send timeout. A client the server had specced asked
+for a ship every second, the request is reliable, the tick loop awaited its acknowledgement, and
+when the acknowledgement was lost the loop stood still for three seconds an attempt. Those were
+single clients waiting on a lost packet, not the generator stalling; the summary's maximum across
+five thousand loops made them look like one. The ship request no longer blocks the loop and is
+made every five seconds at most.
+
+So the third run's explanation of the wave, a stall and a backlog, was wrong, and the wave is
+back to being loss the server measured: 2,414 specced in one window, this time the *youngest*
+clients, and the probe on the oldest client at twenty seconds into the hold read 11.1% server to
+client, 4.7% on the reliable stream, none the other way. A burst of loss shared by everyone shows
+first on the clients with the fewest packets to dilute it, which is what young clients are, and
+that is what this run's distribution says; the third run's fell on the oldest, which no single
+story yet covers. The machine windows again showed the VPS's interface and queue discipline
+dropping nothing over their thirty seconds and this machine's adapter receiving what was sent
+within the offset between the two windows, and that offset, a few seconds between two thirty
+second windows on a rate that was changing, is exactly what stops them resolving a few percent.
+
+The instrument that resolves it is in the harness now. The server side samples its machine every
+second for the life of the server, stamped by the wall clock: datagrams out and in, the queue
+discipline's drops and requeues, the interface's drops, the socket overflows. The client prints
+the same seconds from its end, the datagrams all its clients received and sent, from the same NTP
+clock. The report matches the two by the second over the hold and prints the total shortfall, the
+seconds where the clients received eight percent or more less than the server machine sent, and
+on each such second what the server machine's own counters dropped. Loss on the path shows as a
+shortfall with clean server-side counters; loss at the VPS's egress shows as a shortfall with
+queue discipline drops on the same second; a counting fault in the client shows as no shortfall at
+all beside a server that still specs. Two clocks and two samplers put up to a second of skew
+between the series, so the totals over the hold are the figure to trust and single seconds are
+read with that in mind. The next 5,000 run is the first with it.
+
 ## What to watch next
 
 - **A sampled profile of one send thread — DONE.** `profile-thread.sh` did it and found the firewall,
