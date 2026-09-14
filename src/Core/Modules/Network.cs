@@ -3472,9 +3472,9 @@ namespace SS.Core.Modules
                 if (_stopToken.IsCancellationRequested)
                     return;
 
-                // Wait at least 1 tick from the start of the iteration, 1/100 second
+                // Wait out the rest of the interval, measured from the start of the iteration.
                 long busyTicks = Stopwatch.GetTimestamp() - start;
-                int msToWait = (10 - (int)Math.Floor(Stopwatch.GetElapsedTime(start).TotalMilliseconds));
+                int msToWait = (_config.SendInterval - (int)Math.Floor(Stopwatch.GetElapsedTime(start).TotalMilliseconds));
 
                 IServerMetrics? serverMetrics = _serverMetrics;
                 if (serverMetrics is not null && serverMetrics.IsEnabled)
@@ -3516,14 +3516,14 @@ namespace SS.Core.Modules
                 }
 
 #if CFG_LOG_SEND_THREAD_PERFORMANCE
-                if (msToWait < 10)
+                if (msToWait < _config.SendInterval)
                 {
                     _logManager.LogM(LogLevel.Drivel, nameof(Network), $"SendThread wait {msToWait} ms.");
                 }
 #endif
                 if (msToWait <= 0)
                 {
-                    // The processing took 10 ms or longer. Continue processing again immediately.
+                    // The processing took the whole interval or longer. Continue processing again immediately.
                     continue;
                 }
                 else
@@ -7330,6 +7330,25 @@ namespace SS.Core.Modules
             public SendThreadWaitOption SendThreadWaitOption { get; private set; }
 
             /// <summary>
+            /// How often each send thread makes a pass over its connections, in milliseconds.
+            /// </summary>
+            [ConfigHelp<int>("Net", "SendInterval", ConfigScope.Global, Default = 10, Min = 5, Max = 100,
+                Description = """
+                    How often each send thread makes a pass over its connections, in milliseconds.
+                    Every pass sends each connection everything queued for it since the last, merged
+                    into as few datagrams as it fits, so the interval sets two things at once: how long
+                    a position can wait before it is sent, and how many datagrams the server sends for
+                    the same positions. Ten, the default, is what the server has always done. Twenty
+                    sends about half as many datagrams for the same positions, each carrying twice as
+                    much, and adds up to ten milliseconds to the wait.
+                    A hosted machine's network interface has a limit on packets per second that can be
+                    reached before the server's threads are: measured at about 270,000 a second on one,
+                    with the send threads at half load and two cores idle. This is the setting that
+                    trades latency for room under that limit.
+                    """)]
+            public int SendInterval { get; private set; }
+
+            /// <summary>
             /// Display total or playing in simple ping responses.
             /// </summary>
             [ConfigHelp<PingPopulationMode>("Net", "SimplePingPopulationMode", ConfigScope.Global, Default = PingPopulationMode.Total,
@@ -7370,6 +7389,7 @@ namespace SS.Core.Modules
                 PerPacketOverhead = configManager.GetInt(configManager.Global, "Net", "PerPacketOverhead", 28);
                 PingRefreshThreshold = TimeSpan.FromMilliseconds(10 * configManager.GetInt(configManager.Global, "Net", "PingDataRefreshTime", 200));
                 SendThreadWaitOption = configManager.GetEnum(configManager.Global, "Net", "SendThreadWaitOption", SendThreadWaitOption.Sleep);
+                SendInterval = int.Clamp(configManager.GetInt(configManager.Global, "Net", "SendInterval", NetSettings.SendInterval.Default), 5, 100);
                 UseAlternateTimerMode = configManager.GetBool(configManager.Global, "Net", "UseAlternateTimerMode", false);
             }
         }
