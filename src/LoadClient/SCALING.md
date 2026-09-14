@@ -2002,6 +2002,61 @@ and the mainloop, adds up to under two cores at 10,000. That puts nominal-latenc
 capacity near 8,000 and graceful capacity above 10,000, with the firewall's fifth of every datagram
 the largest single cost that is not the server's own. Combat roughly doubles the send side.
 
+## With the generator on another machine: clean to 3,000, and the interface gives out at 4,000
+
+The load client on the development box, the server alone on the VPS, over the internet through a
+home router and WSL2's own NAT. Release, a hundred per arena, `--spread 16384`, connects 3 ms
+apart, 150 second holds, arena-local ids on, `MaxSendThreads = 6`. Run by `remote-loadtest.sh`,
+with `server-side.sh` taking the VPS's whole-machine window from `/proc` and the same window taken
+here for the load client's process.
+
+Three things had to be fixed in the load client before the first clean run, none of them the
+server's. It stamped positions with its own machine's clock, which the server compares against its
+own from arena entry, so nothing was ever newer and nothing was broadcast; on the same machine the
+two clocks had been the same counter. It reported only its positions in the time sync request, so
+the server derived client-to-server loss that was not there and specced 621 of 1,000 for it. And
+the sync itself did not exist, for the same same-machine reason. The server needed one fix: its
+send socket had the kernel's default buffer, and on a real interface a datagram is charged to the
+buffer until the interface takes it, so the connect ramp of 2,000 refused 2,517 datagrams with a
+stack trace each. `Net:SendBufferSize` now, with refusals counted in `?netstats` rather than
+logged one by one.
+
+| clients | server cores | send threads | workers | idle | datagrams/s out | delivered | rel ping | loss s2c / c2s | specced |
+|---|---|---|---|---|---|---|---|---|---|
+| 200 | 0.35 | 2 at 10% | 4% | 7.38 | 11k | 100% | | | 0 |
+| 1,000 | 1.53 | 3 at 35% | 17% | 5.73 | 74k | 99.8% | | 0 / 0 | 0 |
+| 2,000 | 2.86 | 4 at 46% | 31% | 4.87 | 151k | 100% | | 0 / 0 | 0 |
+| 3,000 | 3.59 | 5 at 48% | 45% | 4.17 | 214k | 100% | 27 ms | 0.3 / 1.2 | 0 |
+| 4,000 | 4.98 | 6 at 49% | 46% | 2.19 | 271k | 71% | 41 ms | 9.0 / 0.5 | 3,772 |
+
+"rel ping" and the loss figures are the server's own view of one client, asked with `?lag -v`
+twenty seconds into the hold; the load client now does that itself, and it is the only way to tell
+a path that loses packets from a generator that reports its counts wrongly.
+
+**At 4,000 the VPS's network interface stopped taking packets.** The send socket refused 12,600
+datagrams a second with its 4 MB buffer full, `fq_codel` on the interface had dropped 400,000 for
+latency with its packet limit untouched, and the driver was refusing with its transmit ring full.
+About 270,000 datagrams a second is what that virtual interface takes, and that is the host's
+limit, not the guest's: the send threads were at half load, two cores were idle, the workers at
+46%. Everything else in that row follows from it, the 9% loss, the reliable resends, the clients
+receiving 106 updates a second instead of 190, and the server speccing 3,772 of them for the loss.
+
+The generator's side was not the limit: 2.6 cores of 32, no overflows, and the reliable round trip
+at 27 to 41 ms. Its position stamps did fall a second behind at 4,000, which is its sends stalling
+in its own virtual interface; the total through WSL2's path sat at about 250,000 datagrams a second
+in both the 3,000 and 4,000 runs, so it may have a ceiling of its own near the VPS's.
+
+**What the server alone holds on this VPS is about 3,500, at ten millisecond send passes, and the
+interface's packet rate is what says so.** With the box to itself the server is 0.35 cores at 200
+and about 1.2 per thousand after, growing send threads as it goes, and nothing of the server's is
+near a wall at 4,000. Against the same-box series, which reached 5,000 through loopback, the
+difference is entirely that loopback has no packet rate.
+
+`Net:SendInterval` is the lever against a packet rate limit, added on `scale/28`. Each pass sends
+every connection what queued since the last, merged into as few datagrams as fit, so a twenty
+millisecond pass sends about half the datagrams for the same positions, each carrying twice as
+much, at up to ten milliseconds more delay before a position goes out. Not yet measured.
+
 ## What to watch next
 
 - **A sampled profile of one send thread — DONE.** `profile-thread.sh` did it and found the firewall,
@@ -2018,13 +2073,12 @@ the largest single cost that is not the server's own. Combat roughly doubles the
 - **Whole-machine utilisation during every run — DONE.** `validate.sh` records the server's cores, the
   rest of the machine, idle and the kernel's UDP overflows over the perf window, and warns under a
   core idle.
-- **Moving the load generator off the box — the harness can now do it.** `remote-loadtest.sh`
-  runs the load client here and the server on another machine over SSH, with `server-side.sh`
-  taking the whole-machine window there from `/proc`, and reports through the same code as a local
-  run. The Release limit series above ran the pair to 5,000 with the box under half a core idle from
-  3,000 on, so everything past 3,000 is the pair's number, and the extrapolation to a box of its
-  own is waiting on this run. What bounds a run from a home connection is the router's table of UDP
-  flows, one per client, and the downstream link, about 2 KB/s per client with arena-local ids.
+- **Moving the load generator off the box — DONE, see "With the generator on another machine"
+  above.** Clean to 3,000; the VPS's interface stops taking packets at about 270,000 a second, which
+  the server reaches near 3,500 at ten millisecond passes with its own threads at half load.
+- **`Net:SendInterval = 20` at 4,000 and 5,000.** Half the datagrams for the same positions, up to
+  ten milliseconds more delay. If the interface is the wall, this moves it; the run says by how much,
+  and the send socket's refusals and the server's lag view of one client are the two lines to read.
 - **Position latency, which the send side degrades by and nothing here sees.** Past its interval a
   send thread stretches its pass and batches more per datagram, so delivery stays above 99% while
   every position arrives later. The load client could stamp each position it sends and read the age

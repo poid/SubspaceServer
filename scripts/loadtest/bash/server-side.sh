@@ -53,7 +53,7 @@ if [ "$(pgrep -xc SubspaceServer || true)" -gt 0 ]; then
 fi
 
 if [ -f "$GLOBAL_CONF" ]; then
-    echo "config: $(grep -E '^[[:space:]]*(SendThreads|MaxSendThreads|Workers|HandlePacketsOnArenaThread|UseArenaLocalPlayerIds)[[:space:]]*=' \
+    echo "config: $(grep -E '^[[:space:]]*(SendThreads|MaxSendThreads|Workers|HandlePacketsOnArenaThread|UseArenaLocalPlayerIds|SendInterval)[[:space:]]*=' \
         "$GLOBAL_CONF" | tr -s ' ' | paste -sd'; ' -)"
 else
     echo "FAILED: no global.conf at $GLOBAL_CONF; set ZONE_DIR if the zone is elsewhere."
