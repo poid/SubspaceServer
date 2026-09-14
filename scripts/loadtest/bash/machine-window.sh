@@ -45,10 +45,68 @@ udp_counters() {
     }' /proc/net/snmp
 }
 
+# The interface the default route leaves by, which is the one the clients are behind when they are
+# on another machine.
+net_interface() {
+    ip route show default 2>/dev/null | awk '{ for (i = 1; i <= NF; i++) if ($i == "dev") { print $(i + 1); exit } }'
+}
+
+# The interface's own counters: packets each way, and what it dropped or errored each way. A drop
+# here is after the socket and the queue discipline, in the driver or the virtual NIC.
+interface_counters() {
+    local dir="/sys/class/net/$1/statistics"
+    local rx_packets tx_packets rx_dropped tx_dropped rx_errors tx_errors
+    read -r rx_packets < "$dir/rx_packets" 2>/dev/null || rx_packets=0
+    read -r tx_packets < "$dir/tx_packets" 2>/dev/null || tx_packets=0
+    read -r rx_dropped < "$dir/rx_dropped" 2>/dev/null || rx_dropped=0
+    read -r tx_dropped < "$dir/tx_dropped" 2>/dev/null || tx_dropped=0
+    read -r rx_errors < "$dir/rx_errors" 2>/dev/null || rx_errors=0
+    read -r tx_errors < "$dir/tx_errors" 2>/dev/null || tx_errors=0
+    echo "$rx_packets $tx_packets $rx_dropped $tx_dropped $rx_errors $tx_errors"
+}
+
+# The root queue discipline's drops and requeues, which is where a burst that the interface cannot
+# take at line rate goes missing: fq_codel drops for latency once its queue is standing, and a
+# requeue is the driver refusing a packet because its ring was full. Reading the statistics needs no
+# privilege. The root's line is the first with "dropped" in it; an mq root sums its children there.
+qdisc_counters() {
+    if ! command -v tc >/dev/null 2>&1; then
+        echo "- -"
+        return
+    fi
+    tc -s qdisc show dev "$1" 2>/dev/null | awk '
+        /dropped/ {
+            for (i = 1; i <= NF; i++) {
+                if ($i == "(dropped") dropped = $(i + 1)
+                if ($i == "requeues") requeues = $(i + 1)
+            }
+            gsub(/[,)]/, "", dropped); gsub(/[,)]/, "", requeues)
+            print dropped + 0, requeues + 0
+            exit
+        }'
+}
+
+# Datagrams the kernel dropped for want of room in a processor's backlog queue, summed over the
+# processors; the second column of each softnet_stat line, in hex.
+softnet_dropped() {
+    local total=0 line
+    while read -r line; do
+        set -- $line
+        total=$(( total + 16#$2 ))
+    done < /proc/net/softnet_stat
+    echo "$total"
+}
+
 machine_window_begin() {
     MACHINE_WINDOW_PID="$1"
+    MACHINE_WINDOW_IF="$(net_interface)"
     read -ra CPU_BEFORE < /proc/stat
     read -r UDP_IN_BEFORE UDP_OUT_BEFORE UDP_INERR_BEFORE UDP_RCVBUF_BEFORE UDP_SNDBUF_BEFORE <<< "$(udp_counters)"
+    if [ -n "$MACHINE_WINDOW_IF" ]; then
+        read -r IF_RX_BEFORE IF_TX_BEFORE IF_RXDROP_BEFORE IF_TXDROP_BEFORE IF_RXERR_BEFORE IF_TXERR_BEFORE <<< "$(interface_counters "$MACHINE_WINDOW_IF")"
+        read -r QDISC_DROP_BEFORE QDISC_REQUEUE_BEFORE <<< "$(qdisc_counters "$MACHINE_WINDOW_IF")"
+        SOFTNET_BEFORE="$(softnet_dropped)"
+    fi
     PROC_BEFORE="$(process_ticks "$MACHINE_WINDOW_PID")"
     WALL_BEFORE="$(date +%s%N)"
 }
@@ -56,6 +114,11 @@ machine_window_begin() {
 machine_window_end() {
     WALL_AFTER="$(date +%s%N)"
     PROC_AFTER="$(process_ticks "$MACHINE_WINDOW_PID")"
+    if [ -n "$MACHINE_WINDOW_IF" ]; then
+        SOFTNET_AFTER="$(softnet_dropped)"
+        read -r QDISC_DROP_AFTER QDISC_REQUEUE_AFTER <<< "$(qdisc_counters "$MACHINE_WINDOW_IF")"
+        read -r IF_RX_AFTER IF_TX_AFTER IF_RXDROP_AFTER IF_TXDROP_AFTER IF_RXERR_AFTER IF_TXERR_AFTER <<< "$(interface_counters "$MACHINE_WINDOW_IF")"
+    fi
     read -r UDP_IN_AFTER UDP_OUT_AFTER UDP_INERR_AFTER UDP_RCVBUF_AFTER UDP_SNDBUF_AFTER <<< "$(udp_counters)"
     read -ra CPU_AFTER < /proc/stat
 }
@@ -128,5 +191,29 @@ machine_window_print() {
         echo "      drained. The server's socket has its own drop counter in ?metrics; if that did not move,"
         echo "      these were other sockets on this machine, and with the load generator here that means"
         echo "      any shortfall in what the clients received is the generator's, not the server's."
+    fi
+
+    # Past the sockets: the interface itself and the queue discipline in front of it. A datagram the
+    # socket accepted can still be lost here, and this is the only place that shows it. Send buffer
+    # errors above are the socket refusing; qdisc drops are the queue giving up on latency; interface
+    # drops are the driver or the virtual NIC.
+    if [ -n "${MACHINE_WINDOW_IF:-}" ]; then
+        echo
+        echo "--- the interface $MACHINE_WINDOW_IF over the same window ---"
+        printf '%s packets/s in, %s out; dropped in %s, out %s; errors in %s, out %s\n' \
+            "$(echo "($IF_RX_AFTER - $IF_RX_BEFORE) / $elapsed" | bc)" \
+            "$(echo "($IF_TX_AFTER - $IF_TX_BEFORE) / $elapsed" | bc)" \
+            "$(( IF_RXDROP_AFTER - IF_RXDROP_BEFORE ))" \
+            "$(( IF_TXDROP_AFTER - IF_TXDROP_BEFORE ))" \
+            "$(( IF_RXERR_AFTER - IF_RXERR_BEFORE ))" \
+            "$(( IF_TXERR_AFTER - IF_TXERR_BEFORE ))"
+        if [ "$QDISC_DROP_AFTER" = "-" ]; then
+            echo "queue discipline: tc is not installed here, so its drops are not known"
+        else
+            printf 'queue discipline dropped %s, requeues %s; backlog queue dropped %s\n' \
+                "$(( QDISC_DROP_AFTER - QDISC_DROP_BEFORE ))" \
+                "$(( QDISC_REQUEUE_AFTER - QDISC_REQUEUE_BEFORE ))" \
+                "$(( SOFTNET_AFTER - SOFTNET_BEFORE ))"
+        fi
     fi
 }

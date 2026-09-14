@@ -27,8 +27,9 @@
 #                   here, which is the same IL on any platform. From WSL, "dotnet.exe" runs it on
 #                   Windows itself, with its sockets on Windows' stack rather than behind WSL's NAT,
 #                   which was measured to lose packets at about 240,000 datagrams a second in total.
-#                   The machine window for the load client is skipped then, since a Windows process is
-#                   not visible from here.
+#                   A Windows process is not visible from /proc, so the load client's machine window
+#                   is then taken through powershell.exe instead (windows-window.sh): the client's
+#                   processor time, idle, Windows' UDP counters and each adapter's discards.
 #
 # Requirements:
 #   - SSH to the server machine. One connection is opened and shared for the whole run, so a password
@@ -55,6 +56,8 @@ STARTUP_ALLOWANCE=420
 . "$SCRIPT_DIR/report.sh"
 # shellcheck source=machine-window.sh
 . "$SCRIPT_DIR/machine-window.sh"
+# shellcheck source=windows-window.sh
+. "$SCRIPT_DIR/windows-window.sh"
 
 usage() {
     grep '^#' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' | sed -n '2,36p'
@@ -164,18 +167,31 @@ for _ in $(seq 1 $((STARTUP_ALLOWANCE / 2))); do
 done
 
 GENERATOR_WINDOW=""
-if [ -n "${CLIENT_DOTNET:-}" ]; then
-    GENERATOR_WINDOW="(the load client ran under $CLIENT_DOTNET, outside this environment, so its machine was not measured)"
-elif grep -q '^Holding' "$CLIENT_LOG" 2>/dev/null; then
+if grep -q '^Holding' "$CLIENT_LOG" 2>/dev/null; then
+    # Tell the server side the hold has begun. It waits the same twenty seconds before its window,
+    # so the two windows cover the same stretch of the hold.
+    remote "touch '$REMOTE_REPO/loadtest-results/${LABEL// /_}.holding'" 2>/dev/null || true
     sleep 20
-    # dotnet run starts the built executable as a child, named after the project; that child is the
-    # one doing the work, not the dotnet run process above it.
-    GENERATOR_PID="$(pgrep -f '/SS\.LoadClient --protocol' | head -1)"
-    if [ -n "$GENERATOR_PID" ]; then
-        machine_window_begin "$GENERATOR_PID"
-        sleep 30
-        machine_window_end
-        GENERATOR_WINDOW="$(machine_window_print 30 "load client" 2>&1)"
+
+    if [ -n "${CLIENT_DOTNET:-}" ]; then
+        if windows_window_available; then
+            windows_window_begin
+            sleep 30
+            windows_window_end
+            GENERATOR_WINDOW="$(windows_window_print 30 2>&1)"
+        else
+            GENERATOR_WINDOW="(the load client ran under $CLIENT_DOTNET, outside this environment, and powershell.exe is not reachable, so its machine was not measured)"
+        fi
+    else
+        # dotnet run starts the built executable as a child, named after the project; that child is
+        # the one doing the work, not the dotnet run process above it.
+        GENERATOR_PID="$(pgrep -f '/SS\.LoadClient --protocol' | head -1)"
+        if [ -n "$GENERATOR_PID" ]; then
+            machine_window_begin "$GENERATOR_PID"
+            sleep 30
+            machine_window_end
+            GENERATOR_WINDOW="$(machine_window_print 30 "load client" 2>&1)"
+        fi
     fi
 fi
 

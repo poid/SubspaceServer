@@ -1,5 +1,6 @@
 ﻿using SS.Packets.Game;
 using System.Diagnostics;
+using System.Runtime.InteropServices;
 using System.Text;
 
 namespace SS.LoadClient
@@ -18,6 +19,17 @@ namespace SS.LoadClient
         {
             // The packet structs encode strings as Windows-1252, which .NET does not carry by default.
             Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
+
+            // On Windows the timers this client is built on, the tick's PeriodicTimer and the
+            // Task.Delay between connects, fire on the system timer, whose default resolution is
+            // 15.6 ms. A 100 ms tick then lands at about 104 ms and ten positions a second become
+            // 9.6, which was measured running from Windows against a remote server. Asking for a
+            // 1 ms resolution puts the tick where it is meant to be; the request lasts for the life
+            // of the process, so it is never given back.
+            if (OperatingSystem.IsWindows())
+            {
+                _ = TimeBeginPeriod(1);
+            }
 
             Options? options = Options.Parse(args);
             if (options is null)
@@ -639,5 +651,11 @@ namespace SS.LoadClient
 
             return 0;
         }
+
+        /// <summary>
+        /// Asks Windows for a finer system timer, in milliseconds. Only ever called on Windows.
+        /// </summary>
+        [DllImport("winmm.dll", EntryPoint = "timeBeginPeriod")]
+        private static extern uint TimeBeginPeriod(uint milliseconds);
     }
 }

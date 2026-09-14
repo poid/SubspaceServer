@@ -2105,6 +2105,71 @@ Windows process is invisible to `/proc` here, so the harness skips the generator
 in that mode, and the generator's own limit on this path is now a thing to be found rather than a
 number already known.
 
+### Five thousand from Windows: the loss is not the generator's, and a race at shutdown
+
+The 5,000 run repeated that way (`win-5000`: 50 arenas, 150 s, `Workers = 4`, `SendInterval = 20`,
+Release, six send threads) came back the same shape as the WSL2 one. All 5,000 connected, in 90 s
+rather than 15 because each connect is a handshake of round trips to the VPS and they are
+sequential; 4,999 survived. The server broadcast the whole offered load, 49,400 positions a second
+at 19 in view, for three windows once everyone was in, with its six send threads at 44% of their
+interval and the four workers at 36-40%. Then 1,752 clients were specced for `s2c ploss` inside
+twenty seconds, 13 more for spikes, and the broadcast rate stepped down to 35,000 and stayed there,
+which is what 35% of the players being spectators looks like. The `?lag` probe on the first client
+at twenty seconds showed the loss as it began: 3.35% server to client, 1.83% on the reliable
+stream, both other directions at zero, and the reliable round trip at 40 ms.
+
+Two things came out of the numbers that were not the run's point.
+
+**The server side's window was a ramp window.** `server-side.sh` took its whole-machine window after
+four metrics windows with positions in them, forty seconds after the first position arrived, and
+with a ninety second connect that is halfway up the ramp: the 3.88 cores and 148,887 datagrams a
+second it reported are for about 3,000 players, not 5,000. The client side now tells the server
+side when the hold has begun, over the same SSH connection, and both windows start twenty seconds
+after that, so they cover the same stretch. The results line, which comes from the metrics windows
+rather than the machine window, was not affected.
+
+**The loss was not in the generator.** That was the whole question, and Windows answers it with
+counters this machine did not have from inside WSL2: its UDP layer had recorded no receive errors
+and the physical adapter no discards, cumulatively, since the machine was booted, so nothing that
+reached this machine was dropped by it. The packets went missing between the VPS's sockets and this
+machine's adapter. That puts the WSL2 run's loss in doubt too: at 5,000 the WSL2 generator specced
+2,222 and the Windows one 1,752, from the same server sending at the same rate, and the one thing
+both runs share is the VPS's own egress at about 225,000 datagrams a second, the rate the earlier
+run at ten millisecond passes was refused at from 270,000. `machine-window.sh` now reads the
+interface's drop counters, the root queue discipline's drops and requeues, and the backlog queue's
+drops over the window, which is where a burst the virtual NIC cannot take at line rate goes
+missing, and the Windows side reads the same for its adapter; the next run says which.
+
+The clients sent 9.6 positions a second against a nominal ten. That is Windows' system timer, whose
+default resolution is 15.6 ms, under a 100 ms `PeriodicTimer`. The load client now asks for a 1 ms
+resolution on Windows at start, the standard `timeBeginPeriod` request.
+
+**And a race at shutdown, which was the run's one real defect.** Eight warnings in the server log,
+all the same: a `NullReferenceException` on an arena worker, in `SendOrBufferPacket`, under the
+ball timer's `SendToArena`, while the server was unloading. The forced disconnect of every player
+that `Network` does at the pre-unload stage frees each connection's bandwidth limiter, and did so
+under the player *read* lock; a forced tear down does not change the player's status, and the
+status is what a sender checks, under the same read lock, before it uses the connection. The arena
+workers were still running the ball timer, since the modules that own timers unload later, and a
+worker that reached a torn down connection through a player still marked as playing dereferenced
+the freed limiter, because the ball packet's priority flag includes urgent and urgent goes through
+the limiter first. Each exception also dropped that arena's ball timer for good, which is what a
+worker does with a timer that throws. On the mainloop the same tear down could not race anything,
+since the mainloop was the only sender of timer packets; the workers are what made the sender and
+the tear down different threads.
+
+It did not reproduce locally until its mechanism was understood: the ball is sent every five
+seconds per arena and every arena was created at the same moment, so fifty arenas send in lockstep,
+and a forced loop shorter than five seconds either meets the burst or misses it. A loop slowed to
+three milliseconds a player, six seconds for two thousand, met it every time: fifty exceptions, one
+per arena, the same stack as the VPS. The fix, on `scale/29-forced-teardown`, takes the write lock
+for the forced loop, so no sender is mid-send while it runs, and detaches each player from its
+connection as it is torn down, so a sender that arrives afterwards finds no player and sends
+nothing; the urgent path also stops trusting that the limiter is there. The same slowed loop with
+the fix in place: the workers waited on the write lock, then found nothing to send to, and no
+exception. This is the third defect the worker path has surfaced, after the flag reset callback
+and the send thread's pass-long lock hold, and the first at shutdown.
+
 ## What to watch next
 
 - **A sampled profile of one send thread — DONE.** `profile-thread.sh` did it and found the firewall,
@@ -2129,10 +2194,13 @@ number already known.
   stopped the 5,000 run was the generator's path through WSL2's NAT at about 240,000 datagrams a
   second. Not yet measured: the latency the interval adds as a player would feel it, which the
   harness does not see.
-- **A generator that is not behind WSL2's NAT — AVAILABLE, not yet run at scale.** The load client
-  on Windows itself, through `CLIENT_DOTNET=dotnet.exe` in `remote-loadtest.sh`, proven at two
-  hundred clients. Until the 5,000 run is repeated that way the server's limit on this VPS at twenty
-  millisecond passes is above 5,000 and not known, and `Workers = 4` is the next setting on that run.
+- **A generator that is not behind WSL2's NAT — RUN at 5,000.** The load client on Windows itself,
+  through `CLIENT_DOTNET=dotnet.exe` in `remote-loadtest.sh`: 4,999 of 5,000 survived, the server
+  under all of its own limits, and 1,752 specced for loss that Windows' counters show was not lost
+  here. The loss is between the VPS's sockets and this machine's adapter, and the WSL2 run's loss at
+  the same population now looks like the same thing. Both ends' interface and queue discipline
+  counters are in the harness now; the next 5,000 run says whether it is the VPS's egress. If it
+  is, `SendInterval` is the lever that was already measured to move it.
 - **Position latency, which the send side degrades by and nothing here sees.** Past its interval a
   send thread stretches its pass and batches more per datagram, so delivery stays above 99% while
   every position arrives later. The load client could stamp each position it sends and read the age

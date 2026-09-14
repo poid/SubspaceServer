@@ -3,11 +3,13 @@
 # The server half of a load test whose clients are on another machine. Runs on the machine with the
 # server; remote-loadtest.sh runs it over SSH from the machine with the load client.
 #
-# It starts the server, says READY once the server is listening, waits for the clients to arrive and
-# settle, takes a whole-machine window from /proc, then waits for the server to be stopped, which
-# the client side does once its clients have left, and finally puts the configuration back and says
-# DONE with the path of the server log. Everything it prints is read by the client side, so the two
-# words it keys on are on lines of their own.
+# It starts the server, says READY once the server is listening, waits for the client side to say
+# the clients are all in and holding (a file named <label>.holding in the results directory, which
+# the client side creates over SSH), takes a whole-machine window from /proc twenty seconds into the
+# hold, then waits for the server to be stopped, which the client side does once its clients have
+# left, and finally puts the configuration back and says DONE with the path of the server log.
+# Everything it prints is read by the client side, so the two words it keys on are on lines of their
+# own.
 #
 # Usage:
 #   server-side.sh <label> <hold-seconds>
@@ -107,25 +109,27 @@ if [ "${#PIDS[@]}" -ne 1 ]; then
 fi
 PID="${PIDS[0]}"
 
-# Steady state: a few metrics windows with positions in them mean the clients have arrived and the
-# ramp is over. Bounded, because if the clients never come there is nothing to wait for.
-windows=0
+# Steady state: the client side creates this file once every client is in and the hold has begun,
+# and then waits the same twenty seconds before its own window, so the two windows cover the same
+# stretch of the hold. Counting metrics windows with positions in them, as this once did, fired
+# during the ramp whenever the connects took longer than forty seconds, which five thousand clients
+# from Windows did. Bounded, because if the clients never come there is nothing to wait for.
+HOLDING_FILE="$OUT/${LABEL// /_}.holding"
+rm -f "$HOLDING_FILE"
 deadline=$(( SECONDS + STARTUP_ALLOWANCE ))
-while [ "$windows" -lt 4 ]; do
+while [ ! -f "$HOLDING_FILE" ]; do
     sleep 2
     if ! kill -0 "$PID" 2>/dev/null; then
         echo "FAILED: the server exited before the clients settled; see $SERVER_LOG"
         exit 1
     fi
     if [ "$SECONDS" -ge "$deadline" ]; then
-        echo "WARNING: no steady state within $STARTUP_ALLOWANCE s; taking the window anyway."
+        echo "WARNING: the client side never said it was holding within $STARTUP_ALLOWANCE s; taking the window anyway."
         break
     fi
-    # grep -c prints its count even when it is zero, and exits 1 then, so its exit code is not an
-    # error here and must not be turned into a second number.
-    windows=$(grep -c 'position: [1-9]' "$SERVER_LOG" 2>/dev/null)
-    windows=${windows:-0}
 done
+rm -f "$HOLDING_FILE"
+sleep 20
 
 echo "=== whole-machine window, $WINDOW_SECONDS s at steady state ==="
 machine_window_begin "$PID"
