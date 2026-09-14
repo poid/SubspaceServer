@@ -156,7 +156,10 @@ namespace SS.LoadClient
                 try
                 {
                     await Task.Delay(TimeSpan.FromSeconds(20), cancellationToken);
-                    await lagProbe.SendChatAsync("?lag", cancellationToken);
+                    // Verbose, for the breakdown: the client-to-server figure from position stamps,
+                    // the reliable round trip, and the client-reported server-to-client one, which
+                    // this client does not report. Between them they say which direction is slow.
+                    await lagProbe.SendChatAsync("?lag -v", cancellationToken);
                 }
                 catch (OperationCanceledException)
                 {

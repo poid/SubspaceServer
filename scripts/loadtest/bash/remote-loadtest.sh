@@ -47,6 +47,8 @@ STARTUP_ALLOWANCE=420
 
 # shellcheck source=report.sh
 . "$SCRIPT_DIR/report.sh"
+# shellcheck source=machine-window.sh
+. "$SCRIPT_DIR/machine-window.sh"
 
 usage() {
     grep '^#' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' | sed -n '2,36p'
@@ -130,7 +132,34 @@ if [ "$ready" -ne 1 ]; then
 fi
 
 ( cd "$REPO_ROOT" && timeout $((DURATION + STARTUP_ALLOWANCE)) dotnet run --project src/LoadClient/LoadClient.csproj --no-build -c "$CONFIGURATION" -- \
-    --protocol game --host "$SERVER_IP" --port "$SERVER_PORT" --clients "$CLIENTS" --arenas "$ARENAS" --duration "$DURATION" "$@" > "$CLIENT_LOG" 2>&1 )
+    --protocol game --host "$SERVER_IP" --port "$SERVER_PORT" --clients "$CLIENTS" --arenas "$ARENAS" --duration "$DURATION" "$@" > "$CLIENT_LOG" 2>&1 ) &
+CLIENT_PID=$!
+
+# This machine over a window too, once the clients are in. The generator is the other half of every
+# figure in the report, and at thousands of clients it can be the one short of processor, late with
+# its timers, or behind on its receives, all of which the server reports as the client's ping and
+# loss and none of which the server's own window can show.
+for _ in $(seq 1 $((STARTUP_ALLOWANCE / 2))); do
+    grep -q '^Holding' "$CLIENT_LOG" 2>/dev/null && break
+    kill -0 "$CLIENT_PID" 2>/dev/null || break
+    sleep 2
+done
+
+GENERATOR_WINDOW=""
+if grep -q '^Holding' "$CLIENT_LOG" 2>/dev/null; then
+    sleep 20
+    # dotnet run starts the built executable as a child, named after the project; that child is the
+    # one doing the work, not the dotnet run process above it.
+    GENERATOR_PID="$(pgrep -f '/SS\.LoadClient --protocol' | head -1)"
+    if [ -n "$GENERATOR_PID" ]; then
+        machine_window_begin "$GENERATOR_PID"
+        sleep 30
+        machine_window_end
+        GENERATOR_WINDOW="$(machine_window_print 30 "load client" 2>&1)"
+    fi
+fi
+
+wait "$CLIENT_PID"
 
 # Let the last window with the clients in it be written, then stop the server so the log ends there
 # rather than trailing empty windows, which is what the local harness's timing gives the extraction.
@@ -149,6 +178,12 @@ trap - EXIT
 # Everything the server side said after READY: the whole-machine window and any warnings.
 echo
 sed -n '/^READY$/,$p' "$REMOTE_LOG" | sed '/^READY$/d; /^DONE /d'
+
+if [ -n "$GENERATOR_WINDOW" ]; then
+    echo
+    echo "=== this machine, running the load client, 30 s in the hold ==="
+    printf '%s\n' "$GENERATOR_WINDOW"
+fi
 
 if ! scp "${SSH_OPTS[@]}" "$SERVER_SSH:$REMOTE_REPO/loadtest-results/${LABEL// /_}.server.log" "$SERVER_LOG" >/dev/null; then
     echo "Could not copy the server log back from $SERVER_SSH." >&2
