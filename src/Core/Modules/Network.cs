@@ -1022,7 +1022,15 @@ namespace SS.Core.Modules
             HashSet<Player> playerSet = _objectPoolManager.PlayerSetPool.Get();
             try
             {
-                _playerData.Lock();
+                // The write lock, not the read lock. A forced tear down changes a connection without
+                // the player's status changing with it, and the status is what every send checks
+                // under the read lock before it touches the connection. This runs at the pre-unload
+                // stage, when the arena workers are still running the timers of modules that have
+                // not unloaded yet, and a worker holding the read lock mid-send while the tear down
+                // frees the connection's bandwidth limiter dereferences null. The write lock keeps
+                // any sender out until the loop is done, and detaching the player from the connection
+                // below is what turns away the ones that arrive after it.
+                _playerData.WriteLock();
 
                 try
                 {
@@ -1036,13 +1044,18 @@ namespace SS.Core.Modules
                             // Force the disconnection.
                             ProcessDisconnect(player, playerConnection, true);
 
+                            // The player is freed after this loop, on the mainloop, and until then the
+                            // arena workers can still reach the connection through the player. A
+                            // connection without a player is one nothing is sent to.
+                            playerConnection.Player = null;
+
                             playerSet.Add(player);
                         }
                     }
                 }
                 finally
                 {
-                    _playerData.Unlock();
+                    _playerData.WriteUnlock();
                 }
 
                 foreach (Player player in playerSet)
@@ -5704,8 +5717,16 @@ namespace SS.Core.Modules
                     // try the fast path
                     if ((flags & (NetSendFlags.Urgent | NetSendFlags.Reliable)) == NetSendFlags.Urgent)
                     {
+                        // A connection that has been torn down has had its limiter freed. That is
+                        // reachable here only while the server is shutting down, since a tear down
+                        // otherwise follows the player's status, which was checked above; even so,
+                        // a torn down connection gets nothing rather than a null dereference.
+                        IBandwidthLimiter? bandwidthLimiter = conn.BandwidthLimiter;
+                        if (bandwidthLimiter is null)
+                            return false;
+
                         // urgent and not reliable
-                        if (conn.BandwidthLimiter!.Check(len + _config.PerPacketOverhead, pri, true))
+                        if (bandwidthLimiter.Check(len + _config.PerPacketOverhead, pri, true))
                         {
                             SendRaw(conn, data);
                             return true;
