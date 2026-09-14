@@ -60,10 +60,12 @@ machine_window_end() {
     read -ra CPU_AFTER < /proc/stat
 }
 
-# Prints the window. The one argument is how long the window was meant to be, so that a window that
-# was stretched by something in it can be flagged.
+# Prints the window. The first argument is how long the window was meant to be, so that a window
+# that was stretched by something in it can be flagged; the second names the process whose time was
+# taken, "server" unless told otherwise.
 machine_window_print() {
     local asked="$1"
+    local label="${2:-server}"
     local elapsed total idle steal nproc_count clk_tck machine_cores server_cores idle_cores i
     local overflows other_errors
 
@@ -93,7 +95,8 @@ machine_window_print() {
 
     echo
     echo "--- the whole machine over the same window ---"
-    printf 'server %s cores, everything else %s, idle %s of %s vCPUs (steal %s%%)\n' \
+    printf '%s %s cores, everything else %s, idle %s of %s vCPUs (steal %s%%)\n' \
+        "$label" \
         "$server_cores" \
         "$(echo "scale=2; $machine_cores - $server_cores" | bc)" \
         "$idle_cores" \
