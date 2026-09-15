@@ -188,9 +188,10 @@ machine_window_print() {
 
     if [ "$overflows" -gt 0 ]; then
         echo "NOTE: an overflow is the kernel discarding a datagram that arrived faster than its socket was"
-        echo "      drained. The server's socket has its own drop counter in ?metrics; if that did not move,"
-        echo "      these were other sockets on this machine, and with the load generator here that means"
-        echo "      any shortfall in what the clients received is the generator's, not the server's."
+        echo "      drained. The server's own sockets have their own count: 'receive queue drops' on the"
+        echo "      network line of ?metrics (per window) and in ?netstats (since start). If that did not"
+        echo "      move, these were other sockets on this machine, and with the load generator here that"
+        echo "      means any shortfall in what the clients received is the generator's, not the server's."
     fi
 
     # Past the sockets: the interface itself and the queue discipline in front of it. A datagram the
