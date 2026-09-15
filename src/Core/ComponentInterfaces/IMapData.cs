@@ -128,11 +128,10 @@ namespace SS.Core.ComponentInterfaces
         /// Gets the map tiles CRC-32 checksum. (Continuum only)
         /// </summary>
         /// <param name="arena">The arena to retrieve the map info for.</param>
-        /// <param name="crc32">When this method returns, contains the CRC-32 checksum of the <paramref name="arena"/>'s map, if loaded; otherwise, 0.</param>
-        /// <returns><see langword="true"/> if the map is loaded; otherwise <see langword="false'"/>.</returns>
+        /// <param name="crc32">When this method returns, contains the CRC-32 checksum of the <paramref name="arena"/>'s map, if loaded and known; otherwise, 0.</param>
+        /// <returns><see langword="true"/> if the map is loaded and its checksum is known; otherwise <see langword="false"/>, including when the <paramref name="arena"/>'s map is not loaded.</returns>
         /// <exception cref="ArgumentNullException"><paramref name="arena"/> is <see langword="null"/>.</exception>
         /// <exception cref="InvalidOperationException">The module is not loaded.</exception>
-        /// <exception cref="InvalidOperationException">The <paramref name="arena"/> data is not loaded.</exception>
         bool TryGetCrc32(Arena arena, out uint crc32);
 
         #endregion
