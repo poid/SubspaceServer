@@ -1851,6 +1851,15 @@ namespace SS.Core.Modules
             _chat.SendMessage(player, $"netstats: buffers used={stats.BuffersUsed}/{stats.BuffersTotal} ({(double)stats.BuffersUsed / stats.BuffersTotal:p})");
             _chat.SendMessage(player, $"netstats: send buffer full drops={stats.SendBufferFullDrops}");
 
+            if (stats.IsSocketReceiveDropsAvailable)
+            {
+                _chat.SendMessage(player, $"netstats: receive queue drops={stats.SocketReceiveDrops}");
+            }
+            else
+            {
+                _chat.SendMessage(player, "netstats: receive queue drops=not reported by this operating system");
+            }
+
             _chat.SendMessage(player, $"netstats: grouped=" +
                 $"{stats.GroupedStats0}/" +
                 $"{stats.GroupedStats1}/" +

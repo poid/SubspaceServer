@@ -442,7 +442,7 @@ namespace SS.Core.Modules
                 sb.Append($"  position: {positionPackets / seconds:F0} pkt/s, {candidatesScanned / seconds:F0} scanned/s, {PerPacket(candidatesScanned, positionPackets):F1} scanned/pkt, {PerPacket(recipientsInView, positionPackets):F1} in-view/pkt");
                 Emit(sb, player);
 
-                sb.Append($"  network: {Read(ServerMetric.NetworkSendToOne) / seconds:F0} SendToOne/s, send thread {Read(ServerMetric.SendThreadIterations) / seconds:F0} iter/s, {Read(ServerMetric.SendThreadOverruns)} overruns");
+                sb.Append($"  network: {Read(ServerMetric.NetworkSendToOne) / seconds:F0} SendToOne/s, send thread {Read(ServerMetric.SendThreadIterations) / seconds:F0} iter/s, {Read(ServerMetric.SendThreadOverruns)} overruns, {Read(ServerMetric.SocketReceiveDrops)} receive queue drops");
                 Emit(sb, player);
 
                 sb.Append($"  send threads: {Read(ServerMetric.SendThreadsActive)} running, busiest {Read(ServerMetric.SendThreadBusiestPercent)}% of its interval");
