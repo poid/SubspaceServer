@@ -2366,7 +2366,8 @@ positions per datagram, at the cost of latency, and the link would still be the 
   the VPS sends above it, with the VPS's interface and queue discipline clean and no standing
   queue. The server on this VPS was not the limit in any of them. What is left needs a generator
   on a connection that takes the server's output: a second VPS at the same provider running this
-  harness.
+  harness. **DEFERRED, to much later**: not until the QS client is released and there are more
+  hosts to run it from. Nothing else in this list waits on it.
 - **Position latency, which the send side degrades by and nothing here sees.** Past its interval a
   send thread stretches its pass and batches more per datagram, so delivery stays above 99% while
   every position arrives later. The load client could stamp each position it sends and read the age
