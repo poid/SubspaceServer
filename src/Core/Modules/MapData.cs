@@ -356,10 +356,10 @@ namespace SS.Core.Modules
 
             try
             {
-                if (ad.LvlData is null)
-                    throw new InvalidOperationException(Error_ArenaDataNotLoaded);
-
-                if (ad.LvlData.TilesCrc32 is not null)
+                // A map that is not loaded is the "otherwise" this method returns false for, the same
+                // as a loaded map without a checksum; it is not an error, unlike the module not being
+                // loaded above.
+                if (ad.LvlData is not null && ad.LvlData.TilesCrc32 is not null)
                 {
                     crc32 = ad.LvlData.TilesCrc32.Value;
                     return true;
