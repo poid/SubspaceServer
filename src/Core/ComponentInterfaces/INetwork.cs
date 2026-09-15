@@ -148,6 +148,19 @@ namespace SS.Core.ComponentInterfaces
         /// </summary>
         ulong SendBufferFullDrops { get; }
 
+        /// <summary>
+        /// Datagrams the operating system discarded on the server's sockets because their receive
+        /// queue was full, since the sockets were opened. Read from the kernel's per-socket counters
+        /// where it keeps them, which is Linux; elsewhere this is 0 and
+        /// <see cref="IsSocketReceiveDropsAvailable"/> is <see langword="false"/>. See Net:ReceiveBufferSize.
+        /// </summary>
+        ulong SocketReceiveDrops { get; }
+
+        /// <summary>
+        /// Whether <see cref="SocketReceiveDrops"/> is reported on this operating system.
+        /// </summary>
+        bool IsSocketReceiveDropsAvailable { get; }
+
         ulong GroupedStats0 { get; }
         ulong GroupedStats1 { get; }
         ulong GroupedStats2 { get; }

@@ -16,6 +16,7 @@ using System.Collections.ObjectModel;
 using System.ComponentModel;
 using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
+using System.IO;
 using System.Linq;
 using System.Net;
 using System.Net.Sockets;
@@ -57,6 +58,16 @@ namespace SS.Core.Modules
 
         // Optional dependency
         private IServerMetrics? _serverMetrics;
+
+        /// <summary>
+        /// When the kernel's per-socket receive drop counters were last read, as a Stopwatch timestamp.
+        /// </summary>
+        private long _socketReceiveDropsReadTimestamp;
+
+        /// <summary>
+        /// How often the kernel's per-socket receive drop counters are read when nobody asks for them.
+        /// </summary>
+        private static readonly TimeSpan SocketReceiveDropsInterval = TimeSpan.FromSeconds(1);
 
         private InterfaceRegistrationToken<INetwork>? _iNetworkToken;
         private InterfaceRegistrationToken<INetworkClient>? _iNetworkClientToken;
@@ -1578,6 +1589,8 @@ namespace SS.Core.Modules
             Interlocked.Exchange(ref _globalStats.BuffersUsed, objectsCreated - (ulong)_bufferPool.ObjectsAvailable);
             Interlocked.Exchange(ref _globalStats.BuffersTotal, objectsCreated);
 
+            RefreshSocketReceiveDrops(force: true);
+
             return _globalStats;
         }
 
@@ -2478,6 +2491,11 @@ namespace SS.Core.Modules
 
                     if (_stopToken.IsCancellationRequested)
                         return;
+
+                    // Once a second, the kernel's count of what it discarded on these sockets. This is
+                    // the thread whose stalls cause those drops, so it cannot read them while stalled,
+                    // and does not need to: the count is cumulative and is caught up on the next wake.
+                    RefreshSocketReceiveDrops(force: false);
 
                     // Take everything a readable socket has, rather than one packet and back to
                     // Select. Select is the expensive half of receiving: it rebuilds and walks the
@@ -5389,6 +5407,153 @@ namespace SS.Core.Modules
         /// matter individually. The count is what matters, and it is in ?netstats.
         /// </remarks>
         /// <param name="socket">The socket whose buffer was full, to name it.</param>
+        #region Socket receive drops
+
+        /// <summary>
+        /// Refreshes <see cref="NetStats.SocketReceiveDrops"/> from the kernel's per-socket counters,
+        /// at most once every <see cref="SocketReceiveDropsInterval"/> unless <paramref name="force"/>,
+        /// and adds whatever changed to the <see cref="ServerMetric.SocketReceiveDrops"/> counter.
+        /// </summary>
+        /// <remarks>
+        /// The machine-wide receive overflow counter cannot say whose socket overflowed. The kernel keeps
+        /// one per socket, in /proc/net/udp and /proc/net/udp6 keyed by inode, and that is the only
+        /// place it reports it; .NET's sockets do not expose it. Linux only; nothing happens elsewhere.
+        /// Called from the receive thread after each wake, which makes the once a second cost nothing,
+        /// and from <see cref="INetwork.GetStats"/> so that ?netstats is current when it is asked.
+        /// </remarks>
+        private void RefreshSocketReceiveDrops(bool force)
+        {
+            if (!OperatingSystem.IsLinux())
+                return;
+
+            long now = Stopwatch.GetTimestamp();
+            long last = Volatile.Read(ref _socketReceiveDropsReadTimestamp);
+            if (!force && Stopwatch.GetElapsedTime(last, now) < SocketReceiveDropsInterval)
+                return;
+
+            // One reader at a time; whoever loses the race leaves it to the winner.
+            if (Interlocked.CompareExchange(ref _socketReceiveDropsReadTimestamp, now, last) != last)
+                return;
+
+            ulong drops;
+            try
+            {
+                drops = ReadSocketReceiveDrops();
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                // /proc is not where it should be or is not readable; the counter stays where it was.
+                return;
+            }
+
+            ulong previous = Interlocked.Exchange(ref _globalStats.SocketReceiveDrops, drops);
+            if (drops > previous)
+            {
+                IServerMetrics? serverMetrics = _serverMetrics;
+                if (serverMetrics is not null && serverMetrics.IsEnabled)
+                {
+                    serverMetrics.Add(ServerMetric.SocketReceiveDrops, (long)(drops - previous));
+                }
+            }
+        }
+
+        /// <summary>
+        /// Sums the kernel's receive queue drop counters over the server's sockets, the game and ping
+        /// socket of every listen endpoint and the client socket, matched by inode.
+        /// </summary>
+        private ulong ReadSocketReceiveDrops()
+        {
+            // The sockets' inodes, from the link the kernel keeps for each open descriptor.
+            List<ulong> inodes = new((_listenDataList.Count * 2) + 1);
+
+            foreach (ListenData listenData in _listenDataList)
+            {
+                if (TryGetSocketInode(listenData.GameSocket, out ulong inode))
+                    inodes.Add(inode);
+
+                if (TryGetSocketInode(listenData.PingSocket, out inode))
+                    inodes.Add(inode);
+            }
+
+            Socket? clientSocket = _clientSocket;
+            if (clientSocket is not null && TryGetSocketInode(clientSocket, out ulong clientInode))
+                inodes.Add(clientInode);
+
+            if (inodes.Count == 0)
+                return 0;
+
+            return SumDrops("/proc/net/udp", inodes) + SumDrops("/proc/net/udp6", inodes);
+
+            static bool TryGetSocketInode(Socket socket, out ulong inode)
+            {
+                // /proc/self/fd/<descriptor> is a link whose target reads "socket:[<inode>]".
+                inode = 0;
+
+                string? target;
+                try
+                {
+                    target = new FileInfo($"/proc/self/fd/{socket.Handle}").LinkTarget;
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                {
+                    return false;
+                }
+
+                const string Prefix = "socket:[";
+                return target is not null
+                    && target.StartsWith(Prefix, StringComparison.Ordinal)
+                    && target.EndsWith(']')
+                    && ulong.TryParse(target.AsSpan(Prefix.Length, target.Length - Prefix.Length - 1), out inode);
+            }
+
+            static ulong SumDrops(string path, List<ulong> inodes)
+            {
+                if (!File.Exists(path))
+                    return 0;
+
+                ulong total = 0;
+
+                // A line for every UDP socket on the machine, once a second: a few kilobytes of strings,
+                // allocated and gone. The fields, separated by runs of spaces, are: sl, local address,
+                // remote address, state, tx queue:rx queue, timer:when, retransmits, uid, timeout,
+                // inode, references, pointer, drops. The header line has words there and parses as
+                // nothing.
+                foreach (string line in File.ReadLines(path))
+                {
+                    ReadOnlySpan<char> remaining = line;
+                    ulong inode = 0;
+                    ulong drops = 0;
+                    bool hasInode = false;
+                    bool hasDrops = false;
+
+                    for (int field = 0; !remaining.IsEmpty; field++)
+                    {
+                        remaining = remaining.TrimStart();
+                        int end = remaining.IndexOf(' ');
+                        ReadOnlySpan<char> token = end < 0 ? remaining : remaining[..end];
+                        remaining = end < 0 ? default : remaining[end..];
+
+                        if (field == 9)
+                        {
+                            hasInode = ulong.TryParse(token, out inode);
+                        }
+                        else if (field == 12)
+                        {
+                            hasDrops = ulong.TryParse(token, out drops);
+                            break;
+                        }
+                    }
+
+                    if (hasInode && hasDrops && inodes.Contains(inode))
+                        total += drops;
+                }
+
+                return total;
+            }
+        }
+
+        #endregion
+
         private void NoteSendBufferFull(Socket socket)
         {
             ulong drops = Interlocked.Increment(ref _globalStats.SendBufferFullDrops);
@@ -7547,6 +7712,7 @@ namespace SS.Core.Modules
             public ulong BytesSent, BytesReceived;
             public ulong BuffersTotal, BuffersUsed;
             public ulong SendBufferFullDrops;
+            public ulong SocketReceiveDrops;
             public readonly ulong[] GroupedStats = new ulong[8];
             public readonly ulong[] RelGroupedStats = new ulong[8];
             public readonly ulong[] PriorityStats = new ulong[(int)Enum.GetValues<BandwidthPriority>().Max() + 1];
@@ -7561,6 +7727,8 @@ namespace SS.Core.Modules
             ulong IReadOnlyNetStats.BuffersTotal => Interlocked.Read(ref BuffersTotal);
             ulong IReadOnlyNetStats.BuffersUsed => Interlocked.Read(ref BuffersUsed);
             ulong IReadOnlyNetStats.SendBufferFullDrops => Interlocked.Read(ref SendBufferFullDrops);
+            ulong IReadOnlyNetStats.SocketReceiveDrops => Interlocked.Read(ref SocketReceiveDrops);
+            bool IReadOnlyNetStats.IsSocketReceiveDropsAvailable => OperatingSystem.IsLinux();
 
             ulong IReadOnlyNetStats.GroupedStats0 => Interlocked.Read(ref GroupedStats[0]);
             ulong IReadOnlyNetStats.GroupedStats1 => Interlocked.Read(ref GroupedStats[1]);

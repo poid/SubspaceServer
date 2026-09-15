@@ -77,6 +77,14 @@ namespace SS.Core.ComponentInterfaces
         SendThreadBusiestPercent,
 
         /// <summary>
+        /// Counter. Datagrams the operating system discarded on the server's own sockets because their
+        /// receive queue was full, read from the kernel's per-socket counters, so this is the server's
+        /// share of the machine's receive overflows and not anything another process lost. Linux only;
+        /// stays at zero elsewhere. See Net:ReceiveBufferSize.
+        /// </summary>
+        SocketReceiveDrops,
+
+        /// <summary>
         /// Counter. Read locks taken on the global player data lock.
         /// <para>
         /// Counts the outermost acquisition only. A thread that already holds the lock skips taking it
