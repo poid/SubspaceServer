@@ -546,7 +546,7 @@ namespace SS.Core.Modules
 
         #region Module Members
 
-        [ConfigHelp<int>("Net", "ReceiveBufferSize", ConfigScope.Global, Default = 1048576, Min = 0,
+        [ConfigHelp<int>("Net", "ReceiveBufferSize", ConfigScope.Global, Default = 4194304, Min = 0,
             Description = """
                 The size in bytes to ask the operating system for on each socket's receive buffer, or 0
                 to leave it at whatever the operating system defaults to.
@@ -555,6 +555,9 @@ namespace SS.Core.Modules
                 kilobytes holds only a few hundred packets, which at a few thousand players is a few
                 milliseconds. Anything stopping the receive thread for longer starts losing packets, and
                 a lost connection attempt or position looks like nothing at all rather than an error.
+                One megabyte held a fifth of a second at five thousand players and overflowed while the
+                mainloop held the player lock through a wave of ship changes; four megabytes, the
+                default, holds most of a second, and is what the send side asks for too.
                 The operating system silently caps this at its own maximum, and a warning is logged when
                 it does. On Linux that maximum is net.core.rmem_max and has to be raised separately.
                 """)]
