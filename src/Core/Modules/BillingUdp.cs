@@ -632,7 +632,7 @@ namespace SS.Core.Modules
                 return "You are banned from entering a ship.";
 
             if ((restrictions & BillingRestrictions.NameQuotaLock) != 0)
-                return "Your account has too many names. Release one to play on this one.";
+                return "Your account has too many names. Release one with ?nick release <name> to play on this one.";
 
             return "You must complete registration before you can play. Type ?authhelp for instructions.";
         }
