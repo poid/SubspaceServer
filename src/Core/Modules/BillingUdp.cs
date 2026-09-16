@@ -616,7 +616,8 @@ namespace SS.Core.Modules
         /// <summary>
         /// The restrictions that keep a player out of a ship.
         /// </summary>
-        private const BillingRestrictions ShipLockRestrictions = BillingRestrictions.SpecLock | BillingRestrictions.RegistrationLock;
+        private const BillingRestrictions ShipLockRestrictions =
+            BillingRestrictions.SpecLock | BillingRestrictions.RegistrationLock | BillingRestrictions.NameQuotaLock;
 
         /// <summary>
         /// Gets the message explaining why a player may not enter a ship.
@@ -624,11 +625,14 @@ namespace SS.Core.Modules
         /// <param name="restrictions">The ship-locking restrictions on the player. Must not be <see cref="BillingRestrictions.None"/>.</param>
         private static string GetShipLockMessage(BillingRestrictions restrictions)
         {
-            // A ban wins over a registration lock when both are set. It is the one the player cannot
-            // resolve by registering, and telling them to register would imply that doing so would let
-            // them play.
+            // Most restrictive first, because naming a lesser lock while a greater one is set would tell
+            // the player that clearing it would let them play. A ban they cannot resolve at all; a name
+            // quota they resolve on another name; a registration they resolve here and now.
             if ((restrictions & BillingRestrictions.SpecLock) != 0)
                 return "You are banned from entering a ship.";
+
+            if ((restrictions & BillingRestrictions.NameQuotaLock) != 0)
+                return "Your account has too many names. Release one to play on this one.";
 
             return "You must complete registration before you can play. Type ?authhelp for instructions.";
         }

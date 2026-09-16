@@ -36,34 +36,45 @@ namespace SS.Packets.Billing
         RegistrationLock = 0x02,
 
         /// <summary>
+        /// The player may not enter a ship because their account holds more names than it is allowed.
+        /// Enforced by the zone.
+        /// </summary>
+        /// <remarks>
+        /// Unlike <see cref="RegistrationLock"/>, this is not resolved on the account the player is
+        /// logged in as. They have to release one of the account's other names before this one can be
+        /// played.
+        /// </remarks>
+        NameQuotaLock = 0x04,
+
+        /// <summary>
         /// The player may not send public (arena) messages. Enforced by the zone.
         /// </summary>
-        SilencePublic = 0x04,
+        SilencePublic = 0x08,
 
         /// <summary>
         /// The player may not send team messages. Enforced by the zone.
         /// </summary>
-        SilenceTeam = 0x08,
+        SilenceTeam = 0x10,
 
         /// <summary>
         /// The player may not send private messages to players in the same zone. Enforced by the zone.
         /// </summary>
-        SilencePrivate = 0x10,
+        SilencePrivate = 0x20,
 
         /// <summary>
         /// The player may not send private messages to players in other zones.
         /// Enforced by the billing server, which drops them before they reach the zone.
         /// </summary>
-        SilenceRemotePrivate = 0x20,
+        SilenceRemotePrivate = 0x40,
 
         /// <summary>
         /// The player may not send chat channel messages.
         /// Enforced by the billing server, which drops them before they reach the zone.
         /// </summary>
-        SilenceChat = 0x40,
+        SilenceChat = 0x80,
 
         /// <summary>
-        /// Every silence, which is every restriction other than the two that keep a player out of a ship.
+        /// Every silence, which is every restriction other than the three that keep a player out of a ship.
         /// </summary>
         SilenceAll = SilencePublic | SilenceTeam | SilencePrivate | SilenceRemotePrivate | SilenceChat,
     }
