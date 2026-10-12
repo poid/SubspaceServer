@@ -293,10 +293,20 @@ namespace SS.Core.Modules
             HashSet<Player> players = _objectPoolManager.PlayerSetPool.Get();
             try
             {
-                _playerData.TargetToSet(target, players, static player => (player.ClientFeatures & ClientFeatures.WarpTo) != 0);
+                // Resolve the FULL target set (no client-feature filter yet) so modules that own server-driven
+                // players with no real client — e.g. bots, whose position is simulation-driven — can apply the
+                // warp to their own model via the callback. The S2C packet below still only reaches real clients
+                // that negotiated the WarpTo feature.
+                _playerData.TargetToSet(target, players);
 
                 S2C_WarpTo warpTo = new(x, y);
-                _network.SendToSet(players, ref warpTo, NetSendFlags.Reliable | NetSendFlags.Urgent);
+                foreach (Player targetPlayer in players)
+                {
+                    WarpToCallback.Fire(targetPlayer.Arena ?? _broker, targetPlayer, x, y);
+
+                    if ((targetPlayer.ClientFeatures & ClientFeatures.WarpTo) != 0)
+                        _network.SendToOne(targetPlayer, ref warpTo, NetSendFlags.Reliable | NetSendFlags.Urgent);
+                }
             }
             finally
             {
