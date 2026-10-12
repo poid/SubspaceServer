@@ -103,6 +103,37 @@
         /// </remarks>
         public int FlagsPerMinute { get; private set; }
 
+        /// <summary>
+        /// Bricks laid per client per minute, or zero for none. Each is dropped on the tile the client is on.
+        /// </summary>
+        /// <remarks>
+        /// The server's brick module places them for any player in a ship; it does not count a player's bricks.
+        /// </remarks>
+        public int BricksPerMinute { get; private set; }
+
+        /// <summary>
+        /// Simulated one-way latency (ms) to stamp into position packets, or 0 for none. Game mode only.
+        /// </summary>
+        /// <remarks>
+        /// Backdates each position packet's Time by this much, so the server measures it as that stale
+        /// (age = Now - Time) without any real network delay. On localhost the natural staleness is only
+        /// the server's drain quantization, so this is how you drive DEEP rollbacks in the bot sim to
+        /// measure roll-forward cost. Keep it under Lag:PingToSpec (or raise the limit in the test arena)
+        /// so the clients are not specced for lag mid-run.
+        /// </remarks>
+        public int LagMs { get; private set; }
+
+        /// <summary>
+        /// Milliseconds between position packets per game client. Game mode only.
+        /// </summary>
+        /// <remarks>
+        /// A real Continuum client sends about every 10 ms while actively moving/firing (sub_43C920, base
+        /// SendPositionDelay), backing off when idle — NOT the 100 ms this historically defaulted to, which
+        /// under-drives the server's per-tick paths ~10x. Set to 10 for a faithful active-play load; higher
+        /// to model calmer traffic. Kept at 100 by default so existing baselines don't move silently.
+        /// </remarks>
+        public int SendIntervalMs { get; private set; } = 100;
+
         public string Host { get; private set; } = "127.0.0.1";
 
         /// <summary>
@@ -271,8 +302,23 @@
                         i++;
                         break;
 
+                    case "--bricks" when next is not null && int.TryParse(next, out int bricks) && bricks >= 0:
+                        options.BricksPerMinute = bricks;
+                        i++;
+                        break;
+
                     case "--spread" when next is not null && int.TryParse(next, out int spread) && spread > 0:
                         options.SpreadPixels = spread;
+                        i++;
+                        break;
+
+                    case "--lag" when next is not null && int.TryParse(next, out int lagMs) && lagMs >= 0:
+                        options.LagMs = lagMs;
+                        i++;
+                        break;
+
+                    case "--send-interval" when next is not null && int.TryParse(next, out int sendMs) && sendMs > 0:
+                        options.SendIntervalMs = sendMs;
                         i++;
                         break;
 
@@ -352,6 +398,16 @@
                                            available and the server sends 21 bytes regardless.
                   --view <width>x<height>  Screen size the clients claim, which the server uses as
                                            their view range. Default 1920x1080
+                  --send-interval <ms>     Milliseconds between each client's position packets. A real
+                                           Continuum client sends ~every 10 ms while active (sub_43C920),
+                                           so use 10 for a faithful active-play load; the historical
+                                           default of 100 under-drives the server ~10x. Default 100
+                  --lag <ms>               Simulated one-way latency stamped into position packets, which
+                                           the server reads as staleness (age = now - packet time) with no
+                                           real delay. On localhost the natural staleness is only the
+                                           server's drain, so this is how to drive DEEP bot-sim rollbacks
+                                           and measure roll-forward cost. Keep under Lag:PingToSpec (or
+                                           raise it in the test arena) so clients are not specced. Default 0
                   --weapons <percent>      Percentage of position packets carrying weapon fire.
                                            Firing stops the server using either compact batched
                                            position form and widens the range it sends to, so it
@@ -370,6 +426,8 @@
                   --flags <per minute>     Flag touches per client per minute, each followed by a
                                            drop. The arena needs a carry flag game with flags on the
                                            map. Default 0
+                  --bricks <per minute>    Bricks laid per client per minute, each on the tile the
+                                           client is on. Default 0
 
                   Every one of these runs a handler that position packets never reach, and all of them
                   except the arena switch are handled on the arena's thread when

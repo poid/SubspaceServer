@@ -97,7 +97,7 @@ namespace SS.LoadClient
             for (int i = 0; i < options.ClientCount; i++)
             {
                 int index = i;
-                GameClient client = new($"{options.NamePrefix}{index:D4}", options.Password, options.BatchPositions, options.ReceiveBufferSize);
+                GameClient client = new($"{options.NamePrefix}{index:D4}", options.Password, options.BatchPositions, options.ReceiveBufferSize, options.LagMs / 10);
                 clients[index] = client;
 
                 setupTasks[index] = SetupAsync(client, index);
@@ -442,6 +442,7 @@ namespace SS.LoadClient
                 double arenaSwitchChancePerTick = options.Arenas.Length > 1 ? options.ArenaSwitchesPerMinute / 60d / 10d : 0d;
                 double ballChancePerTick = options.BallsPerMinute / 60d / 10d;
                 double flagChancePerTick = options.FlagsPerMinute / 60d / 10d;
+                double brickChancePerTick = options.BricksPerMinute / 60d / 10d;
 
                 int currentArena = index % options.Arenas.Length;
 
@@ -456,8 +457,10 @@ namespace SS.LoadClient
 
                 try
                 {
-                    // 10Hz, matching a real client's SendPositionDelay of 10.
-                    using PeriodicTimer timer = new(TimeSpan.FromMilliseconds(100));
+                    // Position send cadence. A real Continuum client sends ~every 10 ms while active
+                    // (sub_43C920); --send-interval sets this (default 100 to preserve old baselines).
+                    int sendIntervalMs = options.SendIntervalMs;
+                    using PeriodicTimer timer = new(TimeSpan.FromMilliseconds(sendIntervalMs));
                     long lastTickTimestamp = Stopwatch.GetTimestamp();
 
                     while (await timer.WaitForNextTickAsync(token))
@@ -466,7 +469,7 @@ namespace SS.LoadClient
                         // late tick is the generator stalling, which the server sees as a spike or as
                         // positions arriving late, so it is recorded here to be told apart from those.
                         long tickTimestamp = Stopwatch.GetTimestamp();
-                        long lateMs = (long)Stopwatch.GetElapsedTime(lastTickTimestamp, tickTimestamp).TotalMilliseconds - 100;
+                        long lateMs = (long)Stopwatch.GetElapsedTime(lastTickTimestamp, tickTimestamp).TotalMilliseconds - sendIntervalMs;
                         lastTickTimestamp = tickTimestamp;
                         if (lateMs > 50)
                         {
@@ -571,6 +574,11 @@ namespace SS.LoadClient
                             if (await client.SendTouchFlagAsync((short)Random.Shared.Next(5), token))
                                 flagToDrop = true;
                         }
+
+                        // A brick on the tile the client is on (positions are pixels, 16 to a tile). Not
+                        // awaited for its acknowledgement, for the reason given for ship requests above.
+                        if (brickChancePerTick > 0d && Random.Shared.NextDouble() < brickChancePerTick)
+                            _ = client.SendBrickAsync((short)(x >> 4), (short)(y >> 4), token);
                     }
                 }
                 catch (OperationCanceledException)

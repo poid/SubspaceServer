@@ -24,7 +24,7 @@ namespace SS.LoadClient
     /// the EncryptionNull module loaded, so that no encryption is negotiated.
     /// </para>
     /// </remarks>
-    internal sealed class GameClient(string name, string password, bool batchPositions = true, int receiveBufferSize = 0) : IDisposable
+    internal sealed class GameClient(string name, string password, bool batchPositions = true, int receiveBufferSize = 0, int lagTicks = 0) : IDisposable
     {
         private const byte ClientTypeVIE = 0x01;
 
@@ -461,7 +461,10 @@ namespace SS.LoadClient
             C2S_PositionPacket position = new()
             {
                 Rotation = rotation,
-                Time = ServerTime,
+                // Backdate the timestamp by the configured lag so the server measures `age = Now - Time` as
+                // that much staleness — simulating network latency without a real delay, to exercise deep
+                // rollbacks in the bot sim. lagTicks = 0 (the default) stamps the true current server time.
+                Time = ServerTime - (uint)lagTicks,
                 X = x,
                 Y = y,
                 XSpeed = xSpeed,
@@ -712,6 +715,17 @@ namespace SS.LoadClient
         public Task<bool> SendTouchFlagAsync(short flagId, CancellationToken cancellationToken)
         {
             return SendReliableAsync([(byte)C2SPacketType.TouchFlag, (byte)flagId, (byte)(flagId >> 8)], cancellationToken);
+        }
+
+        /// <summary>
+        /// Lays a brick at a tile, sent reliably. Where the wall actually goes is the server's brick mode's call.
+        /// </summary>
+        /// <returns><see langword="true"/> if the server acknowledged receiving it.</returns>
+        public Task<bool> SendBrickAsync(short tileX, short tileY, CancellationToken cancellationToken)
+        {
+            C2S_Brick packet = new(tileX, tileY);
+            ReadOnlySpan<byte> bytes = MemoryMarshal.AsBytes(MemoryMarshal.CreateReadOnlySpan(ref packet, 1));
+            return SendReliableAsync(bytes.ToArray(), cancellationToken);
         }
 
         /// <summary>
