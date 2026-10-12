@@ -39,28 +39,35 @@
     </ProjectReference>
   </ItemGroup>
 
-  <!-- Physics engine, from the sibling QS repo. Unlike the server assemblies above, these
-       DLLs are NOT present in the host, so they MUST be copied into the plugin folder
-       (Private=true, the default). This couples the build to the QS repo living beside
-       SubspaceServer at ..\..\..\QS. See README.md for the layout requirement. -->
+  <!-- Physics engine + the shared bot libraries (QS.Navigation, QS.Bots), from the sibling QS repo.
+       Unlike the server assemblies above, these DLLs are NOT present in the host, so they MUST be copied
+       into the plugin folder (Private=true, the default). This couples the build to the QS repo living
+       beside SubspaceServer at ..\..\..\QS. QS.Navigation + QS.Bots are located relative to PhysicsProject,
+       so a single -p:PhysicsProject override (used when building from a worktree not beside QS) finds all
+       three. See README.md for the layout requirement. -->
   <PropertyGroup>
     <PhysicsProject Condition="'$(PhysicsProject)' == ''">$(MSBuildThisFileDirectory)..\..\..\QS\Physics\Physics Legacy Library\Physics Legacy Library.csproj</PhysicsProject>
-    <HasPhysicsProject Condition="Exists('$(PhysicsProject)')">true</HasPhysicsProject>
+    <QSRoot Condition="'$(QSRoot)' == ''">$([System.IO.Path]::GetFullPath('$([System.IO.Path]::GetDirectoryName($(PhysicsProject)))\..\..'))</QSRoot>
+    <QSNavigationProject Condition="'$(QSNavigationProject)' == ''">$(QSRoot)\Bots\QS.Navigation\QS.Navigation.csproj</QSNavigationProject>
+    <QSBotsProject Condition="'$(QSBotsProject)' == ''">$(QSRoot)\Bots\QS.Bots\QS.Bots.csproj</QSBotsProject>
+    <HasPhysicsProject Condition="Exists('$(PhysicsProject)') And Exists('$(QSNavigationProject)') And Exists('$(QSBotsProject)')">true</HasPhysicsProject>
   </PropertyGroup>
 
   <ItemGroup Condition="'$(HasPhysicsProject)' == 'true'">
     <ProjectReference Include="$(PhysicsProject)" SetTargetFramework="TargetFramework=net9.0" />
+    <ProjectReference Include="$(QSNavigationProject)" SetTargetFramework="TargetFramework=net9.0" />
+    <ProjectReference Include="$(QSBotsProject)" SetTargetFramework="TargetFramework=net9.0" />
   </ItemGroup>
 
   <!-- Said once and plainly, because without it this is a hundred missing-type errors and no
        clue which of them matters. This project genuinely cannot build without the physics
-       engine - its own source uses those types - so there is nothing to fall back to.
+       engine + bot libraries - its own source uses those types - so there is nothing to fall back to.
        A machine that only needs to run the server does not need this project at all: the
        server loads plugins at runtime and does not reference Bots, so building
        src/SubspaceServer/SubspaceServer.csproj skips it entirely. -->
   <Target Name="RequirePhysicsProject" BeforeTargets="BeforeBuild" Condition="'$(HasPhysicsProject)' != 'true'">
     <Error Code="QSBOTS001"
-           Text="Bots needs the QS physics engine, expected at '$(PhysicsProject)' and not found. Either clone the QS repo so it sits beside the SubspaceServer repo, or build src/SubspaceServer/SubspaceServer.csproj instead - the server loads plugins at runtime and does not need this project. Override the location with -p:PhysicsProject=&lt;path&gt;." />
+           Text="Bots needs the QS physics engine + bot libraries under '$(QSRoot)' (Physics\Physics Legacy Library, Bots\QS.Navigation, Bots\QS.Bots) and not all were found. Either clone the QS repo so it sits beside the SubspaceServer repo, or build src/SubspaceServer/SubspaceServer.csproj instead - the server loads plugins at runtime and does not need this project. Override with -p:PhysicsProject=&lt;path to Physics Legacy Library.csproj&gt; (QS.Navigation/QS.Bots are found relative to it)." />
   </Target>
 
 </Project>

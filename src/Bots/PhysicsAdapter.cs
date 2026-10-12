@@ -114,19 +114,85 @@ namespace SS.Bots
         /// Fires a bot's decided weapon in the sim, spawning it from the bot's current simulated position,
         /// facing, and velocity. Same requirement as the real-player overload: the engine reads the spawn
         /// point/direction/velocity off the command, so they come from the firing ship's live state.
+        /// The weapon is already a physics-side <see cref="WeaponTypes"/> — the bot AI decides in QS terms,
+        /// so no conversion is needed (unlike the real-player packet overload, which maps WeaponCodes).
         /// </summary>
-        public static PhysicsCommand WeaponFireCommand(int slot, uint tick, WeaponCodes code, byte level, in ShipState firer)
+        public static PhysicsCommand WeaponFireCommand(int slot, uint tick, WeaponTypes weapon, byte level, in ShipState firer)
         {
             return new PhysicsCommand
             {
                 Tick = tick,
                 Kind = CommandKind.WeaponFire,
                 ShipSlot = slot,
-                WeaponType = ToPhysicsWeapon(code),
+                WeaponType = weapon,
                 WeaponLevel = level,
                 Position = firer.Coordinates1000,
                 Direction = firer.Rotation * RotationToDirection,
                 Velocity = firer.Velocity,
+            };
+        }
+
+        // Coordinates1000 per tile: 16 px/tile × 1000. Warp coordinates (0x32 / ?warpto) are TILE coords.
+        private const int TileToCoord = 16 * CoordScale;
+
+        /// <summary>
+        /// Teleports a simulated ship to a TILE coordinate and halts it, mirroring a server-initiated warp
+        /// (the <c>0x32</c> packet a real client would act on). Used to apply <c>?warpto</c> to a bot, whose
+        /// position is simulation-driven rather than client-reported.
+        /// </summary>
+        public static PhysicsCommand ShipWarpCommand(int slot, uint tick, short tileX, short tileY, byte rotation)
+        {
+            return new PhysicsCommand
+            {
+                Tick = tick,
+                Kind = CommandKind.ShipPositionUpdate,
+                ShipSlot = slot,
+                Rotation = rotation,
+                Position = new Point(tileX * TileToCoord, tileY * TileToCoord),
+                Velocity = default, // a warp stops the ship
+            };
+        }
+
+        /// <summary>
+        /// The sim's external ID for one of the server's bricks. The server numbers bricks from 0, and 0 is the
+        /// one ID the sim's slot allocator reserves for "no entity", so they are shifted up by one.
+        /// </summary>
+        public static int BrickExternalId(in BrickData brick) => (ushort)brick.BrickId + 1;
+
+        /// <summary>
+        /// Hands the sim a brick the server's brick module has already placed: its two tile corners, team and
+        /// identity, existing from <paramref name="tick"/>. The sim does not second-guess it (no ship has to
+        /// own a brick or be standing there). <paramref name="alreadyOld"/> is how many ticks of its life had
+        /// gone by at <paramref name="tick"/> — non-zero only when the brick is older than the sim can rewind
+        /// to — so that it still expires when the real one does.
+        /// </summary>
+        public static PhysicsCommand BrickAddCommand(int brickSlot, uint tick, in BrickData brick, int alreadyOld)
+        {
+            return new PhysicsCommand
+            {
+                Tick = tick,
+                Kind = CommandKind.BrickAdd,
+                BrickSlot = brickSlot,
+                EntityId = new ID(BrickExternalId(in brick)),
+                BrickStart = new Point(brick.X1 * TileToCoord, brick.Y1 * TileToCoord),
+                BrickEnd = new Point(brick.X2 * TileToCoord, brick.Y2 * TileToCoord),
+                Frequency = (ushort)brick.Freq,
+                WeaponLevel = alreadyOld, // BrickAdd reads the brick's age from here
+            };
+        }
+
+        /// <summary>
+        /// Tells the sim how many flags a ship is carrying. The server's flag game owns the flags; the sim only
+        /// needs the count, for its flag-carrier rules (damage taken, weapon level, fire delay and cost).
+        /// </summary>
+        public static PhysicsCommand FlagCountCommand(int shipSlot, uint tick, int flagCount)
+        {
+            return new PhysicsCommand
+            {
+                Tick = tick,
+                Kind = CommandKind.SetFlagCount,
+                ShipSlot = shipSlot,
+                WeaponLevel = flagCount, // SetFlagCount reads the count from here
             };
         }
 

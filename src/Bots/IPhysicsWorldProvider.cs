@@ -23,8 +23,13 @@ namespace SS.Bots
     {
         /// <param name="arena">The arena to build a world for.</param>
         /// <param name="currentTick">The tick to seed the controller's clock with.</param>
+        /// <param name="rewindLanes">Snapshot lane delays (ticks) for the real-player rollback — the rewind
+        /// checkpoints and horizon (0 is the canonical lane and is always present).</param>
+        /// <param name="maxCommandsPerTick">The most sim commands per tick the world must be able to hold
+        /// until its deepest lane has replayed them (<c>Bots:MaxCommandsPerTick</c>). Sizes the controller's
+        /// pending-command buffer; commands beyond it are refused.</param>
         /// <returns>A configured, ready-to-<see cref="ReplayController.Tick"/> controller, or
         /// <see langword="null"/> if the arena's physics inputs are unavailable.</returns>
-        ReplayController? CreateWorld(Arena arena, uint currentTick);
+        ReplayController? CreateWorld(Arena arena, uint currentTick, uint[] rewindLanes, int maxCommandsPerTick);
     }
 }

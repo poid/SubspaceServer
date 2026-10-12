@@ -39,7 +39,7 @@ namespace SS.Bots
             _logManager = logManager;
         }
 
-        public ReplayController? CreateWorld(Arena arena, uint currentTick)
+        public ReplayController? CreateWorld(Arena arena, uint currentTick, uint[] rewindLanes, int maxCommandsPerTick)
         {
             // 1. Raw client settings -> QS GameSettings (the Continuum 1428-byte settings format).
             int required = S2C_ClientSettings.Length;
@@ -70,15 +70,37 @@ namespace SS.Bots
             //    are written. One-time per arena attach; ~1M reads but only a few thousand writes.
             LevelArray level = BuildLevel(arena);
 
-            // 3. Build and configure the controller. A single canonical lane (delays = {0}) is correct for a
-            //    live authoritative server; the multi-lane rollback support is for client-side prediction.
+            // 3. Build and configure the controller. Snapshot lanes (delays, in 10ms physics ticks) give the
+            //    rollback horizon for LATE real-player packets: the deepest lane sits a little past
+            //    Lag:PingToSpec so a packet sent just before a high-ping player is specced still lands in a
+            //    lane; the near lanes keep the common small-jitter rebuild cheap. Lanes are configurable via
+            //    Bots:RewindLanes (the module parses + passes them here). Bot-vs-bot never goes late (both
+            //    server-side); the sim-pump + packet-tick stamping (see BotsModule) is what exercises them.
             //    The collision scalars (bounce factor, wormhole switch time) are read from gameSettings.arenas
             //    inside Configure now, so no separate settings object is passed.
-            WorldStateConfig config = WorldStateConfig.Default;
-            ReplayController controller = new(currentTick, [0u], in config);
+            //
+            //    The pending-command buffer has to be sized for the rollback, not left at the library default
+            //    (256). Every command is queued on every lane that has not reached its tick yet, so the DEEPEST
+            //    lane holds each command for the whole horizon — plus the tick it was issued ahead by. At a
+            //    70-tick horizon the default is full with 2-3 steering bots, and a full buffer refuses
+            //    everything: bot steering and real-player packets alike. So: commands per tick x the ticks the
+            //    deepest lane keeps them, with a quarter spare for bursts.
+            uint horizon = 0;
+            foreach (uint lane in rewindLanes)
+                horizon = Math.Max(horizon, lane);
+
+            WorldStateConfig defaults = WorldStateConfig.Default;
+            long wanted = (long)maxCommandsPerTick * (horizon + 2) * 5 / 4;
+            int pendingCommands = (int)Math.Clamp(wanted, defaults.MaxPendingCommands, 1 << 20);
+
+            WorldStateConfig config = new(
+                defaults.MaxShips, defaults.MaxWeapons, defaults.MaxBalls, defaults.MaxBricks, defaults.MaxFlags,
+                defaults.MaxPrizes, pendingCommands, defaults.MaxEventsPerTick);
+            ReplayController controller = new(currentTick, rewindLanes, in config);
             controller.Configure(level, gameSettings);
 
-            _logManager.LogA(LogLevel.Info, nameof(BotsModule), arena, "Physics world configured for bots.");
+            _logManager.LogA(LogLevel.Info, nameof(BotsModule), arena,
+                $"Physics world configured for bots (command buffer: {pendingCommands} per lane, for {maxCommandsPerTick} commands/tick over a {horizon}-tick horizon).");
             return controller;
         }
 
