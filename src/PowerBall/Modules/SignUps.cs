@@ -343,7 +343,7 @@ namespace SS.PowerBall.Modules
                 IReadOnlyList<string> names = await _db.GetSignUpsAsync(ev).ConfigureAwait(false);
                 if (names.Count == 0)
                 {
-                    _chat.SendMessage(player, "There are currently no sign ups.");
+                    _chat.SendMessage(player, "There are currently no sign-ups.");
                     return;
                 }
 
@@ -397,7 +397,7 @@ namespace SS.PowerBall.Modules
                         _chat.SendMessage(player, "Cannot find event.");
                         return;
                     case EventState.Inactive:
-                        _chat.SendMessage(player, "Event is not currently accepting sign ups.");
+                        _chat.SendMessage(player, "Event is not currently accepting sign-ups.");
                         return;
                 }
 

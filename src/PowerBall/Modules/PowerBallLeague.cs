@@ -375,7 +375,7 @@ namespace SS.PowerBall.Modules
 
         #region Commands
 
-        [CommandHelp(Targets = CommandTarget.None, Args = "[minutes][:seconds]", Description = "Display or set the game time to minutes:seconds. (staff)")]
+        [CommandHelp(Targets = CommandTarget.None, Args = "<seconds> | <min>:<seconds>", Description = "Display or set the game time. A bare value is seconds; use <min>:<seconds> for minutes. (staff)")]
         private void Command_settime(ReadOnlySpan<char> commandName, ReadOnlySpan<char> parameters, Player player, ITarget target)
         {
             Arena? arena = player.Arena;
@@ -442,7 +442,7 @@ namespace SS.PowerBall.Modules
             _chat.SendMessage(player, "-------------------------------------------------------");
 
             bool displayedMod = false;
-            DisplayModCommand(player, ref displayedMod, "settime", "?settime [minutes][:seconds]", "Display or set the game time to minutes:seconds");
+            DisplayModCommand(player, ref displayedMod, "settime", "?settime <seconds>|<min>:<sec>", "Display or set the game time (a bare value is seconds)");
             DisplayModCommand(player, ref displayedMod, "resettime", "?resettime", "Reset the game time to the arena default (Teams:GameTime)");
         }
 
