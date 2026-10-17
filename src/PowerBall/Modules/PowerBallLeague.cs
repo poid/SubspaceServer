@@ -6,6 +6,7 @@ using SS.Core.Map;
 using SS.Packets.Game;
 using SS.PowerBall.ComponentCallbacks;
 using SS.PowerBall.ComponentInterfaces;
+using SS.PowerBall.Threading;
 using System;
 using System.Threading;
 
@@ -19,6 +20,12 @@ namespace SS.PowerBall.Modules
     /// ship-resets and warps each team to its start region, starts the ball game, and starts the in-game clock. On
     /// time-up it handles a tied game as either extra time or golden goal (per <c>Soccer:GoldenGoalRule</c>); otherwise
     /// it ends the game.
+    /// <para>
+    /// Like the other PowerBall modules it runs on the arena's own thread, with one exception: the core game timer is a
+    /// mainloop module, so calls to <see cref="IGameTimer"/> are handed to the mainloop, and the time-up decision is made
+    /// on the mainloop inside <see cref="GameTimerEndedCallback"/>, because extra time only takes effect if the timer is
+    /// restarted before that callback returns.
+    /// </para>
     /// </remarks>
     [ModuleInfo("PowerBall league match orchestration (ASSS pbleague port): countdown, clock, golden goal.")]
     public sealed class PowerBallLeague : IModule, IArenaAttachableModule, IPowerBallLeague
@@ -26,25 +33,28 @@ namespace SS.PowerBall.Modules
         private const int MaxTeams = 8;
 
         private readonly IArenaManager _arenaManager;
+        private readonly IArenaTimer _arenaTimer;
         private readonly IBalls _balls;
         private readonly ICapabilityManager _capabilityManager;
         private readonly IChat _chat;
-        private readonly ICommandManager _commandManager;
         private readonly IConfigManager _configManager;
         private readonly IGame _game;
         private readonly IGameTimer _gameTimer;
         private readonly ILogManager _logManager;
         private readonly ILvzObjects _lvzObjects;
-        private readonly IMainloopTimer _mainloopTimer;
+        private readonly IMainloop _mainloop;
         private readonly IMapData _mapData;
         private readonly IObjectPoolManager _objectPoolManager;
         private readonly IPlayerData _playerData;
         private readonly IScoreStats _scoreStats;
+        private readonly ArenaWork _arenaWork;
 
         private ArenaDataKey<ArenaData> _adKey;
 
         public PowerBallLeague(
+            IArenaLoop arenaLoop,
             IArenaManager arenaManager,
+            IArenaTimer arenaTimer,
             IBalls balls,
             ICapabilityManager capabilityManager,
             IChat chat,
@@ -54,27 +64,28 @@ namespace SS.PowerBall.Modules
             IGameTimer gameTimer,
             ILogManager logManager,
             ILvzObjects lvzObjects,
-            IMainloopTimer mainloopTimer,
+            IMainloop mainloop,
             IMapData mapData,
             IObjectPoolManager objectPoolManager,
             IPlayerData playerData,
             IScoreStats scoreStats)
         {
             _arenaManager = arenaManager ?? throw new ArgumentNullException(nameof(arenaManager));
+            _arenaTimer = arenaTimer ?? throw new ArgumentNullException(nameof(arenaTimer));
             _balls = balls ?? throw new ArgumentNullException(nameof(balls));
             _capabilityManager = capabilityManager ?? throw new ArgumentNullException(nameof(capabilityManager));
             _chat = chat ?? throw new ArgumentNullException(nameof(chat));
-            _commandManager = commandManager ?? throw new ArgumentNullException(nameof(commandManager));
             _configManager = configManager ?? throw new ArgumentNullException(nameof(configManager));
             _game = game ?? throw new ArgumentNullException(nameof(game));
             _gameTimer = gameTimer ?? throw new ArgumentNullException(nameof(gameTimer));
             _logManager = logManager ?? throw new ArgumentNullException(nameof(logManager));
             _lvzObjects = lvzObjects ?? throw new ArgumentNullException(nameof(lvzObjects));
-            _mainloopTimer = mainloopTimer ?? throw new ArgumentNullException(nameof(mainloopTimer));
+            _mainloop = mainloop ?? throw new ArgumentNullException(nameof(mainloop));
             _mapData = mapData ?? throw new ArgumentNullException(nameof(mapData));
             _objectPoolManager = objectPoolManager ?? throw new ArgumentNullException(nameof(objectPoolManager));
             _playerData = playerData ?? throw new ArgumentNullException(nameof(playerData));
             _scoreStats = scoreStats ?? throw new ArgumentNullException(nameof(scoreStats));
+            _arenaWork = new ArenaWork(arenaLoop, commandManager, logManager, nameof(PowerBallLeague));
         }
 
         #region Module members
@@ -98,14 +109,16 @@ namespace SS.PowerBall.Modules
 
             InitializeArena(arena, ad);
 
+            ad.CountdownTimer = new ArenaTimerSlot<CountdownState>(_arenaTimer, arena, Timer_Countdown);
+
             TeamsReadyCallback.Register(arena, Callback_TeamsReady);
             BallGameStartCallback.Register(arena, Callback_BallGameStart);
             BallGameOverCallback.Register(arena, Callback_BallGameOver);
             BallGameGoalCallback.Register(arena, Callback_BallGameGoal);
             GameTimerEndedCallback.Register(arena, Callback_GameTimerEnded);
 
-            _commandManager.AddCommand("settime", Command_settime, arena);
-            _commandManager.AddCommand("resettime", Command_resettime, arena);
+            _arenaWork.AddCommand("settime", Command_settime, arena);
+            _arenaWork.AddCommand("resettime", Command_resettime, arena);
 
             ad.InterfaceToken = arena.RegisterInterface<IPowerBallLeague>(this);
 
@@ -120,16 +133,19 @@ namespace SS.PowerBall.Modules
             if (ad.InterfaceToken is not null)
                 arena.UnregisterInterface(ref ad.InterfaceToken);
 
-            _mainloopTimer.ClearTimer<CountdownState>(Timer_Countdown, arena);
+            ad.CountdownTimer?.Stop();
 
-            _commandManager.RemoveCommand("settime", Command_settime, arena);
-            _commandManager.RemoveCommand("resettime", Command_resettime, arena);
+            _arenaWork.RemoveCommand("settime", Command_settime, arena);
+            _arenaWork.RemoveCommand("resettime", Command_resettime, arena);
 
             TeamsReadyCallback.Unregister(arena, Callback_TeamsReady);
             BallGameStartCallback.Unregister(arena, Callback_BallGameStart);
             BallGameOverCallback.Unregister(arena, Callback_BallGameOver);
             BallGameGoalCallback.Unregister(arena, Callback_BallGameGoal);
             GameTimerEndedCallback.Unregister(arena, Callback_GameTimerEnded);
+
+            _arenaWork.Drain(arena);
+            ad.CountdownTimer = null;
 
             return true;
         }
@@ -162,18 +178,19 @@ namespace SS.PowerBall.Modules
 
         private void Callback_TeamsReady(Arena arena)
         {
+            if (!_arenaWork.IsCurrent(arena) && _arenaWork.Defer(arena, Callback_TeamsReady))
+                return;
+
             if (!arena.TryGetExtraData(_adKey, out ArenaData? ad))
                 return;
 
             _logManager.LogA(LogLevel.Info, nameof(PowerBallLeague), arena, "Handle Teams Ready");
             _chat.SendArenaMessage(arena, "Game Starts in 30 seconds ...");
 
-            // Clear any in-flight countdown first so a re-ready (or ?newteams then re-ready) during the countdown
-            // doesn't stack a second one.
-            _mainloopTimer.ClearTimer<CountdownState>(Timer_Countdown, arena);
-
+            // Starting the slot replaces any in-flight countdown, so a re-ready (or ?newteams then re-ready) during the
+            // countdown doesn't stack a second one.
             // Initial delay 30s, then every 3s: READY (30s) -> SET (33s) -> GO + start (36s) -> GO off (39s).
-            _mainloopTimer.SetTimer(Timer_Countdown, 30000, 3000, new CountdownState(arena) { Countdown = 3 }, arena);
+            ad.CountdownTimer?.Start(30000, 3000, new CountdownState(arena) { Countdown = 3 });
         }
 
         private bool Timer_Countdown(CountdownState state)
@@ -298,23 +315,30 @@ namespace SS.PowerBall.Modules
 
         private void Callback_BallGameStart(Arena arena)
         {
+            if (!_arenaWork.IsCurrent(arena) && _arenaWork.Defer(arena, Callback_BallGameStart))
+                return;
+
             if (!arena.TryGetExtraData(_adKey, out ArenaData? ad))
                 return;
 
             _logManager.LogA(LogLevel.Info, nameof(PowerBallLeague), arena, "Game Start");
 
             ad.IsGoldenGoal = false;
-            ad.GoldenGoalRule = _configManager.GetInt(arena.Cfg!, "Soccer", "GoldenGoalRule", 0);
+            Volatile.Write(ref ad.GoldenGoalRule, _configManager.GetInt(arena.Cfg!, "Soccer", "GoldenGoalRule", 0));
 
             if (ad.TimerSeconds != 0)
             {
                 StartLvzTimer(arena, ad.TimerSeconds);
-                _gameTimer.SetTimer(arena, TimeSpan.FromSeconds(ad.TimerSeconds));
+                SetGameTimer(arena, TimeSpan.FromSeconds(ad.TimerSeconds));
             }
 
             ResetScores(arena);
         }
 
+        // Runs on the mainloop, where the core game timer fires it, and decides there what happens to the timer: extra
+        // time has to be set before this returns, or the game timer announces game over and stops. Everything that
+        // touches this module's state is handed to the arena's thread. The two things read here from the arena's side
+        // are the golden goal rule, an int written once per game, and the score, read the same way the core does.
         private void Callback_GameTimerEnded(Arena arena)
         {
             if (!arena.TryGetExtraData(_adKey, out ArenaData? ad))
@@ -325,42 +349,69 @@ namespace SS.PowerBall.Modules
             Span<int> scores = stackalloc int[MaxTeams];
             GetScores(arena, scores);
 
-            if (ad.GoldenGoalRule != 0 && scores[0] == scores[1])
+            int goldenGoalRule = Volatile.Read(ref ad.GoldenGoalRule);
+
+            if (goldenGoalRule != 0 && scores[0] == scores[1])
             {
-                if (ad.GoldenGoalRule < 0)
+                if (goldenGoalRule < 0)
                 {
                     // Extra time.
-                    int extra = -ad.GoldenGoalRule;
+                    int extra = -goldenGoalRule;
                     _chat.SendArenaMessage(arena, ChatSound.Beep1, $"Scores tied. {extra / 60}:{extra % 60:D2} additional time added");
                     _gameTimer.SetTimer(arena, TimeSpan.FromSeconds(extra));
-                    StartLvzTimer(arena, extra); // restart the LVZ clock (replaces the ASSS CB_TIMESET fire)
+                    _arenaWork.Run(arena, static s => s.Self.StartLvzTimer(s.Arena, s.Extra), (Self: this, Arena: arena, Extra: extra)); // restart the LVZ clock (replaces the ASSS CB_TIMESET fire)
                 }
                 else
                 {
                     // Golden goal.
                     _chat.SendArenaMessage(arena, ChatSound.Beep1, "Scores tied. Golden Goal in effect!");
-                    ad.IsGoldenGoal = true;
+                    _arenaWork.Run(arena, static s => s.Self.BeginGoldenGoal(s.Arena), (Self: this, Arena: arena));
                 }
             }
             else
             {
-                _balls.EndGame(arena);
+                _arenaWork.Run(arena, static s => s.Self._balls.EndGame(s.Arena), (Self: this, Arena: arena));
             }
+        }
+
+        private void BeginGoldenGoal(Arena arena)
+        {
+            if (arena.TryGetExtraData(_adKey, out ArenaData? ad))
+                ad.IsGoldenGoal = true;
         }
 
         private void Callback_BallGameOver(Arena arena, short winnerFreq)
         {
+            if (!_arenaWork.IsCurrent(arena) && _arenaWork.Defer(arena, Callback_BallGameOver, winnerFreq))
+                return;
+
             if (!arena.TryGetExtraData(_adKey, out ArenaData? ad))
                 return;
 
             _logManager.LogA(LogLevel.Info, nameof(PowerBallLeague), arena, "Game Over");
 
             if (ad.TimerSeconds != 0)
-                _gameTimer.SetTimer(arena, TimeSpan.Zero); // stop the in-game timer
+                SetGameTimer(arena, TimeSpan.Zero); // stop the in-game timer
+        }
+
+        /// <summary>
+        /// Sets the core game timer, which lives on the mainloop, from the arena's thread.
+        /// </summary>
+        private void SetGameTimer(Arena arena, TimeSpan duration)
+        {
+            _mainloop.QueueMainWorkItem(static s => s.GameTimer.SetTimer(s.Arena, s.Duration), (GameTimer: _gameTimer, Arena: arena, Duration: duration));
         }
 
         private void Callback_BallGameGoal(Arena arena, Player player, byte ballId, TileCoordinates goalCoordinates)
         {
+            OnBallGameGoal(arena);
+        }
+
+        private void OnBallGameGoal(Arena arena)
+        {
+            if (!_arenaWork.IsCurrent(arena) && _arenaWork.Defer(arena, OnBallGameGoal))
+                return;
+
             if (!arena.TryGetExtraData(_adKey, out ArenaData? ad))
                 return;
 
@@ -516,6 +567,7 @@ namespace SS.PowerBall.Modules
         private sealed class ArenaData : IResettable
         {
             public InterfaceRegistrationToken<IPowerBallLeague>? InterfaceToken;
+            public ArenaTimerSlot<CountdownState>? CountdownTimer;
 
             public MapRegion? Goal0;
             public MapRegion? Goal1;
@@ -528,6 +580,7 @@ namespace SS.PowerBall.Modules
             public bool TryReset()
             {
                 InterfaceToken = null;
+                CountdownTimer = null;
                 Goal0 = Goal1 = Start0 = Start1 = null;
                 TimerSeconds = 0;
                 IsGoldenGoal = false;

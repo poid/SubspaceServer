@@ -2,6 +2,7 @@ using SS.Core;
 using SS.Core.ComponentInterfaces;
 using SS.Packets.Game;
 using SS.PowerBall.ComponentInterfaces;
+using SS.PowerBall.Threading;
 using SS.Utilities;
 using System;
 
@@ -27,24 +28,26 @@ namespace SS.PowerBall.Modules
         private readonly IBalls _balls;
         private readonly ICapabilityManager _capabilityManager;
         private readonly IChat _chat;
-        private readonly ICommandManager _commandManager;
         private readonly IPlayerData _playerData;
         private readonly IScoreStats _scoreStats;
+        private readonly ArenaWork _arenaWork;
 
         public PowerBallExtras(
+            IArenaLoop arenaLoop,
             IBalls balls,
             ICapabilityManager capabilityManager,
             IChat chat,
             ICommandManager commandManager,
+            ILogManager logManager,
             IPlayerData playerData,
             IScoreStats scoreStats)
         {
             _balls = balls ?? throw new ArgumentNullException(nameof(balls));
             _capabilityManager = capabilityManager ?? throw new ArgumentNullException(nameof(capabilityManager));
             _chat = chat ?? throw new ArgumentNullException(nameof(chat));
-            _commandManager = commandManager ?? throw new ArgumentNullException(nameof(commandManager));
             _playerData = playerData ?? throw new ArgumentNullException(nameof(playerData));
             _scoreStats = scoreStats ?? throw new ArgumentNullException(nameof(scoreStats));
+            _arenaWork = new ArenaWork(arenaLoop, commandManager, logManager, nameof(PowerBallExtras));
         }
 
         #region Module members
@@ -55,23 +58,24 @@ namespace SS.PowerBall.Modules
 
         bool IArenaAttachableModule.AttachModule(Arena arena)
         {
-            _commandManager.AddCommand("pbhelp", Command_pbhelp, arena);
-            _commandManager.AddCommand("centerball", Command_centerball, arena);
-            _commandManager.AddCommand("endgame", Command_endgame, arena);
-            _commandManager.AddCommand("startgame", Command_startgame, arena);
-            _commandManager.AddCommand("stopgame", Command_stopgame, arena);
-            _commandManager.AddCommand("scoreresetall", Command_scoreresetall, arena);
+            _arenaWork.AddCommand("pbhelp", Command_pbhelp, arena);
+            _arenaWork.AddCommand("centerball", Command_centerball, arena);
+            _arenaWork.AddCommand("endgame", Command_endgame, arena);
+            _arenaWork.AddCommand("startgame", Command_startgame, arena);
+            _arenaWork.AddCommand("stopgame", Command_stopgame, arena);
+            _arenaWork.AddCommand("scoreresetall", Command_scoreresetall, arena);
             return true;
         }
 
         bool IArenaAttachableModule.DetachModule(Arena arena)
         {
-            _commandManager.RemoveCommand("pbhelp", Command_pbhelp, arena);
-            _commandManager.RemoveCommand("centerball", Command_centerball, arena);
-            _commandManager.RemoveCommand("endgame", Command_endgame, arena);
-            _commandManager.RemoveCommand("startgame", Command_startgame, arena);
-            _commandManager.RemoveCommand("stopgame", Command_stopgame, arena);
-            _commandManager.RemoveCommand("scoreresetall", Command_scoreresetall, arena);
+            _arenaWork.RemoveCommand("pbhelp", Command_pbhelp, arena);
+            _arenaWork.RemoveCommand("centerball", Command_centerball, arena);
+            _arenaWork.RemoveCommand("endgame", Command_endgame, arena);
+            _arenaWork.RemoveCommand("startgame", Command_startgame, arena);
+            _arenaWork.RemoveCommand("stopgame", Command_stopgame, arena);
+            _arenaWork.RemoveCommand("scoreresetall", Command_scoreresetall, arena);
+            _arenaWork.Drain(arena);
             return true;
         }
 

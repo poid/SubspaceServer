@@ -4,6 +4,7 @@ using SS.Core.ComponentCallbacks;
 using SS.Core.ComponentInterfaces;
 using SS.Core.Map;
 using SS.PowerBall.ComponentInterfaces;
+using SS.PowerBall.Threading;
 using System;
 using System.Threading;
 
@@ -32,28 +33,30 @@ namespace SS.PowerBall.Modules
         private const int MaxFreqs = 8;
 
         private readonly IArenaManager _arenaManager;
+        private readonly IArenaTimer _arenaTimer;
         private readonly IChat _chat;
-        private readonly ICommandManager _commandManager;
         private readonly IConfigManager _configManager;
         private readonly ILvzObjects _lvzObjects;
-        private readonly IMainloopTimer _mainloopTimer;
+        private readonly ArenaWork _arenaWork;
 
         private ArenaDataKey<ArenaData> _adKey;
 
         public PowerBallLvz(
+            IArenaLoop arenaLoop,
             IArenaManager arenaManager,
+            IArenaTimer arenaTimer,
             IChat chat,
             ICommandManager commandManager,
             IConfigManager configManager,
-            ILvzObjects lvzObjects,
-            IMainloopTimer mainloopTimer)
+            ILogManager logManager,
+            ILvzObjects lvzObjects)
         {
             _arenaManager = arenaManager ?? throw new ArgumentNullException(nameof(arenaManager));
+            _arenaTimer = arenaTimer ?? throw new ArgumentNullException(nameof(arenaTimer));
             _chat = chat ?? throw new ArgumentNullException(nameof(chat));
-            _commandManager = commandManager ?? throw new ArgumentNullException(nameof(commandManager));
             _configManager = configManager ?? throw new ArgumentNullException(nameof(configManager));
             _lvzObjects = lvzObjects ?? throw new ArgumentNullException(nameof(lvzObjects));
-            _mainloopTimer = mainloopTimer ?? throw new ArgumentNullException(nameof(mainloopTimer));
+            _arenaWork = new ArenaWork(arenaLoop, commandManager, logManager, nameof(PowerBallLvz));
         }
 
         #region Module members
@@ -77,6 +80,10 @@ namespace SS.PowerBall.Modules
 
             InitializeArena(arena, ad);
 
+            ad.GameDisplayTimer = new ArenaTimerSlot<Arena>(_arenaTimer, arena, Timer_GameDisplay);
+            ad.AnnounceGameOverTimer = new ArenaTimerSlot<GameOverState>(_arenaTimer, arena, Timer_AnnounceGameOver);
+            ad.AnnounceWinnerTimer = new ArenaTimerSlot<GameOverState>(_arenaTimer, arena, Timer_AnnounceWinner);
+
             BallPickupCallback.Register(arena, Callback_BallPickup);
             BallShootCallback.Register(arena, Callback_BallShoot);
             BallGameGoalCallback.Register(arena, Callback_BallGameGoal);
@@ -84,7 +91,7 @@ namespace SS.PowerBall.Modules
             BallGameOverCallback.Register(arena, Callback_BallGameOver);
             GameTimerChangedCallback.Register(arena, Callback_GameTimerChanged);
 
-            _commandManager.AddCommand("pblvzsversion", Command_pblvzsversion, arena);
+            _arenaWork.AddCommand("pblvzsversion", Command_pblvzsversion, arena);
 
             ad.InterfaceToken = arena.RegisterInterface<IPowerBallLvz>(this);
 
@@ -99,12 +106,12 @@ namespace SS.PowerBall.Modules
             if (ad.InterfaceToken is not null)
                 arena.UnregisterInterface(ref ad.InterfaceToken);
 
-            _mainloopTimer.ClearTimer<Arena>(Timer_GameDisplay, arena);
-            _mainloopTimer.ClearTimer<GameOverState>(Timer_AnnounceGameOver, arena);
-            _mainloopTimer.ClearTimer<GameOverState>(Timer_AnnounceWinner, arena);
-            _mainloopTimer.ClearTimer<DelayedSoundState>(Timer_PlayDelayed, arena);
+            ad.GameDisplayTimer?.Stop();
+            ad.AnnounceGameOverTimer?.Stop();
+            ad.AnnounceWinnerTimer?.Stop();
+            _arenaTimer.ClearTimer<DelayedSoundState>(arena, Timer_PlayDelayed, arena);
 
-            _commandManager.RemoveCommand("pblvzsversion", Command_pblvzsversion, arena);
+            _arenaWork.RemoveCommand("pblvzsversion", Command_pblvzsversion, arena);
 
             BallPickupCallback.Unregister(arena, Callback_BallPickup);
             BallShootCallback.Unregister(arena, Callback_BallShoot);
@@ -112,6 +119,11 @@ namespace SS.PowerBall.Modules
             BallGameStartCallback.Unregister(arena, Callback_BallGameStart);
             BallGameOverCallback.Unregister(arena, Callback_BallGameOver);
             GameTimerChangedCallback.Unregister(arena, Callback_GameTimerChanged);
+
+            _arenaWork.Drain(arena);
+            ad.GameDisplayTimer = null;
+            ad.AnnounceGameOverTimer = null;
+            ad.AnnounceWinnerTimer = null;
 
             return true;
         }
@@ -146,6 +158,16 @@ namespace SS.PowerBall.Modules
 
         private void Callback_BallPickup(Arena arena, Player player, byte ballId)
         {
+            OnBallPickup(arena, player.Freq, ballId);
+        }
+
+        // The freq is read when the ball is picked up, on the thread that fired the callback, so that the indicator
+        // shows the team that actually had it.
+        private void OnBallPickup(Arena arena, short pickupFreq, byte ballId)
+        {
+            if (!_arenaWork.IsCurrent(arena) && _arenaWork.Defer(arena, OnBallPickup, pickupFreq, ballId))
+                return;
+
             if (!arena.TryGetExtraData(_adKey, out ArenaData? ad))
                 return;
 
@@ -154,7 +176,7 @@ namespace SS.PowerBall.Modules
 
             for (int freq = 0; freq < MaxFreqs; freq++)
             {
-                if (freq == player.Freq)
+                if (freq == pickupFreq)
                 {
                     ad.HasBall[freq] = true;
                     SetBall(arena, freq, true, ad);
@@ -169,15 +191,23 @@ namespace SS.PowerBall.Modules
 
         private void Callback_BallShoot(Arena arena, Player player, byte ballId)
         {
-            // Covers the ASSS CB_BALLFIRE and CB_BALLKILL cases (any loss of possession). Turns off the team's ball
-            // indicator. (Faithfully does not clear HasBall[]; the next pickup reconciles it.)
+            OnBallShoot(arena, player.Freq, ballId);
+        }
+
+        private void OnBallShoot(Arena arena, short freq, byte ballId)
+        {
+            // Covers the ASSS CB_BALLFIRE and CB_BALLKILL cases (any loss of possession, including leaving). Turns off the
+            // team's ball indicator. (Faithfully does not clear HasBall[]; the next pickup reconciles it.)
+            if (!_arenaWork.IsCurrent(arena) && _arenaWork.Defer(arena, OnBallShoot, freq, ballId))
+                return;
+
             if (!arena.TryGetExtraData(_adKey, out ArenaData? ad))
                 return;
 
             if ((GetCustomGameMask(arena) & (1 << ballId)) != 0)
                 return;
 
-            SetBall(arena, player.Freq, false, ad);
+            SetBall(arena, freq, false, ad);
         }
 
         #endregion
@@ -186,6 +216,14 @@ namespace SS.PowerBall.Modules
 
         private void Callback_BallGameGoal(Arena arena, Player player, byte ballId, TileCoordinates goalCoordinates)
         {
+            OnBallGameGoal(arena, player.Freq, ballId);
+        }
+
+        private void OnBallGameGoal(Arena arena, short freq, byte ballId)
+        {
+            if (!_arenaWork.IsCurrent(arena) && _arenaWork.Defer(arena, OnBallGameGoal, freq, ballId))
+                return;
+
             if (!arena.TryGetExtraData(_adKey, out ArenaData? ad))
                 return;
 
@@ -195,7 +233,6 @@ namespace SS.PowerBall.Modules
             Span<int> scores = stackalloc int[MaxFreqs];
             ReadScores(arena, scores);
 
-            short freq = player.Freq;
             if (freq < 0 || freq >= MaxFreqs)
                 return;
 
@@ -339,6 +376,9 @@ namespace SS.PowerBall.Modules
 
         private void Callback_BallGameOver(Arena arena, short winnerFreq)
         {
+            if (!_arenaWork.IsCurrent(arena) && _arenaWork.Defer(arena, Callback_BallGameOver, winnerFreq))
+                return;
+
             if (!arena.TryGetExtraData(_adKey, out ArenaData? ad))
                 return;
 
@@ -348,12 +388,12 @@ namespace SS.PowerBall.Modules
             // Timer frame off + clear the clock.
             _lvzObjects.Toggle(arena, PbLvz.Timer, false);
             ad.Lvzs.TimerDisplay = false;
-            _mainloopTimer.ClearTimer<Arena>(Timer_GameDisplay, arena);
+            ad.GameDisplayTimer?.Stop();
             ResetGameTimerLvzs(arena, false, ad);
             ad.TimerPaused = false;
 
             int winner = ad.LastScoringFreq;
-            _mainloopTimer.SetTimer(Timer_AnnounceGameOver, 4000, Timeout.Infinite, new GameOverState(arena, winner), arena);
+            ad.AnnounceGameOverTimer?.Start(4000, Timeout.Infinite, new GameOverState(arena, winner));
 
             ad.RoundStart = false;
             ad.LastScoringFreq = -1;
@@ -363,8 +403,8 @@ namespace SS.PowerBall.Modules
         {
             _chat.SendArenaMessage(state.Arena, PbSound.GameOver, "");
 
-            if (state.Winner != -1)
-                _mainloopTimer.SetTimer(Timer_AnnounceWinner, 3000, Timeout.Infinite, state, state.Arena);
+            if (state.Winner != -1 && state.Arena.TryGetExtraData(_adKey, out ArenaData? ad))
+                ad.AnnounceWinnerTimer?.Start(3000, Timeout.Infinite, state);
 
             return false;
         }
@@ -386,6 +426,9 @@ namespace SS.PowerBall.Modules
 
         private void Callback_BallGameStart(Arena arena)
         {
+            if (!_arenaWork.IsCurrent(arena) && _arenaWork.Defer(arena, Callback_BallGameStart))
+                return;
+
             if (!arena.TryGetExtraData(_adKey, out ArenaData? ad))
                 return;
 
@@ -446,10 +489,9 @@ namespace SS.PowerBall.Modules
             ad.Lvzs.TimerDisplay = true;
 
             int startDelayMs = CalculateLvzTimerValues(arena, ad, seconds);
-            // Clear any existing clock timer first so a restart (e.g. golden-goal extra time) doesn't stack a
-            // second Timer_GameDisplay and run the clock at double speed.
-            _mainloopTimer.ClearTimer<Arena>(Timer_GameDisplay, arena);
-            _mainloopTimer.SetTimer(Timer_GameDisplay, startDelayMs, 10000, arena, arena);
+            // Starting the slot replaces any clock already running, so a restart (e.g. golden-goal extra time) doesn't
+            // stack a second Timer_GameDisplay and run the clock at double speed.
+            ad.GameDisplayTimer?.Start(startDelayMs, 10000, arena);
         }
 
         // Keeps the on-screen game clock in sync when the core game timer is paused/resumed (ASSS pblvzs
@@ -458,6 +500,9 @@ namespace SS.PowerBall.Modules
         // callback carries no time value, so Started/Stopped are left to that path / BallGameOver.
         private void Callback_GameTimerChanged(Arena arena, TimerChange change, TimerChangeReason reason, bool isTimedGame)
         {
+            if (!_arenaWork.IsCurrent(arena) && _arenaWork.Defer(arena, Callback_GameTimerChanged, change, reason, isTimedGame))
+                return;
+
             if (!arena.TryGetExtraData(_adKey, out ArenaData? ad) || !ad.IsLeagueGame)
                 return;
 
@@ -579,7 +624,8 @@ namespace SS.PowerBall.Modules
 
         private void PlayDelayedSound(Arena arena, int delayMs, ChatSound sound)
         {
-            _mainloopTimer.SetTimer(Timer_PlayDelayed, delayMs, Timeout.Infinite, new DelayedSoundState(arena, sound), arena);
+            // Several of these can be pending at once, so each is its own one-shot timer rather than a slot.
+            _arenaTimer.SetTimer(arena, Timer_PlayDelayed, delayMs, Timeout.Infinite, new DelayedSoundState(arena, sound), arena);
         }
 
         private bool Timer_PlayDelayed(DelayedSoundState state)
@@ -707,6 +753,9 @@ namespace SS.PowerBall.Modules
         private sealed class ArenaData : IResettable
         {
             public InterfaceRegistrationToken<IPowerBallLvz>? InterfaceToken;
+            public ArenaTimerSlot<Arena>? GameDisplayTimer;
+            public ArenaTimerSlot<GameOverState>? AnnounceGameOverTimer;
+            public ArenaTimerSlot<GameOverState>? AnnounceWinnerTimer;
 
             public bool RoundStart;
             public int LastScoringFreq;
@@ -724,6 +773,9 @@ namespace SS.PowerBall.Modules
             public bool TryReset()
             {
                 InterfaceToken = null;
+                GameDisplayTimer = null;
+                AnnounceGameOverTimer = null;
+                AnnounceWinnerTimer = null;
                 RoundStart = false;
                 LastScoringFreq = -1;
                 Array.Clear(HasLead);

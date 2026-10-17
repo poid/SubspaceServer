@@ -4,6 +4,7 @@ using SS.Core.ComponentCallbacks;
 using SS.Core.ComponentInterfaces;
 using SS.Core.Map;
 using SS.Packets.Game;
+using SS.PowerBall.Threading;
 using SS.Utilities;
 using System;
 using System.Collections.Generic;
@@ -20,7 +21,7 @@ namespace SS.PowerBall.Modules
     /// clock, starts the goal value at 1 and doubles it every 12 seconds of continuous possession (capped at 32, resets on
     /// turnover), and the first team past 64 points (or the leader at time-up, else sudden death) wins.
     /// <para>
-    /// Deviations from the C original (idiomatic): all state is touched only on the mainloop thread, so the recursive
+    /// Deviations from the C original (idiomatic): all state is touched only on the arena's own thread, so the recursive
     /// per-arena mutex is removed; goals are filtered by the scramble ball id (the C did not filter, which could cross-talk
     /// with other balls in a MultiPub arena); the dead <c>secsleft</c> computation in the pickup handler is dropped; and
     /// the "20 seconds" / "game stopped" announcements are sent once to the arena rather than once per matching player.
@@ -39,37 +40,39 @@ namespace SS.PowerBall.Modules
         private const int WinScore = 64; // strictly greater than this wins (i.e. >= 65)
 
         private readonly IArenaManager _arenaManager;
+        private readonly IArenaTimer _arenaTimer;
         private readonly IBalls _balls;
         private readonly IChat _chat;
-        private readonly ICommandManager _commandManager;
         private readonly IConfigManager _configManager;
         private readonly IGame _game;
-        private readonly IMainloopTimer _mainloopTimer;
         private readonly IObjectPoolManager _objectPoolManager;
         private readonly IPlayerData _playerData;
+        private readonly ArenaWork _arenaWork;
 
         private ArenaDataKey<ArenaData> _adKey;
 
         public ScrambleGame(
+            IArenaLoop arenaLoop,
             IArenaManager arenaManager,
+            IArenaTimer arenaTimer,
             IBalls balls,
             IChat chat,
             ICommandManager commandManager,
             IConfigManager configManager,
             IGame game,
-            IMainloopTimer mainloopTimer,
+            ILogManager logManager,
             IObjectPoolManager objectPoolManager,
             IPlayerData playerData)
         {
             _arenaManager = arenaManager ?? throw new ArgumentNullException(nameof(arenaManager));
+            _arenaTimer = arenaTimer ?? throw new ArgumentNullException(nameof(arenaTimer));
             _balls = balls ?? throw new ArgumentNullException(nameof(balls));
             _chat = chat ?? throw new ArgumentNullException(nameof(chat));
-            _commandManager = commandManager ?? throw new ArgumentNullException(nameof(commandManager));
             _configManager = configManager ?? throw new ArgumentNullException(nameof(configManager));
             _game = game ?? throw new ArgumentNullException(nameof(game));
-            _mainloopTimer = mainloopTimer ?? throw new ArgumentNullException(nameof(mainloopTimer));
             _objectPoolManager = objectPoolManager ?? throw new ArgumentNullException(nameof(objectPoolManager));
             _playerData = playerData ?? throw new ArgumentNullException(nameof(playerData));
+            _arenaWork = new ArenaWork(arenaLoop, commandManager, logManager, nameof(ScrambleGame));
         }
 
         #region Module members
@@ -93,32 +96,42 @@ namespace SS.PowerBall.Modules
 
             LoadConfig(arena, ad);
 
+            ad.PreGameTimer = new ArenaTimerSlot<Arena>(_arenaTimer, arena, Timer_PreGame);
+            ad.DumpStatsTimer = new ArenaTimerSlot<Arena>(_arenaTimer, arena, Timer_DumpStats);
+            ad.UpGoalValueTimer = new ArenaTimerSlot<Arena>(_arenaTimer, arena, Timer_UpGoalValue);
+
             ArenaActionCallback.Register(arena, Callback_ArenaAction);
             BallGoalCallback.Register(arena, Callback_BallGoal);
             BallPickupCallback.Register(arena, Callback_BallPickup);
             ShipFreqChangeCallback.Register(arena, Callback_ShipFreqChange);
 
-            _commandManager.AddCommand("startgm", Command_startgm, arena);
-            _commandManager.AddCommand("stopgm", Command_stopgm, arena);
-            _commandManager.AddCommand("rules", Command_rules, arena);
+            _arenaWork.AddCommand("startgm", Command_startgm, arena);
+            _arenaWork.AddCommand("stopgm", Command_stopgm, arena);
+            _arenaWork.AddCommand("rules", Command_rules, arena);
 
             return true;
         }
 
         bool IArenaAttachableModule.DetachModule(Arena arena)
         {
-            _mainloopTimer.ClearTimer<Arena>(Timer_PreGame, arena);
-            _mainloopTimer.ClearTimer<Arena>(Timer_DumpStats, arena);
-            _mainloopTimer.ClearTimer<Arena>(Timer_UpGoalValue, arena);
+            if (!arena.TryGetExtraData(_adKey, out ArenaData? ad))
+                return false;
 
-            _commandManager.RemoveCommand("startgm", Command_startgm, arena);
-            _commandManager.RemoveCommand("stopgm", Command_stopgm, arena);
-            _commandManager.RemoveCommand("rules", Command_rules, arena);
+            StopTimers(ad);
+
+            _arenaWork.RemoveCommand("startgm", Command_startgm, arena);
+            _arenaWork.RemoveCommand("stopgm", Command_stopgm, arena);
+            _arenaWork.RemoveCommand("rules", Command_rules, arena);
 
             ArenaActionCallback.Unregister(arena, Callback_ArenaAction);
             BallGoalCallback.Unregister(arena, Callback_BallGoal);
             BallPickupCallback.Unregister(arena, Callback_BallPickup);
             ShipFreqChangeCallback.Unregister(arena, Callback_ShipFreqChange);
+
+            _arenaWork.Drain(arena);
+            ad.PreGameTimer = null;
+            ad.DumpStatsTimer = null;
+            ad.UpGoalValueTimer = null;
 
             return true;
         }
@@ -144,6 +157,9 @@ namespace SS.PowerBall.Modules
 
         private void Callback_ArenaAction(Arena arena, ArenaAction action)
         {
+            if (!_arenaWork.IsCurrent(arena) && _arenaWork.Defer(arena, Callback_ArenaAction, action))
+                return;
+
             if (!arena.TryGetExtraData(_adKey, out ArenaData? ad))
                 return;
 
@@ -160,9 +176,7 @@ namespace SS.PowerBall.Modules
             }
             else if (action == ArenaAction.Destroy)
             {
-                _mainloopTimer.ClearTimer<Arena>(Timer_PreGame, arena);
-                _mainloopTimer.ClearTimer<Arena>(Timer_DumpStats, arena);
-                _mainloopTimer.ClearTimer<Arena>(Timer_UpGoalValue, arena);
+                StopTimers(ad);
             }
         }
 
@@ -210,27 +224,30 @@ namespace SS.PowerBall.Modules
             ad.BallFreq = -1;
             ad.GoalValue = 1;
 
-            _mainloopTimer.ClearTimer<Arena>(Timer_DumpStats, arena);
-            _mainloopTimer.ClearTimer<Arena>(Timer_PreGame, arena);
-            _mainloopTimer.ClearTimer<Arena>(Timer_UpGoalValue, arena);
+            StopTimers(ad);
 
-            ArmPreGame(arena, ad.LeagueArena ? 10 : 15000);
+            ArmPreGame(arena, ad, ad.LeagueArena ? 10 : 15000);
         }
 
         private void StopGame(Arena arena, ArenaData ad)
         {
             ad.GameState = 0;
 
-            _mainloopTimer.ClearTimer<Arena>(Timer_DumpStats, arena);
-            _mainloopTimer.ClearTimer<Arena>(Timer_PreGame, arena);
-            _mainloopTimer.ClearTimer<Arena>(Timer_UpGoalValue, arena);
+            StopTimers(ad);
 
             _chat.SendArenaMessage(arena, "Game stopped.");
         }
 
-        private void ArmPreGame(Arena arena, int delayMs)
+        private static void StopTimers(ArenaData ad)
         {
-            _mainloopTimer.SetTimer(Timer_PreGame, delayMs, Timeout.Infinite, arena, arena);
+            ad.DumpStatsTimer?.Stop();
+            ad.PreGameTimer?.Stop();
+            ad.UpGoalValueTimer?.Stop();
+        }
+
+        private static void ArmPreGame(Arena arena, ArenaData ad, int delayMs)
+        {
+            ad.PreGameTimer?.Start(delayMs, Timeout.Infinite, arena);
         }
 
         #endregion
@@ -264,7 +281,7 @@ namespace SS.PowerBall.Modules
                             _chat.SendMessage(p, "Game will begin in 5 seconds.");
                         }
                         ad.GameState = 2;
-                        ArmPreGame(arena, 2000);
+                        ArmPreGame(arena, ad, 2000);
                         break;
 
                     case 2:
@@ -272,14 +289,14 @@ namespace SS.PowerBall.Modules
                             _chat.SendMessage(p, "SCORE: Warbirds:0  Javelins:0");
                         ad.GameState = 3;
                         ad.BallFreq = -1;
-                        ArmPreGame(arena, 1000);
+                        ArmPreGame(arena, ad, 1000);
                         break;
 
                     case 3:
                         foreach (Player p in audience)
                             _chat.SendMessage(p, PbSound.Ready, "READY");
                         ad.GameState = 4;
-                        ArmPreGame(arena, 1000);
+                        ArmPreGame(arena, ad, 1000);
                         break;
 
                     case 4:
@@ -290,7 +307,7 @@ namespace SS.PowerBall.Modules
                             DepleteShip(p, ad);
                         }
                         PlaceScrambleBall(arena, ad);
-                        ArmPreGame(arena, 1000);
+                        ArmPreGame(arena, ad, 1000);
                         break;
 
                     case 5:
@@ -300,8 +317,8 @@ namespace SS.PowerBall.Modules
                             _chat.SendMessage(p, PbSound.Go, "GO!!!");
                         }
                         ad.GameState = 10;
-                        _mainloopTimer.SetTimer(Timer_DumpStats, 901000, Timeout.Infinite, arena, arena);
-                        ArmPreGame(arena, 1000);
+                        ad.DumpStatsTimer?.Start(901000, Timeout.Infinite, arena);
+                        ArmPreGame(arena, ad, 1000);
                         break;
 
                     case 10:
@@ -382,6 +399,16 @@ namespace SS.PowerBall.Modules
 
         private void Callback_BallGoal(Arena arena, Player player, byte ballId, TileCoordinates goalCoordinates)
         {
+            OnBallGoal(arena, player, ballId, player.Ship, player.Freq);
+        }
+
+        // The scorer's ship and freq are read when the goal is scored, so that the goal still counts for the team that
+        // scored it if the scorer has changed or left by the time this runs. Only this arena's game is touched.
+        private void OnBallGoal(Arena arena, Player player, byte ballId, ShipType scorerShip, short scorerFreq)
+        {
+            if (!_arenaWork.IsCurrent(arena) && _arenaWork.DeferUnchecked(arena, OnBallGoal, player, ballId, scorerShip, scorerFreq))
+                return;
+
             if (!arena.TryGetExtraData(_adKey, out ArenaData? ad))
                 return;
 
@@ -404,7 +431,7 @@ namespace SS.PowerBall.Modules
 
                         if (p.Status == PlayerState.Playing && (p.Freq == ad.StartFreq || p.Freq == ad.StartFreq + 1))
                         {
-                            if (p.Freq == player.Freq)
+                            if (p.Freq == scorerFreq)
                                 teamSet.Add(p);
                             else
                                 enemySet.Add(p);
@@ -424,19 +451,19 @@ namespace SS.PowerBall.Modules
                 _chat.SendSetMessage(enemySet, ChatSound.Goal, $"Enemy Goal! by {player.Name}: {ad.GoalValue} point{plural}");
 
                 // Score by ship: Warbird => team 0, anything else => team 1.
-                if (player.Ship == ShipType.Warbird)
+                if (scorerShip == ShipType.Warbird)
                     ad.Scores[0] += ad.GoalValue;
                 else
                     ad.Scores[1] += ad.GoalValue;
 
-                _mainloopTimer.ClearTimer<Arena>(Timer_UpGoalValue, arena);
+                ad.UpGoalValueTimer?.Stop();
 
                 foreach (Player p in audience)
                     _chat.SendMessage(p, $"SCORE: Warbirds:{ad.Scores[0]}  Javelins:{ad.Scores[1]}");
 
                 if (ad.Scores[0] > WinScore || ad.Scores[1] > WinScore || ad.GameState == 11)
                 {
-                    _mainloopTimer.ClearTimer<Arena>(Timer_DumpStats, arena);
+                    ad.DumpStatsTimer?.Stop();
                     ad.GameState = 0;
 
                     foreach (Player p in audience)
@@ -455,6 +482,9 @@ namespace SS.PowerBall.Modules
 
         private void Callback_BallPickup(Arena arena, Player player, byte ballId)
         {
+            if (!_arenaWork.IsCurrent(arena) && _arenaWork.Defer(arena, Callback_BallPickup, player, ballId))
+                return;
+
             if (!arena.TryGetExtraData(_adKey, out ArenaData? ad))
                 return;
 
@@ -476,15 +506,23 @@ namespace SS.PowerBall.Modules
 
                 ad.GoalValue = 1;
                 ad.BallFreq = team;
-                _mainloopTimer.ClearTimer<Arena>(Timer_UpGoalValue, arena);
-                _mainloopTimer.SetTimer(Timer_UpGoalValue, 12000, 12000, arena, arena);
+                ad.UpGoalValueTimer?.Start(12000, 12000, arena);
             }
         }
 
         private void Callback_ShipFreqChange(Player player, ShipType newShip, ShipType oldShip, short newFreq, short oldFreq)
         {
-            Arena? arena = player.Arena;
-            if (arena is null || !arena.TryGetExtraData(_adKey, out ArenaData? ad))
+            if (player.Arena is { } arena)
+                OnShipFreqChange(arena, player);
+        }
+
+        private void OnShipFreqChange(Arena arena, Player player)
+        {
+            // Checked: this strips and warps the player, so it only runs while the player is still here.
+            if (!_arenaWork.IsCurrent(arena) && _arenaWork.Defer(arena, OnShipFreqChange, player))
+                return;
+
+            if (!arena.TryGetExtraData(_adKey, out ArenaData? ad))
                 return;
 
             // Strip prizes on any ship/freq change onto a scramble freq before the game is active.
@@ -624,8 +662,15 @@ namespace SS.PowerBall.Modules
             public int MapCenterY;
             public bool LeagueArena;
 
+            public ArenaTimerSlot<Arena>? PreGameTimer;
+            public ArenaTimerSlot<Arena>? DumpStatsTimer;
+            public ArenaTimerSlot<Arena>? UpGoalValueTimer;
+
             public bool TryReset()
             {
+                PreGameTimer = null;
+                DumpStatsTimer = null;
+                UpGoalValueTimer = null;
                 GameState = 0;
                 Scores[0] = Scores[1] = 0;
                 GoalValue = 0;

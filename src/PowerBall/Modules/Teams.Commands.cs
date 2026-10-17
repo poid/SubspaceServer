@@ -39,13 +39,13 @@ namespace SS.PowerBall.Modules
         private void AddCommands(Arena arena)
         {
             foreach (string name in CommandNames)
-                _commandManager.AddCommand(name, Command_dispatch, arena);
+                _arenaWork.AddCommand(name, Command_dispatch, arena);
         }
 
         private void RemoveCommands(Arena arena)
         {
             foreach (string name in CommandNames)
-                _commandManager.RemoveCommand(name, Command_dispatch, arena);
+                _arenaWork.RemoveCommand(name, Command_dispatch, arena);
         }
 
         [CommandHelp(Targets = CommandTarget.Any, Args = "varies", Description = "PowerBall league team commands. Use ?teamshelp for the list.")]

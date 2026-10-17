@@ -5,6 +5,7 @@ using SS.Core.ComponentInterfaces;
 using SS.Core.Map;
 using SS.Packets.Game;
 using SS.PowerBall.ComponentInterfaces;
+using SS.PowerBall.Threading;
 using SS.Utilities;
 using System;
 using System.Collections.Generic;
@@ -37,43 +38,44 @@ namespace SS.PowerBall.Modules
         private const int AssistTimeout = 1000;         // centiseconds
 
         private readonly IArenaManager _arenaManager;
+        private readonly IArenaTimer _arenaTimer;
         private readonly IBalls _balls;
         private readonly ICapabilityManager _capabilityManager;
         private readonly IChat _chat;
-        private readonly ICommandManager _commandManager;
         private readonly IConfigManager _configManager;
         private readonly ILogManager _logManager;
-        private readonly IMainloopTimer _mainloopTimer;
         private readonly IMapData _mapData;
         private readonly IObjectPoolManager _objectPoolManager;
         private readonly IPlayerData _playerData;
+        private readonly ArenaWork _arenaWork;
 
         private ArenaDataKey<ArenaData> _adKey;
 
         public PowerBallStats(
+            IArenaLoop arenaLoop,
             IArenaManager arenaManager,
+            IArenaTimer arenaTimer,
             IBalls balls,
             ICapabilityManager capabilityManager,
             IChat chat,
             ICommandManager commandManager,
             IConfigManager configManager,
             ILogManager logManager,
-            IMainloopTimer mainloopTimer,
             IMapData mapData,
             IObjectPoolManager objectPoolManager,
             IPlayerData playerData)
         {
             _arenaManager = arenaManager ?? throw new ArgumentNullException(nameof(arenaManager));
+            _arenaTimer = arenaTimer ?? throw new ArgumentNullException(nameof(arenaTimer));
             _balls = balls ?? throw new ArgumentNullException(nameof(balls));
             _capabilityManager = capabilityManager ?? throw new ArgumentNullException(nameof(capabilityManager));
             _chat = chat ?? throw new ArgumentNullException(nameof(chat));
-            _commandManager = commandManager ?? throw new ArgumentNullException(nameof(commandManager));
             _configManager = configManager ?? throw new ArgumentNullException(nameof(configManager));
             _logManager = logManager ?? throw new ArgumentNullException(nameof(logManager));
-            _mainloopTimer = mainloopTimer ?? throw new ArgumentNullException(nameof(mainloopTimer));
             _mapData = mapData ?? throw new ArgumentNullException(nameof(mapData));
             _objectPoolManager = objectPoolManager ?? throw new ArgumentNullException(nameof(objectPoolManager));
             _playerData = playerData ?? throw new ArgumentNullException(nameof(playerData));
+            _arenaWork = new ArenaWork(arenaLoop, commandManager, logManager, nameof(PowerBallStats));
         }
 
         #region Module members
@@ -106,13 +108,14 @@ namespace SS.PowerBall.Modules
             PlayerActionCallback.Register(arena, Callback_PlayerAction);
             KillCallback.Register(arena, Callback_Kill);
 
-            _commandManager.AddCommand("chart", Command_chart, arena);
-            _commandManager.AddCommand("charthelp", Command_charthelp, arena);
-            _commandManager.AddCommand("resetstats", Command_resetstats, arena);
-            _commandManager.AddCommand("pbstatshelp", Command_pbstatshelp, arena);
-            _commandManager.AddCommand("pbstatsversion", Command_pbstatsversion, arena);
+            _arenaWork.AddCommand("chart", Command_chart, arena);
+            _arenaWork.AddCommand("charthelp", Command_charthelp, arena);
+            _arenaWork.AddCommand("resetstats", Command_resetstats, arena);
+            _arenaWork.AddCommand("pbstatshelp", Command_pbstatshelp, arena);
+            _arenaWork.AddCommand("pbstatsversion", Command_pbstatsversion, arena);
 
-            _mainloopTimer.SetTimer(Timer_Base, 1000, 1000, arena, arena);
+            ad.BaseTimer = new ArenaTimerSlot<Arena>(_arenaTimer, arena, Timer_Base);
+            ad.BaseTimer.Start(1000, 1000, arena);
 
             ad.InterfaceToken = arena.RegisterInterface<IPowerBallStats>(this);
 
@@ -127,13 +130,13 @@ namespace SS.PowerBall.Modules
             if (ad.InterfaceToken is not null)
                 arena.UnregisterInterface(ref ad.InterfaceToken);
 
-            _mainloopTimer.ClearTimer<Arena>(Timer_Base, arena);
+            ad.BaseTimer?.Stop();
 
-            _commandManager.RemoveCommand("chart", Command_chart, arena);
-            _commandManager.RemoveCommand("charthelp", Command_charthelp, arena);
-            _commandManager.RemoveCommand("resetstats", Command_resetstats, arena);
-            _commandManager.RemoveCommand("pbstatshelp", Command_pbstatshelp, arena);
-            _commandManager.RemoveCommand("pbstatsversion", Command_pbstatsversion, arena);
+            _arenaWork.RemoveCommand("chart", Command_chart, arena);
+            _arenaWork.RemoveCommand("charthelp", Command_charthelp, arena);
+            _arenaWork.RemoveCommand("resetstats", Command_resetstats, arena);
+            _arenaWork.RemoveCommand("pbstatshelp", Command_pbstatshelp, arena);
+            _arenaWork.RemoveCommand("pbstatsversion", Command_pbstatsversion, arena);
 
             ShipFreqChangeCallback.Unregister(arena, Callback_ShipFreqChange);
             BallPickupCallback.Unregister(arena, Callback_BallPickup);
@@ -143,6 +146,9 @@ namespace SS.PowerBall.Modules
             BallGameStartCallback.Unregister(arena, Callback_BallGameStart);
             PlayerActionCallback.Unregister(arena, Callback_PlayerAction);
             KillCallback.Unregister(arena, Callback_Kill);
+
+            _arenaWork.Drain(arena);
+            ad.BaseTimer = null;
 
             return true;
         }
@@ -271,6 +277,9 @@ namespace SS.PowerBall.Modules
 
         private void Callback_BallPickup(Arena arena, Player player, byte ballId)
         {
+            if (!_arenaWork.IsCurrent(arena) && _arenaWork.Defer(arena, Callback_BallPickup, player, ballId))
+                return;
+
             if (!arena.TryGetExtraData(_adKey, out ArenaData? ad))
                 return;
 
@@ -355,7 +364,11 @@ namespace SS.PowerBall.Modules
         private void Callback_BallShoot(Arena arena, Player player, byte ballId)
         {
             // Possession lost (shot, killed while carrying, or left). This is the single place carry-time and choke are
-            // accounted, covering the ASSS CB_BALLFIRE and the carry-time part of CB_BALLKILL.
+            // accounted, covering the ASSS CB_BALLFIRE and the carry-time part of CB_BALLKILL. Unchecked because leaving
+            // is one of the ways to lose the ball, and only this arena's stats are touched.
+            if (!_arenaWork.IsCurrent(arena) && _arenaWork.DeferUnchecked(arena, Callback_BallShoot, player, ballId))
+                return;
+
             if (!arena.TryGetExtraData(_adKey, out ArenaData? ad))
                 return;
 
@@ -464,6 +477,10 @@ namespace SS.PowerBall.Modules
 
         private void Callback_BallGameGoal(Arena arena, Player player, byte ballId, TileCoordinates goalCoordinates)
         {
+            // Unchecked: the goal counts even if the scorer has left since, and only this arena's stats are touched.
+            if (!_arenaWork.IsCurrent(arena) && _arenaWork.DeferUnchecked(arena, Callback_BallGameGoal, player, ballId, goalCoordinates))
+                return;
+
             if (!arena.TryGetExtraData(_adKey, out ArenaData? ad))
                 return;
 
@@ -518,6 +535,15 @@ namespace SS.PowerBall.Modules
 
         private void Callback_Kill(Arena arena, Player killer, Player killed, short bounty, short flagCount, short points, Prize green)
         {
+            OnKill(arena, killer, killed);
+        }
+
+        private void OnKill(Arena arena, Player killer, Player killed)
+        {
+            // Unchecked: the kill counts even if either player has left since, and only this arena's stats are touched.
+            if (!_arenaWork.IsCurrent(arena) && _arenaWork.DeferUnchecked(arena, OnKill, killer, killed))
+                return;
+
             if (!arena.TryGetExtraData(_adKey, out ArenaData? ad))
                 return;
 
@@ -584,8 +610,18 @@ namespace SS.PowerBall.Modules
 
         private void Callback_ShipFreqChange(Player player, ShipType newShip, ShipType oldShip, short newFreq, short oldFreq)
         {
-            Arena? arena = player.Arena;
-            if (arena is null || !arena.TryGetExtraData(_adKey, out ArenaData? ad))
+            if (player.Arena is { } arena)
+                OnShipFreqChange(arena, player, newShip, oldShip, newFreq, oldFreq);
+        }
+
+        private void OnShipFreqChange(Arena arena, Player player, ShipType newShip, ShipType oldShip, short newFreq, short oldFreq)
+        {
+            // Unchecked: the change is accounted against the freqs it was between rather than the player's current
+            // state, and only this arena's stats are touched.
+            if (!_arenaWork.IsCurrent(arena) && _arenaWork.DeferUnchecked(arena, OnShipFreqChange, player, newShip, oldShip, newFreq, oldFreq))
+                return;
+
+            if (!arena.TryGetExtraData(_adKey, out ArenaData? ad))
                 return;
 
             if (oldFreq > ad.MaxPubFreq && newFreq > ad.MaxPubFreq)
@@ -638,12 +674,18 @@ namespace SS.PowerBall.Modules
 
         private void Callback_BallGameStart(Arena arena)
         {
+            if (!_arenaWork.IsCurrent(arena) && _arenaWork.Defer(arena, Callback_BallGameStart))
+                return;
+
             if (arena.TryGetExtraData(_adKey, out ArenaData? ad) && !ad.RoundStart)
                 RoundStart(arena, ad);
         }
 
         private void Callback_BallGameOver(Arena arena, short winnerFreq)
         {
+            if (!_arenaWork.IsCurrent(arena) && _arenaWork.Defer(arena, Callback_BallGameOver, winnerFreq))
+                return;
+
             if (!arena.TryGetExtraData(_adKey, out ArenaData? ad))
                 return;
 
@@ -662,6 +704,14 @@ namespace SS.PowerBall.Modules
         private void Callback_PlayerAction(Player player, PlayerAction action, Arena? arena)
         {
             if ((action != PlayerAction.LeaveArena && action != PlayerAction.Disconnect) || arena is null)
+                return;
+
+            OnPlayerLeft(arena, player);
+        }
+
+        private void OnPlayerLeft(Arena arena, Player player)
+        {
+            if (!_arenaWork.IsCurrent(arena) && _arenaWork.DeferUnchecked(arena, OnPlayerLeft, player))
                 return;
 
             if (!arena.TryGetExtraData(_adKey, out ArenaData? ad))
@@ -1090,6 +1140,7 @@ namespace SS.PowerBall.Modules
         private sealed class ArenaData : IResettable
         {
             public InterfaceRegistrationToken<IPowerBallStats>? InterfaceToken;
+            public ArenaTimerSlot<Arena>? BaseTimer;
 
             public readonly List<PlayerStats>[] GameStats = [new List<PlayerStats>(), new List<PlayerStats>()];
             public Player? PlayerWithBall;
@@ -1113,6 +1164,7 @@ namespace SS.PowerBall.Modules
             public bool TryReset()
             {
                 InterfaceToken = null;
+                BaseTimer = null;
                 GameStats[0].Clear();
                 GameStats[1].Clear();
                 PlayerWithBall = null;

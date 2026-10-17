@@ -6,6 +6,7 @@ using SS.Core.ComponentInterfaces;
 using SS.Core.Map;
 using SS.Packets.Game;
 using SS.PowerBall.ComponentInterfaces;
+using SS.PowerBall.Threading;
 using System;
 using System.Collections.Generic;
 using System.Text;
@@ -25,6 +26,11 @@ namespace SS.PowerBall.Modules
     /// this module hard-coded an "attach only to the arena literally named 0" guard; that guard is dropped here in favor of
     /// config-driven attachment.
     /// </para>
+    /// <para>
+    /// Per-player state (votes, applied client-setting overrides) is kept in the arena's data rather than in per-player
+    /// data, so that only the arena's own thread ever touches it, and it is dropped when the player leaves. The core
+    /// resets a player's client-setting overrides on leaving an arena, so there is nothing to undo then.
+    /// </para>
     /// </remarks>
     [ModuleInfo("MultiPub controller (ASSS pbpub port): game-type voting/switching, team randomize, side-game routing.")]
     public sealed class MultiPub : IModule, IArenaAttachableModule, IMultiPub, IFreqManagerEnforcerAdvisor
@@ -32,24 +38,25 @@ namespace SS.PowerBall.Modules
         private const string VersionString = "PowerBall MultiPub (C# port of ASSS PB Module v1.2 by POiD)";
 
         private readonly IArenaManager _arenaManager;
+        private readonly IArenaTimer _arenaTimer;
         private readonly IBalls _balls;
         private readonly ICapabilityManager _capabilityManager;
         private readonly IChat _chat;
         private readonly IClientSettings _clientSettings;
-        private readonly ICommandManager _commandManager;
         private readonly IConfigManager _configManager;
         private readonly IGame _game;
         private readonly ILogManager _logManager;
-        private readonly IMainloopTimer _mainloopTimer;
         private readonly IObjectPoolManager _objectPoolManager;
         private readonly IPlayerData _playerData;
         private readonly IPrng _prng;
+        private readonly ArenaWork _arenaWork;
 
         private ArenaDataKey<ArenaData> _adKey;
-        private PlayerDataKey<PlayerData> _pdKey;
 
         public MultiPub(
+            IArenaLoop arenaLoop,
             IArenaManager arenaManager,
+            IArenaTimer arenaTimer,
             IBalls balls,
             ICapabilityManager capabilityManager,
             IChat chat,
@@ -58,24 +65,23 @@ namespace SS.PowerBall.Modules
             IConfigManager configManager,
             IGame game,
             ILogManager logManager,
-            IMainloopTimer mainloopTimer,
             IObjectPoolManager objectPoolManager,
             IPlayerData playerData,
             IPrng prng)
         {
             _arenaManager = arenaManager ?? throw new ArgumentNullException(nameof(arenaManager));
+            _arenaTimer = arenaTimer ?? throw new ArgumentNullException(nameof(arenaTimer));
             _balls = balls ?? throw new ArgumentNullException(nameof(balls));
             _capabilityManager = capabilityManager ?? throw new ArgumentNullException(nameof(capabilityManager));
             _chat = chat ?? throw new ArgumentNullException(nameof(chat));
             _clientSettings = clientSettings ?? throw new ArgumentNullException(nameof(clientSettings));
-            _commandManager = commandManager ?? throw new ArgumentNullException(nameof(commandManager));
             _configManager = configManager ?? throw new ArgumentNullException(nameof(configManager));
             _game = game ?? throw new ArgumentNullException(nameof(game));
             _logManager = logManager ?? throw new ArgumentNullException(nameof(logManager));
-            _mainloopTimer = mainloopTimer ?? throw new ArgumentNullException(nameof(mainloopTimer));
             _objectPoolManager = objectPoolManager ?? throw new ArgumentNullException(nameof(objectPoolManager));
             _playerData = playerData ?? throw new ArgumentNullException(nameof(playerData));
             _prng = prng ?? throw new ArgumentNullException(nameof(prng));
+            _arenaWork = new ArenaWork(arenaLoop, commandManager, logManager, nameof(MultiPub));
         }
 
         #region Module members
@@ -83,14 +89,12 @@ namespace SS.PowerBall.Modules
         bool IModule.Load(IComponentBroker broker)
         {
             _adKey = _arenaManager.AllocateArenaData<ArenaData>();
-            _pdKey = _playerData.AllocatePlayerData<PlayerData>();
             return true;
         }
 
         bool IModule.Unload(IComponentBroker broker)
         {
             _arenaManager.FreeArenaData(ref _adKey);
-            _playerData.FreePlayerData(ref _pdKey);
             return true;
         }
 
@@ -101,6 +105,8 @@ namespace SS.PowerBall.Modules
 
             InitializeArena(arena, ad);
 
+            ad.ChangeMapOnGoalTimer = new ArenaTimerSlot<Arena>(_arenaTimer, arena, Timer_ChangeMapOnGoal);
+
             ArenaActionCallback.Register(arena, Callback_ArenaAction);
             ShipFreqChangeCallback.Register(arena, Callback_ShipFreqChange);
             BallPickupCallback.Register(arena, Callback_BallPickup);
@@ -109,17 +115,17 @@ namespace SS.PowerBall.Modules
             BallGameGoalCallback.Register(arena, Callback_BallGameGoal);
             PlayerActionCallback.Register(arena, Callback_PlayerAction);
 
-            _commandManager.AddCommand("pbpubhelp", Command_pbpubhelp, arena);
-            _commandManager.AddCommand("pbversion", Command_pbversion, arena);
-            _commandManager.AddCommand("randomize", Command_randomize, arena);
-            _commandManager.AddCommand("randomnow", Command_randomnow, arena);
-            _commandManager.AddCommand("changegame", Command_changegame, arena);
-            _commandManager.AddCommand("cg", Command_changegame, arena);
-            _commandManager.AddCommand("changenow", Command_changenow, arena);
-            _commandManager.AddCommand("changemap", Command_changemap, arena);
-            _commandManager.AddCommand("changemapongoal", Command_changemapongoal, arena);
-            _commandManager.AddCommand("togglerandom", Command_togglerandom, arena);
-            _commandManager.AddCommand("pubmode", Command_pubmode, arena);
+            _arenaWork.AddCommand("pbpubhelp", Command_pbpubhelp, arena);
+            _arenaWork.AddCommand("pbversion", Command_pbversion, arena);
+            _arenaWork.AddCommand("randomize", Command_randomize, arena);
+            _arenaWork.AddCommand("randomnow", Command_randomnow, arena);
+            _arenaWork.AddCommand("changegame", Command_changegame, arena);
+            _arenaWork.AddCommand("cg", Command_changegame, arena);
+            _arenaWork.AddCommand("changenow", Command_changenow, arena);
+            _arenaWork.AddCommand("changemap", Command_changemap, arena);
+            _arenaWork.AddCommand("changemapongoal", Command_changemapongoal, arena);
+            _arenaWork.AddCommand("togglerandom", Command_togglerandom, arena);
+            _arenaWork.AddCommand("pubmode", Command_pubmode, arena);
 
             ad.EnforcerAdvisorToken = arena.RegisterAdvisor<IFreqManagerEnforcerAdvisor>(this);
             ad.InterfaceToken = arena.RegisterInterface<IMultiPub>(this);
@@ -137,19 +143,19 @@ namespace SS.PowerBall.Modules
 
             arena.UnregisterAdvisor(ref ad.EnforcerAdvisorToken);
 
-            _mainloopTimer.ClearTimer<Arena>(MainloopTimer_ChangeMapOnGoal, arena);
+            ad.ChangeMapOnGoalTimer?.Stop();
 
-            _commandManager.RemoveCommand("pbpubhelp", Command_pbpubhelp, arena);
-            _commandManager.RemoveCommand("pbversion", Command_pbversion, arena);
-            _commandManager.RemoveCommand("randomize", Command_randomize, arena);
-            _commandManager.RemoveCommand("randomnow", Command_randomnow, arena);
-            _commandManager.RemoveCommand("changegame", Command_changegame, arena);
-            _commandManager.RemoveCommand("cg", Command_changegame, arena);
-            _commandManager.RemoveCommand("changenow", Command_changenow, arena);
-            _commandManager.RemoveCommand("changemap", Command_changemap, arena);
-            _commandManager.RemoveCommand("changemapongoal", Command_changemapongoal, arena);
-            _commandManager.RemoveCommand("togglerandom", Command_togglerandom, arena);
-            _commandManager.RemoveCommand("pubmode", Command_pubmode, arena);
+            _arenaWork.RemoveCommand("pbpubhelp", Command_pbpubhelp, arena);
+            _arenaWork.RemoveCommand("pbversion", Command_pbversion, arena);
+            _arenaWork.RemoveCommand("randomize", Command_randomize, arena);
+            _arenaWork.RemoveCommand("randomnow", Command_randomnow, arena);
+            _arenaWork.RemoveCommand("changegame", Command_changegame, arena);
+            _arenaWork.RemoveCommand("cg", Command_changegame, arena);
+            _arenaWork.RemoveCommand("changenow", Command_changenow, arena);
+            _arenaWork.RemoveCommand("changemap", Command_changemap, arena);
+            _arenaWork.RemoveCommand("changemapongoal", Command_changemapongoal, arena);
+            _arenaWork.RemoveCommand("togglerandom", Command_togglerandom, arena);
+            _arenaWork.RemoveCommand("pubmode", Command_pubmode, arena);
 
             ArenaActionCallback.Unregister(arena, Callback_ArenaAction);
             ShipFreqChangeCallback.Unregister(arena, Callback_ShipFreqChange);
@@ -158,6 +164,9 @@ namespace SS.PowerBall.Modules
             BallGameOverCallback.Unregister(arena, Callback_BallGameOver);
             BallGameGoalCallback.Unregister(arena, Callback_BallGameGoal);
             PlayerActionCallback.Unregister(arena, Callback_PlayerAction);
+
+            _arenaWork.Drain(arena);
+            ad.ChangeMapOnGoalTimer = null;
 
             return true;
         }
@@ -194,6 +203,8 @@ namespace SS.PowerBall.Modules
 
         bool IFreqManagerEnforcerAdvisor.CanChangeToFreq(Player player, short newFreq, StringBuilder? errorMessage)
         {
+            // Called by the freq manager on whichever thread is changing the player's freq, and answered from the
+            // config-derived freq bands only, which are plain ints that change only when the arena's config does.
             Arena? arena = player.Arena;
             if (arena is null || !arena.TryGetExtraData(_adKey, out ArenaData? ad))
                 return true;
@@ -260,6 +271,9 @@ namespace SS.PowerBall.Modules
 
         private void Callback_ArenaAction(Arena arena, ArenaAction action)
         {
+            if (!_arenaWork.IsCurrent(arena) && _arenaWork.Defer(arena, Callback_ArenaAction, action))
+                return;
+
             if (!arena.TryGetExtraData(_adKey, out ArenaData? ad))
                 return;
 
@@ -457,8 +471,7 @@ namespace SS.PowerBall.Modules
                     if (otherPlayer.Ship == ShipType.Spec && otherPlayer.Freq <= ad.MaxPubFreq)
                         continue;
 
-                    if (!otherPlayer.TryGetExtraData(_pdKey, out PlayerData? opd))
-                        continue;
+                    PubPlayerState opd = GetPlayerState(ad, otherPlayer);
 
                     total++;
 
@@ -733,8 +746,7 @@ namespace SS.PowerBall.Modules
                     if (otherPlayer.Arena != arena || otherPlayer.Status != PlayerState.Playing || otherPlayer.Ship == ShipType.Spec)
                         continue;
 
-                    if (!otherPlayer.TryGetExtraData(_pdKey, out PlayerData? opd))
-                        continue;
+                    PubPlayerState opd = GetPlayerState(ad, otherPlayer);
 
                     if (!isCheck && otherPlayer == player)
                         opd.ChangeGameTypeVote = vote;
@@ -852,13 +864,13 @@ namespace SS.PowerBall.Modules
             try
             {
                 // Clear every player's randomize vote; count placeable players.
+                foreach (PubPlayerState state in ad.Players.Values)
+                    state.RandomizeVote = false;
+
                 foreach (Player player in _playerData.Players)
                 {
                     if (player.Arena != arena)
                         continue;
-
-                    if (player.TryGetExtraData(_pdKey, out PlayerData? pd))
-                        pd.RandomizeVote = false;
 
                     if (player.Status == PlayerState.Playing && player.Ship != ShipType.Spec)
                         total++;
@@ -929,12 +941,24 @@ namespace SS.PowerBall.Modules
 
         private void Callback_ShipFreqChange(Player player, ShipType newShip, ShipType oldShip, short newFreq, short oldFreq)
         {
-            Arena? arena = player.Arena;
-            if (arena is null || !arena.TryGetExtraData(_adKey, out ArenaData? ad))
+            if (player.Arena is { } arena)
+                OnShipFreqChange(arena, player, newShip, oldShip, newFreq, oldFreq);
+        }
+
+        private void OnShipFreqChange(Arena arena, Player player, ShipType newShip, ShipType oldShip, short newFreq, short oldFreq)
+        {
+            if (!_arenaWork.IsCurrent(arena) && _arenaWork.Defer(arena, OnShipFreqChange, player, newShip, oldShip, newFreq, oldFreq))
                 return;
 
-            if (!player.TryGetExtraData(_pdKey, out PlayerData? pd))
+            // A change handed over from the mainloop can be overtaken by another before it runs. Acting on this one
+            // would then put the player back on a freq they have already left; the later change has its own call.
+            if (player.Ship != newShip || player.Freq != newFreq)
                 return;
+
+            if (!arena.TryGetExtraData(_adKey, out ArenaData? ad))
+                return;
+
+            PubPlayerState pd = GetPlayerState(ad, player);
 
             if (newFreq > ad.MaxPubFreq && newFreq != ad.SpecFreq)
             {
@@ -972,7 +996,7 @@ namespace SS.PowerBall.Modules
             // The remaining pub-freq rebalance logic was commented out in ASSS; nothing to do.
         }
 
-        private void ApplyScrambleSettings(Player player, PlayerData pd, ArenaData ad, short newFreq, bool warp)
+        private void ApplyScrambleSettings(Player player, PubPlayerState pd, ArenaData ad, short newFreq, bool warp)
         {
             string ship = (newFreq % 2 == 0) ? "Warbird" : "Javelin";
 
@@ -996,7 +1020,7 @@ namespace SS.PowerBall.Modules
             _logManager.LogP(LogLevel.Info, nameof(MultiPub), player, "Sent to Scramble");
         }
 
-        private void ApplyProballSettings(Player player, PlayerData pd, ArenaData ad, short newFreq, bool warp)
+        private void ApplyProballSettings(Player player, PubPlayerState pd, ArenaData ad, short newFreq, bool warp)
         {
             string ship = (newFreq % 2 == 0) ? "Warbird" : "Javelin";
 
@@ -1020,7 +1044,7 @@ namespace SS.PowerBall.Modules
             _logManager.LogP(LogLevel.Info, nameof(MultiPub), player, "Sent to Proball");
         }
 
-        private void ApplySmall4TmSettings(Player player, PlayerData pd, ArenaData ad, short newFreq, bool warp)
+        private void ApplySmall4TmSettings(Player player, PubPlayerState pd, ArenaData ad, short newFreq, bool warp)
         {
             Override(player, pd, "Warbird", "SoccerThrowTime", ad.Small4TmThrowTime);
             Override(player, pd, "Javelin", "SoccerThrowTime", ad.Small4TmThrowTime);
@@ -1046,7 +1070,7 @@ namespace SS.PowerBall.Modules
             _logManager.LogP(LogLevel.Info, nameof(MultiPub), player, "Sent to Small4Tm");
         }
 
-        private void Override(Player player, PlayerData pd, string section, string key, int value)
+        private void Override(Player player, PubPlayerState pd, string section, string key, int value)
         {
             if (!_clientSettings.TryGetSettingsIdentifier(section, key, out ClientSettingIdentifier id))
             {
@@ -1058,7 +1082,7 @@ namespace SS.PowerBall.Modules
             pd.ClientOverrides.Add(id);
         }
 
-        private void UnoverrideAll(Player player, PlayerData pd)
+        private void UnoverrideAll(Player player, PubPlayerState pd)
         {
             if (pd.ClientOverrides.Count == 0)
                 return;
@@ -1076,6 +1100,9 @@ namespace SS.PowerBall.Modules
 
         private void Callback_BallPickup(Arena arena, Player player, byte ballId)
         {
+            if (!_arenaWork.IsCurrent(arena) && _arenaWork.Defer(arena, Callback_BallPickup, player, ballId))
+                return;
+
             if (!arena.TryGetExtraData(_adKey, out ArenaData? ad))
                 return;
 
@@ -1090,6 +1117,9 @@ namespace SS.PowerBall.Modules
 
         private void Callback_BallGameStart(Arena arena)
         {
+            if (!_arenaWork.IsCurrent(arena) && _arenaWork.Defer(arena, Callback_BallGameStart))
+                return;
+
             if (!arena.TryGetExtraData(_adKey, out ArenaData? ad))
                 return;
 
@@ -1098,6 +1128,9 @@ namespace SS.PowerBall.Modules
 
         private void Callback_BallGameOver(Arena arena, short winnerFreq)
         {
+            if (!_arenaWork.IsCurrent(arena) && _arenaWork.Defer(arena, Callback_BallGameOver, winnerFreq))
+                return;
+
             if (!arena.TryGetExtraData(_adKey, out ArenaData? ad))
                 return;
 
@@ -1114,6 +1147,14 @@ namespace SS.PowerBall.Modules
 
         private void Callback_BallGameGoal(Arena arena, Player player, byte ballId, TileCoordinates goalCoordinates)
         {
+            OnBallGameGoal(arena, ballId);
+        }
+
+        private void OnBallGameGoal(Arena arena, byte ballId)
+        {
+            if (!_arenaWork.IsCurrent(arena) && _arenaWork.Defer(arena, OnBallGameGoal, ballId))
+                return;
+
             if (!arena.TryGetExtraData(_adKey, out ArenaData? ad))
                 return;
 
@@ -1122,16 +1163,38 @@ namespace SS.PowerBall.Modules
 
             if (ad.ChangeMapOnGoal != "-")
             {
-                // Defer the map change slightly so it doesn't run inside the goal handling. Clear any pending one
-                // first so two goals within 100ms (multi-ball) don't stack two timers.
-                _mainloopTimer.ClearTimer<Arena>(MainloopTimer_ChangeMapOnGoal, arena);
-                _mainloopTimer.SetTimer(MainloopTimer_ChangeMapOnGoal, 100, Timeout.Infinite, arena, arena);
+                // Defer the map change slightly so it doesn't run inside the goal handling. Starting the slot replaces
+                // any pending one, so two goals within 100ms (multi-ball) don't stack two changes.
+                ad.ChangeMapOnGoalTimer?.Start(100, Timeout.Infinite, arena);
             }
         }
 
         private void Callback_PlayerAction(Player player, PlayerAction action, Arena? arena)
         {
-            if (action != PlayerAction.EnterArena || arena is null || !arena.TryGetExtraData(_adKey, out ArenaData? ad))
+            if (arena is null)
+                return;
+
+            if (action == PlayerAction.EnterArena)
+                OnPlayerEntered(arena, player);
+            else if (action == PlayerAction.LeaveArena || action == PlayerAction.Disconnect)
+                OnPlayerLeft(arena, player);
+        }
+
+        private void OnPlayerLeft(Arena arena, Player player)
+        {
+            if (!_arenaWork.IsCurrent(arena) && _arenaWork.DeferUnchecked(arena, OnPlayerLeft, player))
+                return;
+
+            if (arena.TryGetExtraData(_adKey, out ArenaData? ad))
+                ad.Players.Remove(player);
+        }
+
+        private void OnPlayerEntered(Arena arena, Player player)
+        {
+            if (!_arenaWork.IsCurrent(arena) && _arenaWork.Defer(arena, OnPlayerEntered, player))
+                return;
+
+            if (!arena.TryGetExtraData(_adKey, out ArenaData? ad))
                 return;
 
             _chat.SendMessage(player, "Welcome to PowerBall!");
@@ -1194,7 +1257,7 @@ namespace SS.PowerBall.Modules
             return freq <= 1;
         }
 
-        private bool MainloopTimer_ChangeMapOnGoal(Arena arena)
+        private bool Timer_ChangeMapOnGoal(Arena arena)
         {
             if (arena.TryGetExtraData(_adKey, out ArenaData? ad) && ChangeMapSilent(arena, ad))
                 _balls.TrySpawnBall(arena, 0);
@@ -1363,10 +1426,25 @@ namespace SS.PowerBall.Modules
             BurstMax: 0, WarbirdFireEnergy: 20, JavelinFireEnergy: 30, PortalMax: 2, SoccerThrowTime: 775,
             BrickMax: 1, RepelMax: 0, InitialEnergy: 1500, MaximumEnergy: 1500, RepelPrize: 0);
 
+        private static PubPlayerState GetPlayerState(ArenaData ad, Player player)
+        {
+            if (!ad.Players.TryGetValue(player, out PubPlayerState? state))
+            {
+                state = new PubPlayerState();
+                ad.Players.Add(player, state);
+            }
+
+            return state;
+        }
+
         private sealed class ArenaData : IResettable
         {
             public AdvisorRegistrationToken<IFreqManagerEnforcerAdvisor>? EnforcerAdvisorToken;
             public InterfaceRegistrationToken<IMultiPub>? InterfaceToken;
+            public ArenaTimerSlot<Arena>? ChangeMapOnGoalTimer;
+
+            // Per-player state for the players in this arena, created on first use and removed when they leave.
+            public readonly Dictionary<Player, PubPlayerState> Players = [];
 
             // runtime state
             public PbGameType GameType;
@@ -1394,6 +1472,8 @@ namespace SS.PowerBall.Modules
             {
                 EnforcerAdvisorToken = null;
                 InterfaceToken = null;
+                ChangeMapOnGoalTimer = null;
+                Players.Clear();
                 GameType = PbGameType.Any;
                 RandomizeTeamsOnEnd = true;
                 RoundStart = false;
@@ -1416,19 +1496,11 @@ namespace SS.PowerBall.Modules
             }
         }
 
-        private sealed class PlayerData : IResettable
+        private sealed class PubPlayerState
         {
             public bool RandomizeVote;
             public PbGameType ChangeGameTypeVote;
             public readonly List<ClientSettingIdentifier> ClientOverrides = [];
-
-            public bool TryReset()
-            {
-                RandomizeVote = false;
-                ChangeGameTypeVote = PbGameType.Any;
-                ClientOverrides.Clear();
-                return true;
-            }
         }
 
         #endregion

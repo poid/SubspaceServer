@@ -3,6 +3,7 @@ using SS.Core;
 using SS.Core.ComponentCallbacks;
 using SS.Core.ComponentInterfaces;
 using SS.Core.Map;
+using SS.PowerBall.Threading;
 using System;
 using System.Collections.Generic;
 
@@ -31,13 +32,17 @@ namespace SS.PowerBall.Modules
         private readonly IConfigManager _configManager;
         private readonly IObjectPoolManager _objectPoolManager;
         private readonly IPlayerData _playerData;
+        private readonly ArenaWork _arenaWork;
 
         private ArenaDataKey<ArenaData> _adKey;
 
         public ProBallGame(
+            IArenaLoop arenaLoop,
             IArenaManager arenaManager,
             IChat chat,
+            ICommandManager commandManager,
             IConfigManager configManager,
+            ILogManager logManager,
             IObjectPoolManager objectPoolManager,
             IPlayerData playerData)
         {
@@ -46,6 +51,7 @@ namespace SS.PowerBall.Modules
             _configManager = configManager ?? throw new ArgumentNullException(nameof(configManager));
             _objectPoolManager = objectPoolManager ?? throw new ArgumentNullException(nameof(objectPoolManager));
             _playerData = playerData ?? throw new ArgumentNullException(nameof(playerData));
+            _arenaWork = new ArenaWork(arenaLoop, commandManager, logManager, nameof(ProBallGame));
         }
 
         #region Module members
@@ -80,6 +86,7 @@ namespace SS.PowerBall.Modules
             // Note: the ASSS original mistakenly re-registered CB_ARENAACTION here instead of unregistering it. Fixed.
             BallGoalCallback.Unregister(arena, Callback_BallGoal);
             ArenaActionCallback.Unregister(arena, Callback_ArenaAction);
+            _arenaWork.Drain(arena);
 
             return true;
         }
@@ -103,6 +110,9 @@ namespace SS.PowerBall.Modules
 
         private void Callback_ArenaAction(Arena arena, ArenaAction action)
         {
+            if (!_arenaWork.IsCurrent(arena) && _arenaWork.Defer(arena, Callback_ArenaAction, action))
+                return;
+
             if (!arena.TryGetExtraData(_adKey, out ArenaData? ad))
                 return;
 
@@ -121,6 +131,16 @@ namespace SS.PowerBall.Modules
 
         private void Callback_BallGoal(Arena arena, Player player, byte ballId, TileCoordinates goalCoordinates)
         {
+            OnBallGoal(arena, player, ballId, goalCoordinates, player.Freq);
+        }
+
+        // The scorer's freq is read when the goal is scored, so that the messages still go to the right teams if the
+        // scorer has changed or left by the time this runs. Only this arena's game is touched.
+        private void OnBallGoal(Arena arena, Player player, byte ballId, TileCoordinates goalCoordinates, short scorerFreq)
+        {
+            if (!_arenaWork.IsCurrent(arena) && _arenaWork.DeferUnchecked(arena, OnBallGoal, player, ballId, goalCoordinates, scorerFreq))
+                return;
+
             if (!arena.TryGetExtraData(_adKey, out ArenaData? ad))
                 return;
 
@@ -144,7 +164,7 @@ namespace SS.PowerBall.Modules
                         if (other.Arena != arena || !IsProballPlayerOrSpec(other, ad))
                             continue;
 
-                        if (other.Freq == player.Freq)
+                        if (other.Freq == scorerFreq)
                             teamSet.Add(other);
                         else
                             enemySet.Add(other);

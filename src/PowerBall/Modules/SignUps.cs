@@ -1,6 +1,7 @@
 using SS.Core;
 using SS.Core.ComponentInterfaces;
 using SS.PowerBall.ComponentInterfaces;
+using SS.PowerBall.Threading;
 using System;
 using System.Collections.Generic;
 using System.Threading.Tasks;
@@ -13,8 +14,10 @@ namespace SS.PowerBall.Modules
     /// </summary>
     /// <remarks>
     /// The ASSS original used a callback-based async DB; this port uses <c>async</c>/<c>await</c> over
-    /// <see cref="ILeagueDatabase"/>. Only chat side effects happen after an <c>await</c>, so no mainloop re-marshaling is
-    /// needed (chat is thread-safe). Names are matched case-insensitively.
+    /// <see cref="ILeagueDatabase"/>. The commands run on the arena's own thread like the rest of the PowerBall modules,
+    /// since they read the arena's active event from the Teams module, but only chat side effects happen after an
+    /// <c>await</c>, so those continuations are left to resume on the thread pool (chat is thread-safe). Names are
+    /// matched case-insensitively.
     /// </remarks>
     [ModuleInfo("Event sign-up lists (ASSS signups port). Requires the PowerBallDatabase module.")]
     public sealed class SignUps : IModule, IArenaAttachableModule, ISignUps
@@ -23,13 +26,14 @@ namespace SS.PowerBall.Modules
 
         private readonly ILeagueDatabase _db;
         private readonly IChat _chat;
-        private readonly ICommandManager _commandManager;
         private readonly ICapabilityManager _capabilityManager;
         private readonly ILogManager _logManager;
+        private readonly ArenaWork _arenaWork;
 
         private InterfaceRegistrationToken<ISignUps>? _iSignUpsToken;
 
         public SignUps(
+            IArenaLoop arenaLoop,
             ILeagueDatabase db,
             IChat chat,
             ICommandManager commandManager,
@@ -38,9 +42,9 @@ namespace SS.PowerBall.Modules
         {
             _db = db ?? throw new ArgumentNullException(nameof(db));
             _chat = chat ?? throw new ArgumentNullException(nameof(chat));
-            _commandManager = commandManager ?? throw new ArgumentNullException(nameof(commandManager));
             _capabilityManager = capabilityManager ?? throw new ArgumentNullException(nameof(capabilityManager));
             _logManager = logManager ?? throw new ArgumentNullException(nameof(logManager));
+            _arenaWork = new ArenaWork(arenaLoop, commandManager, logManager, nameof(SignUps));
         }
 
         #region Module members
@@ -61,41 +65,42 @@ namespace SS.PowerBall.Modules
 
         bool IArenaAttachableModule.AttachModule(Arena arena)
         {
-            _commandManager.AddCommand("signupshelp", Command_signupshelp, arena);
-            _commandManager.AddCommand("signupsversion", Command_signupsversion, arena);
-            _commandManager.AddCommand("addevent", Command_addevent, arena);
-            _commandManager.AddCommand("delevent", Command_delevent, arena);
-            _commandManager.AddCommand("chgevent", Command_chgevent, arena);
-            _commandManager.AddCommand("listevents", Command_listevents, arena);
-            _commandManager.AddCommand("startsignups", Command_startsignups, arena);
-            _commandManager.AddCommand("endsignups", Command_endsignups, arena);
-            _commandManager.AddCommand("listsignups", Command_listsignups, arena);
-            _commandManager.AddCommand("signups", Command_listsignups, arena);
-            _commandManager.AddCommand("clearsignups", Command_clearsignups, arena);
-            _commandManager.AddCommand("signup", Command_signup, arena);
-            _commandManager.AddCommand("removesignup", Command_removesignup, arena);
-            _commandManager.AddCommand("forcesignup", Command_signup, arena);
-            _commandManager.AddCommand("forceremovesignup", Command_removesignup, arena);
+            _arenaWork.AddCommand("signupshelp", Command_signupshelp, arena);
+            _arenaWork.AddCommand("signupsversion", Command_signupsversion, arena);
+            _arenaWork.AddCommand("addevent", Command_addevent, arena);
+            _arenaWork.AddCommand("delevent", Command_delevent, arena);
+            _arenaWork.AddCommand("chgevent", Command_chgevent, arena);
+            _arenaWork.AddCommand("listevents", Command_listevents, arena);
+            _arenaWork.AddCommand("startsignups", Command_startsignups, arena);
+            _arenaWork.AddCommand("endsignups", Command_endsignups, arena);
+            _arenaWork.AddCommand("listsignups", Command_listsignups, arena);
+            _arenaWork.AddCommand("signups", Command_listsignups, arena);
+            _arenaWork.AddCommand("clearsignups", Command_clearsignups, arena);
+            _arenaWork.AddCommand("signup", Command_signup, arena);
+            _arenaWork.AddCommand("removesignup", Command_removesignup, arena);
+            _arenaWork.AddCommand("forcesignup", Command_signup, arena);
+            _arenaWork.AddCommand("forceremovesignup", Command_removesignup, arena);
             return true;
         }
 
         bool IArenaAttachableModule.DetachModule(Arena arena)
         {
-            _commandManager.RemoveCommand("signupshelp", Command_signupshelp, arena);
-            _commandManager.RemoveCommand("signupsversion", Command_signupsversion, arena);
-            _commandManager.RemoveCommand("addevent", Command_addevent, arena);
-            _commandManager.RemoveCommand("delevent", Command_delevent, arena);
-            _commandManager.RemoveCommand("chgevent", Command_chgevent, arena);
-            _commandManager.RemoveCommand("listevents", Command_listevents, arena);
-            _commandManager.RemoveCommand("startsignups", Command_startsignups, arena);
-            _commandManager.RemoveCommand("endsignups", Command_endsignups, arena);
-            _commandManager.RemoveCommand("listsignups", Command_listsignups, arena);
-            _commandManager.RemoveCommand("signups", Command_listsignups, arena);
-            _commandManager.RemoveCommand("clearsignups", Command_clearsignups, arena);
-            _commandManager.RemoveCommand("signup", Command_signup, arena);
-            _commandManager.RemoveCommand("removesignup", Command_removesignup, arena);
-            _commandManager.RemoveCommand("forcesignup", Command_signup, arena);
-            _commandManager.RemoveCommand("forceremovesignup", Command_removesignup, arena);
+            _arenaWork.RemoveCommand("signupshelp", Command_signupshelp, arena);
+            _arenaWork.RemoveCommand("signupsversion", Command_signupsversion, arena);
+            _arenaWork.RemoveCommand("addevent", Command_addevent, arena);
+            _arenaWork.RemoveCommand("delevent", Command_delevent, arena);
+            _arenaWork.RemoveCommand("chgevent", Command_chgevent, arena);
+            _arenaWork.RemoveCommand("listevents", Command_listevents, arena);
+            _arenaWork.RemoveCommand("startsignups", Command_startsignups, arena);
+            _arenaWork.RemoveCommand("endsignups", Command_endsignups, arena);
+            _arenaWork.RemoveCommand("listsignups", Command_listsignups, arena);
+            _arenaWork.RemoveCommand("signups", Command_listsignups, arena);
+            _arenaWork.RemoveCommand("clearsignups", Command_clearsignups, arena);
+            _arenaWork.RemoveCommand("signup", Command_signup, arena);
+            _arenaWork.RemoveCommand("removesignup", Command_removesignup, arena);
+            _arenaWork.RemoveCommand("forcesignup", Command_signup, arena);
+            _arenaWork.RemoveCommand("forceremovesignup", Command_removesignup, arena);
+            _arenaWork.Drain(arena);
             return true;
         }
 

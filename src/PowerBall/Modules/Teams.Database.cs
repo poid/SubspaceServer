@@ -24,9 +24,9 @@ namespace SS.PowerBall.Modules
         private void UsingSignupList(Arena arena, ArenaData ad, Player picker, Team team, string targetName, bool captainPath)
         {
             string ev = ad.ActiveEvent!;
-            RunGuarded(async () =>
+            RunGuarded(arena, async () =>
             {
-                SignUpMatch match = await _signUps.IsPlayerSignedUpAsync(ev, targetName); // resumes on the mainloop
+                SignUpMatch match = await _signUps.IsPlayerSignedUpAsync(ev, targetName); // resumes on the arena's thread
 
                 switch (match.Count)
                 {
@@ -38,10 +38,10 @@ namespace SS.PowerBall.Modules
                         return;
 
                     case 1:
-                        // Re-validate after the await: the arena may have recycled, the event/team may have changed,
-                        // and (crucially) an earlier ?pick for the same turn may have already advanced the pick — so a
-                        // spammed second pick doesn't slip a second player onto one turn.
-                        if (!arena.TryGetExtraData(_adKey, out ArenaData? liveAd)
+                        // Re-validate after the await: the arena may have recycled or the module detached, the event/team
+                        // may have changed, and (crucially) an earlier ?pick for the same turn may have already advanced
+                        // the pick — so a spammed second pick doesn't slip a second player onto one turn.
+                        if (!TryGetLiveArenaData(arena, out ArenaData? liveAd)
                             || liveAd.ActiveEvent != ev
                             || !liveAd.Teams.Contains(team))
                             return;
@@ -100,7 +100,7 @@ namespace SS.PowerBall.Modules
             }
 
             string ev = args.ToString();
-            RunGuarded(async () =>
+            RunGuarded(arena, async () =>
             {
                 if (!await _signUps.IsValidEventAsync(ev))
                 {
@@ -108,8 +108,8 @@ namespace SS.PowerBall.Modules
                     return;
                 }
 
-                // Re-fetch after the await in case the arena recycled during the DB round-trip.
-                if (!arena.TryGetExtraData(_adKey, out ArenaData? liveAd))
+                // Re-fetch after the await in case the arena recycled or the module detached during the DB round-trip.
+                if (!TryGetLiveArenaData(arena, out ArenaData? liveAd))
                     return;
 
                 liveAd.ActiveEvent = ev;
@@ -145,7 +145,7 @@ namespace SS.PowerBall.Modules
                 }
 
                 List<TeamSnapshot> snapshot = SnapshotTeams(ad);
-                RunGuarded(async () =>
+                RunGuarded(arena, async () =>
                 {
                     List<string> teamNames = new(snapshot.Count);
                     foreach (TeamSnapshot t in snapshot)
@@ -161,8 +161,8 @@ namespace SS.PowerBall.Modules
                         return;
                     }
 
-                    // Re-fetch after the await in case the arena recycled during the existence check.
-                    if (!arena.TryGetExtraData(_adKey, out ArenaData? liveAd))
+                    // Re-fetch after the await in case the arena recycled or the module detached during the existence check.
+                    if (!TryGetLiveArenaData(arena, out ArenaData? liveAd))
                         return;
 
                     liveAd.SaveTeams = true;
@@ -318,7 +318,7 @@ namespace SS.PowerBall.Modules
             }
 
             string name = nameSpan.Trim().ToString();
-            RunGuarded(async () =>
+            RunGuarded(arena, async () =>
             {
                 IReadOnlyList<SavedTeamInfo> matches = await _db.FindTeamsAsync(name);
                 if (matches.Count == 0)
@@ -337,8 +337,8 @@ namespace SS.PowerBall.Modules
 
                 SavedTeamInfo chosen = PickExactOrFirst(matches, name);
 
-                // Re-fetch after the first DB round-trip in case the arena recycled during it.
-                if (!arena.TryGetExtraData(_adKey, out ArenaData? liveAd))
+                // Re-fetch after the first DB round-trip in case the arena recycled or the module detached during it.
+                if (!TryGetLiveArenaData(arena, out ArenaData? liveAd))
                     return;
 
                 Team? team = AddTeam(arena, liveAd, null, freq, chosen.Name, isLoaded: true);
@@ -352,9 +352,9 @@ namespace SS.PowerBall.Modules
 
                 IReadOnlyList<string> players = await _db.GetTeamPlayersAsync(chosen.Name);
 
-                // Re-validate after the second round-trip: the arena may have recycled, or the team we just added may
-                // have been removed by a concurrent ?newteams/?removeteam.
-                if (!arena.TryGetExtraData(_adKey, out liveAd) || !liveAd.Teams.Contains(team))
+                // Re-validate after the second round-trip: the arena may have recycled or the module detached, or the
+                // team we just added may have been removed by a ?newteams/?removeteam in the meantime.
+                if (!TryGetLiveArenaData(arena, out liveAd) || !liveAd.Teams.Contains(team))
                     return;
 
                 foreach (string p in players)
@@ -442,14 +442,27 @@ namespace SS.PowerBall.Modules
         private void RunDb(Func<Task> action)
         {
             // Serialize DB writes so dependent writes (a team row, then its captain/players) commit in the order they
-            // were submitted on the mainloop, instead of racing on separate connections — otherwise a child row can be
-            // written before its parent commits and silently insert 0 rows.
+            // were submitted, instead of racing on separate connections — otherwise a child row can be written before
+            // its parent commits and silently insert 0 rows. The writes touch only the database, so they run on the
+            // thread pool; the lock is because arenas on different threads can submit at once.
             lock (_dbWriteChainLock)
             {
                 _dbWriteChain = _dbWriteChain.ContinueWith(_ => RunGuardedAsync(action), TaskScheduler.Default).Unwrap();
             }
         }
 
+        /// <summary>
+        /// Runs database work whose continuations touch the arena's teams, so they resume on the arena's thread.
+        /// </summary>
+        private void RunGuarded(Arena arena, Func<Task> action)
+        {
+            _ = _arenaWork.RunAsync(arena, () => RunGuardedAsync(action));
+        }
+
+        /// <summary>
+        /// Runs database work whose continuations only send chat messages, which is safe from any thread, so they
+        /// resume wherever the database call finished.
+        /// </summary>
         private void RunGuarded(Func<Task> action)
         {
             _ = RunGuardedAsync(action);

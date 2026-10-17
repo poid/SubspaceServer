@@ -4,6 +4,7 @@ using SS.Core.ComponentCallbacks;
 using SS.Core.ComponentInterfaces;
 using SS.PowerBall.ComponentCallbacks;
 using SS.PowerBall.ComponentInterfaces;
+using SS.PowerBall.Threading;
 using System;
 using System.Collections.Generic;
 
@@ -23,6 +24,11 @@ namespace SS.PowerBall.Modules
     /// order state machine), Teams.Commands.cs (the ? commands), and Teams.Database.cs (saved-team persistence and
     /// sign-up integration).
     /// </para>
+    /// <para>
+    /// Everything runs on the arena's own thread, including the continuations of the database calls (see
+    /// <see cref="ArenaWork.RunAsync"/>). Those can arrive after the module has been detached, so they re-check
+    /// <see cref="TryGetLiveArenaData"/> before touching anything.
+    /// </para>
     /// </remarks>
     [ModuleInfo("League team drafting/captains/rosters (ASSS teams port). Requires PowerBallDatabase + SignUps.")]
     public sealed partial class Teams : IModule, IArenaAttachableModule, ITeams
@@ -31,7 +37,6 @@ namespace SS.PowerBall.Modules
         private readonly IBalls _balls;
         private readonly ICapabilityManager _capabilityManager;
         private readonly IChat _chat;
-        private readonly ICommandManager _commandManager;
         private readonly IConfigManager _configManager;
         private readonly IGame _game;
         private readonly ILeagueDatabase _db;
@@ -41,10 +46,12 @@ namespace SS.PowerBall.Modules
         private readonly IPrng _prng;
         private readonly IScoreStats _scoreStats;
         private readonly ISignUps _signUps;
+        private readonly ArenaWork _arenaWork;
 
         private ArenaDataKey<ArenaData> _adKey;
 
         public Teams(
+            IArenaLoop arenaLoop,
             IArenaManager arenaManager,
             IBalls balls,
             ICapabilityManager capabilityManager,
@@ -64,7 +71,6 @@ namespace SS.PowerBall.Modules
             _balls = balls ?? throw new ArgumentNullException(nameof(balls));
             _capabilityManager = capabilityManager ?? throw new ArgumentNullException(nameof(capabilityManager));
             _chat = chat ?? throw new ArgumentNullException(nameof(chat));
-            _commandManager = commandManager ?? throw new ArgumentNullException(nameof(commandManager));
             _configManager = configManager ?? throw new ArgumentNullException(nameof(configManager));
             _game = game ?? throw new ArgumentNullException(nameof(game));
             _db = db ?? throw new ArgumentNullException(nameof(db));
@@ -74,6 +80,7 @@ namespace SS.PowerBall.Modules
             _prng = prng ?? throw new ArgumentNullException(nameof(prng));
             _scoreStats = scoreStats ?? throw new ArgumentNullException(nameof(scoreStats));
             _signUps = signUps ?? throw new ArgumentNullException(nameof(signUps));
+            _arenaWork = new ArenaWork(arenaLoop, commandManager, logManager, nameof(Teams));
         }
 
         #region Module members
@@ -95,6 +102,10 @@ namespace SS.PowerBall.Modules
             if (!arena.TryGetExtraData(_adKey, out ArenaData? ad))
                 return false;
 
+            // Set up before anything is registered, so nothing on the arena's thread can see it half done.
+            InitializeArena(arena, ad);
+            Volatile.Write(ref ad.IsAttached, true);
+
             PlayerActionCallback.Register(arena, Callback_PlayerAction);
             ShipFreqChangeCallback.Register(arena, Callback_ShipFreqChange);
             BallGameOverCallback.Register(arena, Callback_BallGameOver);
@@ -102,8 +113,6 @@ namespace SS.PowerBall.Modules
             AddCommands(arena);
 
             ad.InterfaceToken = arena.RegisterInterface<ITeams>(this);
-
-            InitializeArena(arena, ad);
 
             return true;
         }
@@ -122,11 +131,23 @@ namespace SS.PowerBall.Modules
             ShipFreqChangeCallback.Unregister(arena, Callback_ShipFreqChange);
             BallGameOverCallback.Unregister(arena, Callback_BallGameOver);
 
+            // Nothing else can reach the arena's teams once its queued work has run, so the rest is done here.
+            _arenaWork.Drain(arena);
+            Volatile.Write(ref ad.IsAttached, false);
+
             // Release the arena lock and clear rosters.
             ReleaseTeams(arena, ad);
             _game.UnlockArena(arena, true, false);
 
             return true;
+        }
+
+        /// <summary>
+        /// Gets the arena's data if this module is still attached to it, for code resuming after an await.
+        /// </summary>
+        private bool TryGetLiveArenaData(Arena arena, [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out ArenaData? ad)
+        {
+            return arena.TryGetExtraData(_adKey, out ad) && Volatile.Read(ref ad.IsAttached);
         }
 
         #endregion
@@ -450,24 +471,50 @@ namespace SS.PowerBall.Modules
 
         private void Callback_PlayerAction(Player player, PlayerAction action, Arena? arena)
         {
-            if (arena is null || !arena.TryGetExtraData(_adKey, out ArenaData? ad))
+            if (arena is null)
                 return;
 
             if (action == PlayerAction.EnterArena)
-            {
-                SendWelcome(player, ad);
-                ChangePlayerLagStatus(ad, player, leaving: false);
-            }
+                OnPlayerEntered(arena, player);
             else if (action == PlayerAction.LeaveArena)
-            {
+                OnPlayerLeft(arena, player);
+        }
+
+        private void OnPlayerEntered(Arena arena, Player player)
+        {
+            if (!_arenaWork.IsCurrent(arena) && _arenaWork.Defer(arena, OnPlayerEntered, player))
+                return;
+
+            if (!arena.TryGetExtraData(_adKey, out ArenaData? ad))
+                return;
+
+            SendWelcome(player, ad);
+            ChangePlayerLagStatus(ad, player, leaving: false);
+        }
+
+        private void OnPlayerLeft(Arena arena, Player player)
+        {
+            // Unchecked: the player has always left by now, and only this arena's roster is touched.
+            if (!_arenaWork.IsCurrent(arena) && _arenaWork.DeferUnchecked(arena, OnPlayerLeft, player))
+                return;
+
+            if (arena.TryGetExtraData(_adKey, out ArenaData? ad))
                 ChangePlayerLagStatus(ad, player, leaving: true);
-            }
         }
 
         private void Callback_ShipFreqChange(Player player, ShipType newShip, ShipType oldShip, short newFreq, short oldFreq)
         {
-            Arena? arena = player.Arena;
-            if (arena is null || !arena.TryGetExtraData(_adKey, out ArenaData? ad))
+            if (player.Arena is { } arena)
+                OnShipFreqChange(arena, player, newShip);
+        }
+
+        private void OnShipFreqChange(Arena arena, Player player, ShipType newShip)
+        {
+            // Unchecked: only this arena's roster is touched, and changes arrive in order, so the last one wins.
+            if (!_arenaWork.IsCurrent(arena) && _arenaWork.DeferUnchecked(arena, OnShipFreqChange, player, newShip))
+                return;
+
+            if (!arena.TryGetExtraData(_adKey, out ArenaData? ad))
                 return;
 
             Team? team = FindTeamExactPlayer(ad, player.Name);
@@ -481,6 +528,9 @@ namespace SS.PowerBall.Modules
 
         private void Callback_BallGameOver(Arena arena, short winnerFreq)
         {
+            if (!_arenaWork.IsCurrent(arena) && _arenaWork.Defer(arena, Callback_BallGameOver, winnerFreq))
+                return;
+
             if (!arena.TryGetExtraData(_adKey, out ArenaData? ad))
                 return;
 
@@ -578,6 +628,9 @@ namespace SS.PowerBall.Modules
         {
             public InterfaceRegistrationToken<ITeams>? InterfaceToken;
 
+            // Set on the mainloop while attaching and detaching, and read by database continuations on the arena's thread.
+            public bool IsAttached;
+
             public readonly List<Team> Teams = [];
             public int NumberOfTeams;
             public PickingStage PickingStage = PickingStage.Setup;
@@ -598,6 +651,7 @@ namespace SS.PowerBall.Modules
             public bool TryReset()
             {
                 InterfaceToken = null;
+                IsAttached = false;
                 Teams.Clear();
                 NumberOfTeams = 0;
                 PickingStage = PickingStage.Setup;

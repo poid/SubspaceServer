@@ -3,6 +3,7 @@ using SS.Core;
 using SS.Core.ComponentCallbacks;
 using SS.Core.ComponentInterfaces;
 using SS.Packets.Game;
+using SS.PowerBall.Threading;
 using System;
 
 namespace SS.PowerBall.Modules
@@ -27,21 +28,23 @@ namespace SS.PowerBall.Modules
 
         private readonly IArenaManager _arenaManager;
         private readonly IChat _chat;
-        private readonly ICommandManager _commandManager;
         private readonly ILvzObjects _lvzObjects;
+        private readonly ArenaWork _arenaWork;
 
         private ArenaDataKey<ArenaData> _adKey;
 
         public Small4TeamGame(
+            IArenaLoop arenaLoop,
             IArenaManager arenaManager,
             IChat chat,
             ICommandManager commandManager,
+            ILogManager logManager,
             ILvzObjects lvzObjects)
         {
             _arenaManager = arenaManager ?? throw new ArgumentNullException(nameof(arenaManager));
             _chat = chat ?? throw new ArgumentNullException(nameof(chat));
-            _commandManager = commandManager ?? throw new ArgumentNullException(nameof(commandManager));
             _lvzObjects = lvzObjects ?? throw new ArgumentNullException(nameof(lvzObjects));
+            _arenaWork = new ArenaWork(arenaLoop, commandManager, logManager, nameof(Small4TeamGame));
         }
 
         #region Module members
@@ -67,18 +70,19 @@ namespace SS.PowerBall.Modules
             BallGameGoalCallback.Register(arena, Callback_BallGameGoal);
             BallGameOverCallback.Register(arena, Callback_BallGameOver);
 
-            _commandManager.AddCommand("small4tmrules", Command_small4tmrules, arena);
+            _arenaWork.AddCommand("small4tmrules", Command_small4tmrules, arena);
 
             return true;
         }
 
         bool IArenaAttachableModule.DetachModule(Arena arena)
         {
-            _commandManager.RemoveCommand("small4tmrules", Command_small4tmrules, arena);
+            _arenaWork.RemoveCommand("small4tmrules", Command_small4tmrules, arena);
 
             ArenaActionCallback.Unregister(arena, Callback_ArenaAction);
             BallGameGoalCallback.Unregister(arena, Callback_BallGameGoal);
             BallGameOverCallback.Unregister(arena, Callback_BallGameOver);
+            _arenaWork.Drain(arena);
 
             return true;
         }
@@ -89,17 +93,27 @@ namespace SS.PowerBall.Modules
 
         private void Callback_ArenaAction(Arena arena, ArenaAction action)
         {
+            if (!_arenaWork.IsCurrent(arena) && _arenaWork.Defer(arena, Callback_ArenaAction, action))
+                return;
+
             if (action == ArenaAction.Create)
                 MakeLvz(arena, LvzUpdate.Initialize);
         }
 
         private void Callback_BallGameGoal(Arena arena, Player player, byte ballId, SS.Core.Map.TileCoordinates goalCoordinates)
         {
+            // Unchecked: the scoreboard follows the goal even if the scorer has left since.
+            if (!_arenaWork.IsCurrent(arena) && _arenaWork.DeferUnchecked(arena, Callback_BallGameGoal, player, ballId, goalCoordinates))
+                return;
+
             MakeLvz(arena, LvzUpdate.Goal);
         }
 
         private void Callback_BallGameOver(Arena arena, short winnerFreq)
         {
+            if (!_arenaWork.IsCurrent(arena) && _arenaWork.Defer(arena, Callback_BallGameOver, winnerFreq))
+                return;
+
             MakeLvz(arena, LvzUpdate.GameOver);
         }
 
