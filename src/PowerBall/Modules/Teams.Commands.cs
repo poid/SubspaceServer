@@ -177,14 +177,15 @@ namespace SS.PowerBall.Modules
 
         private void Cmd_ListBorrows(Arena arena, ArenaData ad, Player player, ReadOnlySpan<char> args)
         {
+            TeamLookup lookup = default;
             // Optional team/freq filter; with no argument, list borrows for every team.
             Team? filter = null;
             if (!args.IsEmpty)
             {
-                filter = FindTeam(ad, args);
+                filter = FindTeam(ad, args, ref lookup);
                 if (filter is null)
                 {
-                    _chat.SendMessage(player, "Team not found.");
+                    SendTeamNotFound(player, lookup);
                     return;
                 }
             }
@@ -338,16 +339,17 @@ namespace SS.PowerBall.Modules
 
         private void Cmd_RemoveTeam(Arena arena, ArenaData ad, Player player, ReadOnlySpan<char> args)
         {
+            TeamLookup lookup = default;
             if (ad.PickingStage != PickingStage.Setup)
             {
                 _chat.SendMessage(player, "Cannot remove a team after having started picking.");
                 return;
             }
 
-            Team? team = FindTeam(ad, args);
+            Team? team = FindTeam(ad, args, ref lookup);
             if (team is null)
             {
-                _chat.SendMessage(player, "Team not found.");
+                SendTeamNotFound(player, lookup);
                 return;
             }
 
@@ -363,6 +365,7 @@ namespace SS.PowerBall.Modules
 
         private void Cmd_AddCaptain(Arena arena, ArenaData ad, Player player, ReadOnlySpan<char> args, ITarget target)
         {
+            TeamLookup lookup = default;
             Team? team;
             string captainName;
 
@@ -373,7 +376,7 @@ namespace SS.PowerBall.Modules
                     _chat.SendMessage(player, "No frequency or team name specified");
                     return;
                 }
-                team = FindTeam(ad, args);
+                team = FindTeam(ad, args, ref lookup);
                 captainName = targetPlayer.Name ?? "";
             }
             else
@@ -384,14 +387,14 @@ namespace SS.PowerBall.Modules
                     return;
                 }
                 SplitColon(args, out ReadOnlySpan<char> teamSpan, out ReadOnlySpan<char> nameSpan);
-                team = FindTeam(ad, teamSpan.Trim());
+                team = FindTeam(ad, teamSpan.Trim(), ref lookup);
                 Player? resolved = FindPlayerInArenaFuzzy(arena, nameSpan.Trim());
                 captainName = resolved?.Name ?? nameSpan.Trim().ToString();
             }
 
             if (team is null)
             {
-                _chat.SendMessage(player, "Team not found.");
+                SendTeamNotFound(player, lookup);
                 return;
             }
             if (string.IsNullOrEmpty(captainName))
@@ -418,6 +421,7 @@ namespace SS.PowerBall.Modules
 
         private void Cmd_RemoveCaptain(Arena arena, ArenaData ad, Player player, ReadOnlySpan<char> args, ITarget target)
         {
+            TeamLookup lookup = default;
             Team? team;
             string captainQuery;
 
@@ -428,7 +432,7 @@ namespace SS.PowerBall.Modules
                     _chat.SendMessage(player, "No frequency or team name specified");
                     return;
                 }
-                team = FindTeam(ad, args);
+                team = FindTeam(ad, args, ref lookup);
                 captainQuery = targeted.Name ?? "";
             }
             else
@@ -439,13 +443,13 @@ namespace SS.PowerBall.Modules
                     return;
                 }
                 SplitColon(args, out ReadOnlySpan<char> teamSpan, out ReadOnlySpan<char> nameSpan);
-                team = FindTeam(ad, teamSpan.Trim());
+                team = FindTeam(ad, teamSpan.Trim(), ref lookup);
                 captainQuery = nameSpan.Trim().ToString();
             }
 
             if (team is null)
             {
-                _chat.SendMessage(player, "Team not found.");
+                SendTeamNotFound(player, lookup);
                 return;
             }
 
@@ -641,6 +645,14 @@ namespace SS.PowerBall.Modules
             }
 
             // ASSS maps 1->Setup, 2->Picking, 3->Completed, 4->GameStart, 5->GameOver (Paused is not settable here).
+            // ASSS let staff set any stage. Picking, Completed and Game Start describe teams that exist, so those need
+            // at least two of them; Setup and Game Over are always reachable, which is how a stuck match is recovered.
+            if (args[0] is '2' or '3' or '4' && ad.NumberOfTeams < 2)
+            {
+                _chat.SendMessage(player, "Less than 2 teams setup. Picking, Completed and Game Start need teams first.");
+                return;
+            }
+
             switch (args[0])
             {
                 case '1':
@@ -782,6 +794,7 @@ namespace SS.PowerBall.Modules
 
         private void Cmd_AddOrPick(Arena arena, ArenaData ad, Player player, ReadOnlySpan<char> args, ITarget target, bool draftCommand)
         {
+            TeamLookup lookup = default;
             if (draftCommand && !ad.IsDraft)
             {
                 _chat.SendMessage(player, "Currently in team adding mode. Pick is only used for drafting.");
@@ -837,7 +850,7 @@ namespace SS.PowerBall.Modules
                 else if (isStaff)
                 {
                     // Staff targeting a player while also naming a team/freq: resolve that team.
-                    team = FindTeam(ad, args);
+                    team = FindTeam(ad, args, ref lookup);
                 }
                 else
                 {
@@ -856,7 +869,7 @@ namespace SS.PowerBall.Modules
             else if (isStaff && args.Contains(':'))
             {
                 SplitColon(args, out ReadOnlySpan<char> teamSpan, out ReadOnlySpan<char> nameSpan);
-                team = FindTeam(ad, teamSpan.Trim());
+                team = FindTeam(ad, teamSpan.Trim(), ref lookup);
                 targetName = nameSpan.Trim().ToString();
             }
             else if (isCaptain)
@@ -878,7 +891,7 @@ namespace SS.PowerBall.Modules
 
             if (team is null)
             {
-                _chat.SendMessage(player, "Team not found.");
+                SendTeamNotFound(player, lookup);
                 return;
             }
             if (string.IsNullOrEmpty(targetName))
@@ -1017,6 +1030,7 @@ namespace SS.PowerBall.Modules
 
         private void Cmd_Remove(Arena arena, ArenaData ad, Player player, ReadOnlySpan<char> args, ITarget target)
         {
+            TeamLookup lookup = default;
             bool isStaff = _capabilityManager.HasCapability(player, "cmd_forceremove");
             bool isCaptain = IsCaptain(ad, player);
             if (!isStaff && !isCaptain)
@@ -1055,7 +1069,7 @@ namespace SS.PowerBall.Modules
                 }
                 else if (isStaff)
                 {
-                    team = FindTeam(ad, args);
+                    team = FindTeam(ad, args, ref lookup);
                 }
                 else
                 {
@@ -1073,7 +1087,7 @@ namespace SS.PowerBall.Modules
             else if (isStaff && args.Contains(':'))
             {
                 SplitColon(args, out ReadOnlySpan<char> teamSpan, out ReadOnlySpan<char> nameSpan);
-                team = FindTeam(ad, teamSpan.Trim());
+                team = FindTeam(ad, teamSpan.Trim(), ref lookup);
                 name = nameSpan.Trim().ToString();
             }
             else if (isCaptain)
@@ -1094,7 +1108,7 @@ namespace SS.PowerBall.Modules
 
             if (team is null)
             {
-                _chat.SendMessage(player, "Team not found.");
+                SendTeamNotFound(player, lookup);
                 return;
             }
 
@@ -1112,6 +1126,7 @@ namespace SS.PowerBall.Modules
 
         private void Cmd_Ready(Arena arena, ArenaData ad, Player player, ReadOnlySpan<char> args)
         {
+            TeamLookup lookup = default;
             bool isStaff = _capabilityManager.HasCapability(player, "cmd_forceready");
 
             if (ad.PickingStage == PickingStage.Completed)
@@ -1125,17 +1140,29 @@ namespace SS.PowerBall.Modules
                 return;
             }
 
-            Team? team = isStaff && !args.IsEmpty ? FindTeam(ad, args) : FindCaptainTeam(ad, player);
+            Team? captainsTeam = FindCaptainTeam(ad, player);
+            Team? team = isStaff && !args.IsEmpty ? FindTeam(ad, args, ref lookup) : captainsTeam;
             if (team is null)
             {
-                _chat.SendMessage(player, "Team not found.");
+                if (lookup.Query is null)
+                    _chat.SendMessage(player, isStaff ? "Specify the team name or frequency to ready." : "Only captains may ready their team.");
+                else
+                    SendTeamNotFound(player, lookup);
+
                 return;
             }
 
             SetReady(arena, ad, team, player);
 
             if (ad.PickingStage == PickingStage.Picking && IsCurrentPick(ad, team.Frequency))
+            {
                 NextPick(arena, ad, notify: true, skip: false);
+
+                // Readying a team that holds the pick moves the pick on, as it does for a captain. Staff readying
+                // another team's pick are told so, since it is that team's turn they have just ended.
+                if (team != captainsTeam)
+                    _chat.SendMessage(player, $"{team.TeamName} had the current pick, so readying it has moved the pick on.");
+            }
         }
 
         private void Cmd_Sub(Arena arena, ArenaData ad, Player player, ReadOnlySpan<char> args, ITarget target)
@@ -1452,9 +1479,17 @@ namespace SS.PowerBall.Modules
                 return;
             }
 
-            // Removes the borrow request whether or not it had already been approved.
+            // Removes the borrow request whether or not it had already been approved. An approved borrow also put the
+            // player on the roster, so that comes off too, the same way as removing any other non-loaded player.
             _chat.SendArenaMessage(arena, ChatSound.Beep2, $"{team.TeamName} removed request to borrow {borrow.Name}");
             team.BorrowList.Remove(borrow);
+
+            if (borrow.Approved)
+            {
+                TeamPlayer? rostered = FindPlayerInTeamExact(team, borrow.Name);
+                if (rostered is not null && rostered.WasBorrowed)
+                    RemovePlayer(arena, ad, team, rostered, player);
+            }
         }
 
         private void Cmd_Approve(Arena arena, ArenaData ad, Player player, ReadOnlySpan<char> args)
@@ -1507,6 +1542,7 @@ namespace SS.PowerBall.Modules
 
         private void Cmd_AddBorrow(Arena arena, ArenaData ad, Player player, ReadOnlySpan<char> args, ITarget target)
         {
+            TeamLookup lookup = default;
             Team? team;
             Player? targetPlayer;
 
@@ -1517,7 +1553,7 @@ namespace SS.PowerBall.Modules
                     _chat.SendMessage(player, "No frequency or team name specified");
                     return;
                 }
-                team = FindTeam(ad, args);
+                team = FindTeam(ad, args, ref lookup);
                 targetPlayer = targeted;
             }
             else
@@ -1528,7 +1564,7 @@ namespace SS.PowerBall.Modules
                     return;
                 }
                 SplitColon(args, out ReadOnlySpan<char> teamSpan, out ReadOnlySpan<char> nameSpan);
-                team = FindTeam(ad, teamSpan.Trim());
+                team = FindTeam(ad, teamSpan.Trim(), ref lookup);
                 targetPlayer = FindPlayerInArenaFuzzy(arena, nameSpan.Trim(), out int count);
                 if (count != 1 || targetPlayer is null)
                 {
@@ -1539,7 +1575,7 @@ namespace SS.PowerBall.Modules
 
             if (team is null)
             {
-                _chat.SendMessage(player, "Team not found.");
+                SendTeamNotFound(player, lookup);
                 return;
             }
             if (targetPlayer is null)

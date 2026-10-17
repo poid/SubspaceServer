@@ -285,40 +285,84 @@ namespace SS.PowerBall.Modules
             return null;
         }
 
-        private static Team? FindTeamFuzzy(ArenaData ad, ReadOnlySpan<char> name)
+        private static Team? FindTeamFuzzy(ArenaData ad, ReadOnlySpan<char> name, out int count)
         {
+            count = 0;
+
             if (name.IsEmpty)
                 return null;
 
             Team? match = null;
-            int count = 0;
 
             foreach (Team team in ad.Teams)
             {
                 if (team.TeamName.AsSpan().StartsWith(name, StringComparison.OrdinalIgnoreCase))
                 {
                     if (team.TeamName.Length == name.Length)
+                    {
+                        count = 1;
                         return team; // exact
+                    }
 
                     count++;
                     match ??= team;
                 }
             }
 
-            return count == 1 ? match : (count > 1 ? null : match);
+            return count == 1 ? match : null;
         }
 
         /// <summary>Finds a team by a numeric freq, or by (fuzzy) name.</summary>
-        private static Team? FindTeam(ArenaData ad, ReadOnlySpan<char> input)
+        private static Team? FindTeam(ArenaData ad, ReadOnlySpan<char> input) => FindTeam(ad, input, out _);
+
+        /// <summary>Finds a team by a numeric freq, or by (fuzzy) name, recording a failed lookup for <see cref="SendTeamNotFound"/>.</summary>
+        private static Team? FindTeam(ArenaData ad, ReadOnlySpan<char> input, ref TeamLookup lookup)
+        {
+            Team? team = FindTeam(ad, input, out int matches);
+            if (team is null)
+            {
+                lookup.Query = input.ToString();
+                lookup.Matches = matches;
+            }
+
+            return team;
+        }
+
+        private static Team? FindTeam(ArenaData ad, ReadOnlySpan<char> input, out int matches)
         {
             if (int.TryParse(input, out int freq))
             {
                 Team? byFreq = FindTeamFreq(ad, freq);
                 if (byFreq is not null)
+                {
+                    matches = 1;
                     return byFreq;
+                }
             }
 
-            return FindTeamFuzzy(ad, input);
+            return FindTeamFuzzy(ad, input, out matches);
+        }
+
+        /// <summary>
+        /// Tells the player why a team lookup failed: nothing matched, or the name matched more than one team.
+        /// </summary>
+        private void SendTeamNotFound(Player player, in TeamLookup lookup)
+        {
+            if (lookup.Query is null)
+                _chat.SendMessage(player, "Team not found.");
+            else if (lookup.Matches > 1)
+                _chat.SendMessage(player, $"{lookup.Matches} teams match '{lookup.Query}'. Use more of the team name, or its frequency.");
+            else
+                _chat.SendMessage(player, $"No team matches '{lookup.Query}'.");
+        }
+
+        /// <summary>
+        /// A failed team lookup, recorded by <see cref="FindTeam(ArenaData, ReadOnlySpan{char}, ref TeamLookup)"/>.
+        /// </summary>
+        private struct TeamLookup
+        {
+            public string? Query;
+            public int Matches;
         }
 
         private static TeamPlayer? FindPlayerInTeamExact(Team team, ReadOnlySpan<char> name)
