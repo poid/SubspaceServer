@@ -110,6 +110,7 @@ namespace SS.PowerBall.Modules
             ArenaActionCallback.Register(arena, Callback_ArenaAction);
             ShipFreqChangeCallback.Register(arena, Callback_ShipFreqChange);
             BallPickupCallback.Register(arena, Callback_BallPickup);
+            BallShootCallback.Register(arena, Callback_BallShoot);
             BallGameStartCallback.Register(arena, Callback_BallGameStart);
             BallGameOverCallback.Register(arena, Callback_BallGameOver);
             BallGameGoalCallback.Register(arena, Callback_BallGameGoal);
@@ -160,6 +161,7 @@ namespace SS.PowerBall.Modules
             ArenaActionCallback.Unregister(arena, Callback_ArenaAction);
             ShipFreqChangeCallback.Unregister(arena, Callback_ShipFreqChange);
             BallPickupCallback.Unregister(arena, Callback_BallPickup);
+            BallShootCallback.Unregister(arena, Callback_BallShoot);
             BallGameStartCallback.Unregister(arena, Callback_BallGameStart);
             BallGameOverCallback.Unregister(arena, Callback_BallGameOver);
             BallGameGoalCallback.Unregister(arena, Callback_BallGameGoal);
@@ -1115,6 +1117,40 @@ namespace SS.PowerBall.Modules
             ad.RoundStart = true;
         }
 
+        private void Callback_BallShoot(Arena arena, Player player, byte ballId)
+        {
+            // Checked: a carrier who left is dropped from the set by the leave handler instead, and there is no ship to
+            // correct for them here.
+            if (!_arenaWork.IsCurrent(arena) && _arenaWork.Defer(arena, Callback_BallShoot, player, ballId))
+                return;
+
+            if (!arena.TryGetExtraData(_adKey, out ArenaData? ad))
+                return;
+
+            // A carrier whose ship the round start left alone (see RoundStart) has let go of the ball, so it can be
+            // corrected now without costing them the ball.
+            if (ad.ShipFixOnRelease.Remove(player) && ad.PubMode && !IsCarryingBall(arena, player))
+                EnforcePubShip(player, ad);
+        }
+
+        private bool IsCarryingBall(Arena arena, Player player)
+        {
+            if (!_balls.TryGetBallSettings(arena, out BallSettings settings))
+                return false;
+
+            for (int ballId = 0; ballId < settings.BallCount; ballId++)
+            {
+                if (_balls.TryGetBallData(arena, ballId, out BallData ballData)
+                    && ballData.State == BallState.Carried
+                    && ballData.Carrier == player)
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
         private void Callback_BallGameStart(Arena arena)
         {
             if (!_arenaWork.IsCurrent(arena) && _arenaWork.Defer(arena, Callback_BallGameStart))
@@ -1135,6 +1171,29 @@ namespace SS.PowerBall.Modules
                 return;
 
             ad.RoundStart = false;
+
+            // The game is over, so nobody is carrying a ball any more, and a carrier still waiting for their ship to be
+            // put right (see RoundStart) won't let go of one now.
+            if (ad.ShipFixOnRelease.Count > 0)
+            {
+                // Taken out of the set first, since a ship change fires callbacks that may come back to it.
+                HashSet<Player> pending = _objectPoolManager.PlayerSetPool.Get();
+                try
+                {
+                    pending.UnionWith(ad.ShipFixOnRelease);
+                    ad.ShipFixOnRelease.Clear();
+
+                    if (ad.PubMode)
+                    {
+                        foreach (Player player in pending)
+                            EnforcePubShip(player, ad);
+                    }
+                }
+                finally
+                {
+                    _objectPoolManager.PlayerSetPool.Return(pending);
+                }
+            }
 
             if (ad.GameType == PbGameType.Pro || !ad.RandomizeTeamsOnEnd)
                 return;
@@ -1186,7 +1245,10 @@ namespace SS.PowerBall.Modules
                 return;
 
             if (arena.TryGetExtraData(_adKey, out ArenaData? ad))
+            {
                 ad.Players.Remove(player);
+                ad.ShipFixOnRelease.Remove(player);
+            }
         }
 
         private void OnPlayerEntered(Arena arena, Player player)
@@ -1233,20 +1295,48 @@ namespace SS.PowerBall.Modules
                         continue;
                     }
 
-                    if (!IsValidGameFreq(ad.GameType, player.Freq))
+                    // Any ship or freq change makes the core drop the ball the player is carrying, and the round
+                    // usually starts with a pickup. ASSS changed the ship anyway, so the ball popped back out and
+                    // the round started over; here a carrier in the wrong ship keeps the ball and is put right as
+                    // soon as they let go of it.
+                    if (IsCarryingBall(arena, player))
                     {
-                        short random = (short)_prng.Number(0, 1);
-                        _game.SetShipAndFreq(player, (ShipType)random, random);
+                        if (NeedsPubShipFix(player, ad))
+                            ad.ShipFixOnRelease.Add(player);
+
+                        continue;
                     }
-                    else if ((int)player.Ship != player.Freq)
-                    {
-                        _game.SetShipAndFreq(player, (ShipType)player.Freq, player.Freq);
-                    }
+
+                    EnforcePubShip(player, ad);
                 }
             }
             finally
             {
                 _playerData.Unlock();
+            }
+        }
+
+        private static bool NeedsPubShipFix(Player player, ArenaData ad)
+        {
+            return !IsValidGameFreq(ad.GameType, player.Freq) || (int)player.Ship != player.Freq;
+        }
+
+        /// <summary>
+        /// Puts a pub player on a valid pub freq in that freq's ship (freq 0 = Warbird, freq 1 = Javelin).
+        /// </summary>
+        private void EnforcePubShip(Player player, ArenaData ad)
+        {
+            if (player.Status != PlayerState.Playing || player.Freq > ad.MaxPubFreq || player.Ship == ShipType.Spec)
+                return;
+
+            if (!IsValidGameFreq(ad.GameType, player.Freq))
+            {
+                short random = (short)_prng.Number(0, 1);
+                _game.SetShipAndFreq(player, (ShipType)random, random);
+            }
+            else if ((int)player.Ship != player.Freq)
+            {
+                _game.SetShipAndFreq(player, (ShipType)player.Freq, player.Freq);
             }
         }
 
@@ -1446,6 +1536,9 @@ namespace SS.PowerBall.Modules
             // Per-player state for the players in this arena, created on first use and removed when they leave.
             public readonly Dictionary<Player, PubPlayerState> Players = [];
 
+            // Carriers whose ship is to be corrected once they let go of the ball (see RoundStart).
+            public readonly HashSet<Player> ShipFixOnRelease = [];
+
             // runtime state
             public PbGameType GameType;
             public bool RandomizeTeamsOnEnd;
@@ -1474,6 +1567,7 @@ namespace SS.PowerBall.Modules
                 InterfaceToken = null;
                 ChangeMapOnGoalTimer = null;
                 Players.Clear();
+                ShipFixOnRelease.Clear();
                 GameType = PbGameType.Any;
                 RandomizeTeamsOnEnd = true;
                 RoundStart = false;
