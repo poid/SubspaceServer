@@ -23,8 +23,9 @@ namespace SS.PowerBall.Modules
     /// <para>
     /// Deviations from the C original (idiomatic): the per-enter LVZ resend is dropped because the C# server records
     /// arena-target LVZ state and re-sends it automatically when a player enters; the external game-timer mirroring
-    /// (CB_TIMEPAUSE/RESUME/SET) is deferred to the league slice since MultiPub does not use a game clock; and two C bugs
-    /// are fixed (the ResetLVZs Javelin-ones-digit clear, and the branch-C game-point re-fire guard).
+    /// (CB_TIMEPAUSE/RESUME/SET) follows the core game timer's changes in league games only, since MultiPub does not use
+    /// a game clock; and two C bugs are fixed (the ResetLVZs Javelin-ones-digit clear, and the branch-C game-point re-fire
+    /// guard).
     /// </para>
     /// </remarks>
     [ModuleInfo("PowerBall LVZ scoreboard/indicators/banners/sounds and game clock (ASSS pblvzs port).")]
@@ -36,6 +37,7 @@ namespace SS.PowerBall.Modules
         private readonly IArenaTimer _arenaTimer;
         private readonly IChat _chat;
         private readonly IConfigManager _configManager;
+        private readonly IGameTimer _gameTimer;
         private readonly ILvzObjects _lvzObjects;
         private readonly ArenaWork _arenaWork;
 
@@ -48,6 +50,7 @@ namespace SS.PowerBall.Modules
             IChat chat,
             ICommandManager commandManager,
             IConfigManager configManager,
+            IGameTimer gameTimer,
             ILogManager logManager,
             ILvzObjects lvzObjects)
         {
@@ -55,6 +58,7 @@ namespace SS.PowerBall.Modules
             _arenaTimer = arenaTimer ?? throw new ArgumentNullException(nameof(arenaTimer));
             _chat = chat ?? throw new ArgumentNullException(nameof(chat));
             _configManager = configManager ?? throw new ArgumentNullException(nameof(configManager));
+            _gameTimer = gameTimer ?? throw new ArgumentNullException(nameof(gameTimer));
             _lvzObjects = lvzObjects ?? throw new ArgumentNullException(nameof(lvzObjects));
             _arenaWork = new ArenaWork(arenaLoop, commandManager, logManager, nameof(PowerBallLvz));
         }
@@ -84,6 +88,7 @@ namespace SS.PowerBall.Modules
             ad.AnnounceGameOverTimer = new ArenaTimerSlot<GameOverState>(_arenaTimer, arena, Timer_AnnounceGameOver);
             ad.AnnounceWinnerTimer = new ArenaTimerSlot<GameOverState>(_arenaTimer, arena, Timer_AnnounceWinner);
 
+            ArenaActionCallback.Register(arena, Callback_ArenaAction);
             BallPickupCallback.Register(arena, Callback_BallPickup);
             BallShootCallback.Register(arena, Callback_BallShoot);
             BallGameGoalCallback.Register(arena, Callback_BallGameGoal);
@@ -113,6 +118,7 @@ namespace SS.PowerBall.Modules
 
             _arenaWork.RemoveCommand("pblvzsversion", Command_pblvzsversion, arena);
 
+            ArenaActionCallback.Unregister(arena, Callback_ArenaAction);
             BallPickupCallback.Unregister(arena, Callback_BallPickup);
             BallShootCallback.Unregister(arena, Callback_BallShoot);
             BallGameGoalCallback.Unregister(arena, Callback_BallGameGoal);
@@ -147,10 +153,22 @@ namespace SS.PowerBall.Modules
             ConfigHandle ch = arena.Cfg!;
             ad.CapturePoints = _configManager.GetInt(ch, "Soccer", "CapturePoints", 0) * -1;
             ad.WinBy = _configManager.GetInt(ch, "Soccer", "WinBy", 0);
+            ad.CustomGameMask = _configManager.GetInt(ch, "Soccer", "CustomGame", 0);
             ad.LastScoringFreq = -1;
         }
 
-        private int GetCustomGameMask(Arena arena) => _configManager.GetInt(arena.Cfg!, "Soccer", "CustomGame", 0);
+        private void Callback_ArenaAction(Arena arena, ArenaAction action)
+        {
+            if (action != ArenaAction.ConfChanged)
+                return;
+
+            if (!_arenaWork.IsCurrent(arena) && _arenaWork.Defer(arena, Callback_ArenaAction, action))
+                return;
+
+            // Read once here and when the arena is set up, rather than on every ball event.
+            if (arena.TryGetExtraData(_adKey, out ArenaData? ad))
+                ad.CustomGameMask = _configManager.GetInt(arena.Cfg!, "Soccer", "CustomGame", 0);
+        }
 
         #endregion
 
@@ -171,7 +189,7 @@ namespace SS.PowerBall.Modules
             if (!arena.TryGetExtraData(_adKey, out ArenaData? ad))
                 return;
 
-            if ((GetCustomGameMask(arena) & (1 << ballId)) != 0)
+            if ((ad.CustomGameMask & (1 << ballId)) != 0)
                 return;
 
             for (int freq = 0; freq < MaxFreqs; freq++)
@@ -204,7 +222,7 @@ namespace SS.PowerBall.Modules
             if (!arena.TryGetExtraData(_adKey, out ArenaData? ad))
                 return;
 
-            if ((GetCustomGameMask(arena) & (1 << ballId)) != 0)
+            if ((ad.CustomGameMask & (1 << ballId)) != 0)
                 return;
 
             SetBall(arena, freq, false, ad);
@@ -227,7 +245,7 @@ namespace SS.PowerBall.Modules
             if (!arena.TryGetExtraData(_adKey, out ArenaData? ad))
                 return;
 
-            if ((GetCustomGameMask(arena) & (1 << ballId)) != 0)
+            if ((ad.CustomGameMask & (1 << ballId)) != 0)
                 return;
 
             Span<int> scores = stackalloc int[MaxFreqs];
@@ -432,11 +450,28 @@ namespace SS.PowerBall.Modules
             if (!arena.TryGetExtraData(_adKey, out ArenaData? ad))
                 return;
 
-            if (!ad.IsLeagueGame)
+            // A new game cancels the previous one's game-over and winner announcements, which are still pending if
+            // this game started within a few seconds of that one ending.
+            ad.AnnounceGameOverTimer?.Stop();
+            ad.AnnounceWinnerTimer?.Stop();
+
+            // Asked of the arena rather than left to IsLeagueGame, which the league sets from its own BallGameStart
+            // handler and so would depend on which of the two modules was attached first.
+            if (!ad.IsLeagueGame && !IsLeagueArena(arena))
                 _lvzObjects.Toggle(arena, PbLvz.NewGame, true);
 
             if (!ad.RoundStart)
                 RoundStart(arena, ad);
+        }
+
+        private static bool IsLeagueArena(Arena arena)
+        {
+            IPowerBallLeague? league = arena.GetInterface<IPowerBallLeague>();
+            if (league is null)
+                return false;
+
+            arena.ReleaseInterface(ref league);
+            return true;
         }
 
         private void RoundStart(Arena arena, ArenaData ad)
@@ -488,19 +523,31 @@ namespace SS.PowerBall.Modules
             _lvzObjects.Toggle(arena, PbLvz.Timer, true);
             ad.Lvzs.TimerDisplay = true;
 
+            // Turn off the digits of a clock already showing (a restart, e.g. extra time or a staff reset) before the
+            // new ones are lit, as ASSS did; otherwise the old digits stay on underneath.
+            ResetGameTimerLvzs(arena, false, ad);
+
             int startDelayMs = CalculateLvzTimerValues(arena, ad, seconds);
             // Starting the slot replaces any clock already running, so a restart (e.g. golden-goal extra time) doesn't
             // stack a second Timer_GameDisplay and run the clock at double speed.
             ad.GameDisplayTimer?.Start(startDelayMs, 10000, arena);
         }
 
-        // Keeps the on-screen game clock in sync when the core game timer is paused/resumed (ASSS pblvzs
-        // TimerPause/TimerResume). The clock display (Timer_GameDisplay) already honours TimerPaused, so we only
-        // flip the flag and announce. A "set" is driven directly by the league via StartGameTimer, and the core
-        // callback carries no time value, so Started/Stopped are left to that path / BallGameOver.
+        // Keeps the on-screen game clock in sync with the core game timer (ASSS pblvzs TimerPause/TimerResume/TimerSet).
+        // The core timer is a mainloop module and fires this there, so the time it now shows is read here, before the
+        // rest is handed to the arena's thread.
         private void Callback_GameTimerChanged(Arena arena, TimerChange change, TimerChangeReason reason, bool isTimedGame)
         {
-            if (!_arenaWork.IsCurrent(arena) && _arenaWork.Defer(arena, Callback_GameTimerChanged, change, reason, isTimedGame))
+            int remainingSeconds = _gameTimer.TryGetRemaining(arena, out TimeSpan remaining)
+                ? (int)Math.Ceiling(remaining.TotalSeconds)
+                : 0;
+
+            OnGameTimerChanged(arena, change, reason, remainingSeconds);
+        }
+
+        private void OnGameTimerChanged(Arena arena, TimerChange change, TimerChangeReason reason, int remainingSeconds)
+        {
+            if (!_arenaWork.IsCurrent(arena) && _arenaWork.Defer(arena, OnGameTimerChanged, change, reason, remainingSeconds))
                 return;
 
             if (!arena.TryGetExtraData(_adKey, out ArenaData? ad) || !ad.IsLeagueGame)
@@ -515,9 +562,19 @@ namespace SS.PowerBall.Modules
                     break;
 
                 case TimerChange.Unpaused when ad.TimerPaused:
-                    ad.TimerPaused = false;
-                    _lvzObjects.Toggle(arena, PbLvz.SecondsCountdown, true); // re-light the seconds animation
+                    // Restart the clock from the time left rather than carrying on from where it stopped, as ASSS did:
+                    // the clock only moves in 10 second steps, so a pause would otherwise leave it out by up to that.
                     _chat.SendArenaMessage(arena, ChatSound.Beep2, "Timer Resumed!");
+                    if (remainingSeconds > 0)
+                        StartGameTimer(arena, remainingSeconds);
+                    else
+                        ad.TimerPaused = false;
+                    break;
+
+                // A staff ?timer. The league's own starts (InterfaceCall) set the clock themselves via StartGameTimer.
+                case TimerChange.Started when reason == TimerChangeReason.PlayerCommand && remainingSeconds > 0:
+                    _chat.SendArenaMessage(arena, ChatSound.Beep2, $"Timer Reset to {remainingSeconds / 60}:{remainingSeconds % 60:D2}");
+                    StartGameTimer(arena, remainingSeconds);
                     break;
             }
         }
@@ -766,6 +823,7 @@ namespace SS.PowerBall.Modules
             public readonly EnabledLvz Lvzs = new();
             public bool IsLeagueGame;
             public bool TimerPaused;
+            public int CustomGameMask;
             public int TimerSeconds;
             public int CapturePoints;
             public int WinBy;
@@ -785,6 +843,7 @@ namespace SS.PowerBall.Modules
                 Lvzs.Reset();
                 IsLeagueGame = false;
                 TimerPaused = false;
+                CustomGameMask = 0;
                 TimerSeconds = 0;
                 CapturePoints = 0;
                 WinBy = 0;

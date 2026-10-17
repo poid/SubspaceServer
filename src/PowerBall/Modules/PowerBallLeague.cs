@@ -363,8 +363,10 @@ namespace SS.PowerBall.Modules
                 }
                 else
                 {
-                    // Golden goal.
+                    // Golden goal. Stopping the timer here, inside the callback, keeps the game going untimed: the core
+                    // timer then doesn't announce the game as over, which would contradict this message.
                     _chat.SendArenaMessage(arena, ChatSound.Beep1, "Scores tied. Golden Goal in effect!");
+                    _gameTimer.SetTimer(arena, TimeSpan.Zero);
                     _arenaWork.Run(arena, static s => s.Self.BeginGoldenGoal(s.Arena), (Self: this, Arena: arena));
                 }
             }
@@ -418,7 +420,11 @@ namespace SS.PowerBall.Modules
             if (ad.IsGoldenGoal)
             {
                 ad.IsGoldenGoal = false;
-                _balls.EndGame(arena);
+
+                // Ended once every module has seen the goal, not from inside the goal callback: the game-over handlers
+                // read what the goal handlers record (the winning freq for the banner, the goal on the chart), and the
+                // modules after this one in the arena's attach order would otherwise get the goal after the game over.
+                _arenaWork.Queue(arena, static s => s.Balls.EndGame(s.Arena), (Balls: _balls, Arena: arena));
             }
         }
 
