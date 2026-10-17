@@ -99,6 +99,7 @@ namespace SS.PowerBall.Modules
 
             InitializeArena(arena, ad);
 
+            ArenaActionCallback.Register(arena, Callback_ArenaAction);
             ShipFreqChangeCallback.Register(arena, Callback_ShipFreqChange);
             BallPickupCallback.Register(arena, Callback_BallPickup);
             BallShootCallback.Register(arena, Callback_BallShoot);
@@ -138,6 +139,7 @@ namespace SS.PowerBall.Modules
             _arenaWork.RemoveCommand("pbstatshelp", Command_pbstatshelp, arena);
             _arenaWork.RemoveCommand("pbstatsversion", Command_pbstatsversion, arena);
 
+            ArenaActionCallback.Unregister(arena, Callback_ArenaAction);
             ShipFreqChangeCallback.Unregister(arena, Callback_ShipFreqChange);
             BallPickupCallback.Unregister(arena, Callback_BallPickup);
             BallShootCallback.Unregister(arena, Callback_BallShoot);
@@ -169,10 +171,9 @@ namespace SS.PowerBall.Modules
 
         #region Setup
 
-        [ConfigHelp<int>("MultiPub", "MaxPubFreq", ConfigScope.Arena, Default = 1, Description = "Freqs above this are side games and are ignored by the stats engine.")]
         private void InitializeArena(Arena arena, ArenaData ad)
         {
-            ad.MaxPubFreq = _configManager.GetInt(arena.Cfg!, "MultiPub", "MaxPubFreq", 1);
+            LoadConfig(arena, ad);
             ad.Goal0 = _mapData.FindRegionByName(arena, "Goal0");
             ad.Goal1 = _mapData.FindRegionByName(arena, "Goal1");
             ad.GoalScored = true;
@@ -180,7 +181,25 @@ namespace SS.PowerBall.Modules
             ad.AssistFrequency = -1;
         }
 
-        private int GetCustomGameMask(Arena arena) => _configManager.GetInt(arena.Cfg!, "Soccer", "CustomGame", 0);
+        [ConfigHelp<int>("MultiPub", "MaxPubFreq", ConfigScope.Arena, Default = 1, Description = "Freqs above this are side games and are ignored by the stats engine.")]
+        private void LoadConfig(Arena arena, ArenaData ad)
+        {
+            // Read once here and on a config change, rather than on every ball event.
+            ad.MaxPubFreq = _configManager.GetInt(arena.Cfg!, "MultiPub", "MaxPubFreq", 1);
+            ad.CustomGameMask = _configManager.GetInt(arena.Cfg!, "Soccer", "CustomGame", 0);
+        }
+
+        private void Callback_ArenaAction(Arena arena, ArenaAction action)
+        {
+            if (action != ArenaAction.ConfChanged)
+                return;
+
+            if (!_arenaWork.IsCurrent(arena) && _arenaWork.Defer(arena, Callback_ArenaAction, action))
+                return;
+
+            if (arena.TryGetExtraData(_adKey, out ArenaData? ad))
+                LoadConfig(arena, ad);
+        }
 
         #endregion
 
@@ -283,8 +302,11 @@ namespace SS.PowerBall.Modules
             if (!arena.TryGetExtraData(_adKey, out ArenaData? ad))
                 return;
 
-            if ((GetCustomGameMask(arena) & (1 << ballId)) != 0)
+            if ((ad.CustomGameMask & (1 << ballId)) != 0)
                 return;
+
+            if (ad.LeftWithBall == player)
+                ad.LeftWithBall = null; // back, and carrying again
 
             if (!ad.RoundStart)
             {
@@ -335,9 +357,7 @@ namespace SS.PowerBall.Modules
                         {
                             isSave = true;
                             playerData.Saves++;
-                            BroadcastPub(arena, ad, $"Save by {player.Name}!");
-                            if (ad.PossibleChoke)
-                                BroadcastPub(arena, ad, $"Choke by {ad.LastWithBall.Name}.");
+                            BroadcastPub(arena, ad, $"Save by {player.Name}!", ad.PossibleChoke ? $"Choke by {ad.LastWithBall.Name}." : null);
                         }
                     }
 
@@ -345,12 +365,17 @@ namespace SS.PowerBall.Modules
                     {
                         playerData.Steals++;
                         PlayerStats? last = GetRecord(ad, ad.LastWithBall.Name, ad.LastWithBall.Freq, initialize: false);
+                        string? turnover = null;
                         if (last is not null)
                         {
                             last.Turnover++;
-                            BroadcastPub(arena, ad, $"{(ad.PossibleChoke ? "Choke" : "Turnover")} by {last.Name}.");
+                            turnover = $"{(ad.PossibleChoke ? "Choke" : "Turnover")} by {last.Name}.";
                         }
-                        BroadcastPub(arena, ad, $"Steal by {player.Name}!");
+
+                        if (turnover is not null)
+                            BroadcastPub(arena, ad, turnover, $"Steal by {player.Name}!");
+                        else
+                            BroadcastPub(arena, ad, $"Steal by {player.Name}!", null);
                     }
                 }
             }
@@ -372,8 +397,16 @@ namespace SS.PowerBall.Modules
             if (!arena.TryGetExtraData(_adKey, out ArenaData? ad))
                 return;
 
-            if ((GetCustomGameMask(arena) & (1 << ballId)) != 0)
+            if ((ad.CustomGameMask & (1 << ballId)) != 0)
                 return;
+
+            // The ball being dropped because its carrier left. The leave has already accounted for the carry, and the
+            // player who left is not the last one to have had the ball as far as steals and assists are concerned.
+            if (ad.LeftWithBall == player)
+            {
+                ad.LeftWithBall = null;
+                return;
+            }
 
             ad.LastReleasedTick = ServerTick.Now;
             ad.LastWithBall = player;
@@ -484,7 +517,7 @@ namespace SS.PowerBall.Modules
             if (!arena.TryGetExtraData(_adKey, out ArenaData? ad))
                 return;
 
-            if ((GetCustomGameMask(arena) & (1 << ballId)) != 0)
+            if ((ad.CustomGameMask & (1 << ballId)) != 0)
                 return;
 
             ad.GoalScored = true;
@@ -558,10 +591,11 @@ namespace SS.PowerBall.Modules
             if (killerData is null || killedData is null)
                 return;
 
-            // Was the killed player the ball carrier? (Merged ASSS CB_BALLKILL handling.) Robust to the ordering of this
-            // handler versus the possession-lost handler: check the tracked carrier, or a just-released last carrier.
-            bool wasBallKill = killed == ad.PlayerWithBall
-                || (killed == ad.LastWithBall && (ServerTick.Now - ad.LastReleasedTick) <= 5);
+            // Was the killed player the ball carrier? (Merged ASSS CB_BALLKILL handling.) The tracked carrier is exact:
+            // this handler is registered on the arena, so it runs before the core's zone-wide kill handler drops the
+            // carried ball and fires the possession-lost callback, and when both are handed over from the mainloop they
+            // are queued, and run, in that same order.
+            bool wasBallKill = killed == ad.PlayerWithBall;
 
             if (wasBallKill)
             {
@@ -694,6 +728,7 @@ namespace SS.PowerBall.Modules
 
             ad.PlayerWithBall = null;
             ad.LastWithBall = null;
+            ad.LeftWithBall = null;
             ad.RoundStart = false;
             ad.GoalScored = true;
             ad.ActiveBallId = -1;
@@ -706,12 +741,13 @@ namespace SS.PowerBall.Modules
             if ((action != PlayerAction.LeaveArena && action != PlayerAction.Disconnect) || arena is null)
                 return;
 
-            OnPlayerLeft(arena, player);
+            OnPlayerLeft(arena, player, player.Freq);
         }
 
-        private void OnPlayerLeft(Arena arena, Player player)
+        // The freq is read as the player leaves, since the record to credit is the one for the team they were on.
+        private void OnPlayerLeft(Arena arena, Player player, short freq)
         {
-            if (!_arenaWork.IsCurrent(arena) && _arenaWork.DeferUnchecked(arena, OnPlayerLeft, player))
+            if (!_arenaWork.IsCurrent(arena) && _arenaWork.DeferUnchecked(arena, OnPlayerLeft, player, freq))
                 return;
 
             if (!arena.TryGetExtraData(_adKey, out ArenaData? ad))
@@ -719,7 +755,17 @@ namespace SS.PowerBall.Modules
 
             if (ad.PlayerWithBall == player)
             {
+                // Leaving with the ball: credit the carry now. The core drops the ball after this (its own leave
+                // handler runs after this arena's), and that possession-lost call is ignored via LeftWithBall.
+                PlayerStats? playerData = GetRecord(ad, player.Name, freq, initialize: false);
+                if (playerData is not null && playerData.HasBall)
+                {
+                    playerData.CarriesTime += ServerTick.Now - playerData.PickupTick;
+                    playerData.HasBall = false;
+                }
+
                 ad.PlayerWithBall = null;
+                ad.LeftWithBall = player;
                 ad.LastReleasedTick = ServerTick.Now;
             }
 
@@ -793,7 +839,10 @@ namespace SS.PowerBall.Modules
             return attackGoal.ContainsCoordinate((short)(player.Position.X / 16), (short)(player.Position.Y / 16));
         }
 
-        private void BroadcastPub(Arena arena, ArenaData ad, ReadOnlySpan<char> message)
+        /// <summary>
+        /// Sends one or two messages to the players on the pub freqs, building the set of them once.
+        /// </summary>
+        private void BroadcastPub(Arena arena, ArenaData ad, string message, string? secondMessage)
         {
             HashSet<Player> set = _objectPoolManager.PlayerSetPool.Get();
             try
@@ -813,6 +862,9 @@ namespace SS.PowerBall.Modules
                 }
 
                 _chat.SendSetMessage(set, message);
+
+                if (secondMessage is not null)
+                    _chat.SendSetMessage(set, secondMessage);
             }
             finally
             {
@@ -1141,6 +1193,12 @@ namespace SS.PowerBall.Modules
         {
             public InterfaceRegistrationToken<IPowerBallStats>? InterfaceToken;
             public ArenaTimerSlot<Arena>? BaseTimer;
+            public int CustomGameMask;
+
+            /// <summary>
+            /// A carrier who left with the ball, until the core's drop of that ball arrives (see OnPlayerLeft).
+            /// </summary>
+            public Player? LeftWithBall;
 
             public readonly List<PlayerStats>[] GameStats = [new List<PlayerStats>(), new List<PlayerStats>()];
             public Player? PlayerWithBall;
@@ -1165,6 +1223,8 @@ namespace SS.PowerBall.Modules
             {
                 InterfaceToken = null;
                 BaseTimer = null;
+                CustomGameMask = 0;
+                LeftWithBall = null;
                 GameStats[0].Clear();
                 GameStats[1].Clear();
                 PlayerWithBall = null;
