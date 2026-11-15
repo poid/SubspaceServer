@@ -68,6 +68,11 @@ namespace SS.Replay
         private const int MaxRecordBuffer = 4096;
         private const string ReplayCommandName = "replay";
 
+        /// <summary>
+        /// The maximum # of balls, which is what the client supports.
+        /// </summary>
+        private const int MaxBalls = 8;
+
         private readonly IArenaManager _arenaManager;
         private readonly IBalls _balls;
         private readonly IBrickManager _brickManager;
@@ -1642,6 +1647,7 @@ namespace SS.Replay
                 ad.StartedBy = startedBy?.Name;
                 ad.PlaybackPosition = 0;
                 ad.IsPlaybackPaused = false;
+                ad.PlaybackBallIds = 0;
 
                 // make sure the queue is empty before we start
                 while (ad.PlaybackQueue.TryTake(out _)) { }
@@ -2471,6 +2477,13 @@ namespace SS.Replay
                                     ballPacketWrapper.BallPacket.PlayerId = (short)player.Id;
                                 }
 
+                                // Remember which balls the playback has shown, so that they can be removed when the playback ends.
+                                byte ballId = ballPacketWrapper.BallPacket.BallId;
+                                if (ballId < MaxBalls)
+                                {
+                                    ad.PlaybackBallIds |= (byte)(1 << ballId);
+                                }
+
                                 HashSet<Player> players = _objectPoolManager.PlayerSetPool.Get();
                                 try
                                 {
@@ -2761,11 +2774,13 @@ namespace SS.Replay
 
             _securitySeedSync.RemoveArenaOverride(arena);
 
-            // TODO: remove balls
-
             UnlockAllSpec(arena);
 
+            // Restore the arena's balls. The Balls module sends packets for its balls, which replace any of the playback's balls with the same IDs.
             _balls.TrySetBallCount(arena, null);
+
+            // Remove the rest of the playback's balls from clients.
+            PhasePlaybackBalls(arena, ad);
 
             ICarryFlagGame? carryFlagGame = arena.GetInterface<ICarryFlagGame>();
             if (carryFlagGame is not null)
@@ -2784,6 +2799,38 @@ namespace SS.Replay
             // If the arena is being destroyed, it can continue now that the playback is cleaned up.
             if (removeHold)
                 _arenaManager.RemoveHold(arena);
+        }
+
+        /// <summary>
+        /// Removes the balls that a playback showed, from the clients in the arena.
+        /// </summary>
+        /// <remarks>
+        /// Playback sends ball packets directly to clients, so the Balls module doesn't know about those balls.
+        /// Balls with an ID below the arena's ball count are replaced by the Balls module when the ball count is restored.
+        /// The rest would remain on clients (e.g., a 2 ball replay played in a 1 ball arena), so they are "phased" the same way the Balls module removes a ball:
+        /// no carrier, moved outside of the field of play, and a time of 0 so that it can't be picked up.
+        /// This must be called after the ball count is restored.
+        /// </remarks>
+        /// <param name="arena">The arena the playback was in.</param>
+        /// <param name="ad">The arena's data.</param>
+        private void PhasePlaybackBalls(Arena arena, ArenaData ad)
+        {
+            int ballIds = ad.PlaybackBallIds;
+            ad.PlaybackBallIds = 0;
+
+            if (ballIds == 0)
+                return;
+
+            int ballCount = _balls.TryGetBallSettings(arena, out BallSettings ballSettings) ? ballSettings.BallCount : 0;
+
+            for (int ballId = ballCount; ballId < MaxBalls; ballId++)
+            {
+                if ((ballIds & (1 << ballId)) == 0)
+                    continue;
+
+                BallPacket ballPacket = new(true, (byte)ballId, 30000, 30000, 0, 0, -1, 0);
+                _network.SendToArena(arena, null, ref ballPacket, NetSendFlags.Reliable);
+            }
         }
 
         private void LogAndNotify(Arena arena, NotifyOption notifyOption, string message, Exception? ex = null)
@@ -3137,6 +3184,16 @@ namespace SS.Replay
             public Task? PlaybackTask;
 
             /// <summary>
+            /// For playback, the IDs of the balls that the playback has sent ball packets for, as a bit field (bit n = ball n).
+            /// </summary>
+            /// <remarks>
+            /// Playback sends ball packets directly to clients, so the Balls module doesn't know about these balls.
+            /// This is used to remove them from clients when the playback ends.
+            /// Only accessed on the mainloop thread.
+            /// </remarks>
+            public byte PlaybackBallIds;
+
+            /// <summary>
             /// For playback, maps playerIds in a replay to the fake players.
             /// </summary>
             public readonly Dictionary<short, Player> PlayerIdMap = [];
@@ -3192,6 +3249,7 @@ namespace SS.Replay
                     RecorderTask = null;
                     IsHoldingArena = false;
                     PlaybackTask = null;
+                    PlaybackBallIds = 0;
                     PlayerIdMap.Clear();
 
                     while (PlaybackQueue.TryTake(out _)) { }
