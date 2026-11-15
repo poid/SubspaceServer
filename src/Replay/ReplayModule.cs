@@ -94,6 +94,11 @@ namespace SS.Replay
 
         private static readonly ArrayPool<byte> _recordBufferPool = ArrayPool<byte>.Create();
 
+        /// <summary>
+        /// How long to wait for a recording to finish writing its replay file, when the module is being unloaded.
+        /// </summary>
+        private static readonly TimeSpan RecordingEndTimeout = TimeSpan.FromSeconds(10);
+
         private readonly Action<(Player Player, uint C2SLatency)> _mainloopWorkItem_C2SLatencyEstimateChanged;
 
         public ReplayModule(
@@ -163,6 +168,9 @@ namespace SS.Replay
         {
             if (broker.UnregisterInterface(ref _iReplayControllerToken) != 0)
                 return false;
+
+            // Complete any recordings in progress, so that their replay files aren't left incomplete.
+            EndAllRecordings();
 
             ArenaActionCallback.Unregister(broker, Callback_ArenaAction);
             SecuritySeedChangedCallback.Unregister(broker, Callback_SecuritySeedChanged);
@@ -295,9 +303,28 @@ namespace SS.Replay
             else if (action == ArenaAction.Destroy)
             {
                 if (ad.State == ReplayState.Recording)
+                {
                     StopRecording(arena);
+
+                    // The recording ends asynchronously: the recorder task writes the remaining events and completes the replay file,
+                    // and then EndRecording is run on the mainloop thread to clean up.
+                    // Until that's done, keep the arena from being destroyed, since both use the arena and its per-arena data.
+                    bool addHold;
+
+                    lock (ad.Lock)
+                    {
+                        addHold = ad.RecorderTask is not null && !ad.IsHoldingArena;
+                        if (addHold)
+                            ad.IsHoldingArena = true;
+                    }
+
+                    if (addHold)
+                        _arenaManager.AddHold(arena);
+                }
                 else if (ad.State == ReplayState.Playing)
+                {
                     StopPlayback(arena);
+                }
             }
         }
 
@@ -1313,7 +1340,7 @@ namespace SS.Replay
         }
 
         /// <summary>
-        /// Performs cleanup when a recording ends.
+        /// Queued by the recorder task when it completes, to perform cleanup on the mainloop thread.
         /// </summary>
         /// <remarks>
         /// This is executed on the mainloop thread since the mainloop thread is the producer.
@@ -1324,6 +1351,19 @@ namespace SS.Replay
         {
             Debug.Assert(_mainloop.IsMainloop);
 
+            EndRecording(arena);
+        }
+
+        /// <summary>
+        /// Performs cleanup when a recording ends.
+        /// </summary>
+        /// <remarks>
+        /// This must be called on the mainloop thread, after the <see cref="ArenaData.RecorderTask"/> completes.
+        /// It is safe to call more than once for the same recording; calls after the first do nothing.
+        /// </remarks>
+        /// <param name="arena">The arena to end the recording of.</param>
+        private void EndRecording(Arena arena)
+        {
             if (arena is null || !arena.TryGetExtraData(_adKey, out ArenaData? ad))
                 return;
 
@@ -1332,9 +1372,17 @@ namespace SS.Replay
             // If the recording errored out, then this will bring it into the state we're expecting.
             StopRecording(arena);
 
+            bool removeHold;
+
             lock (ad.Lock)
             {
-                Debug.Assert(ad.RecorderTask!.IsCompleted);
+                if (ad.RecorderTask is null)
+                {
+                    // Already ended. E.g., the module was unloaded, which ended the recording before the queued mainloop work item ran.
+                    return;
+                }
+
+                Debug.Assert(ad.RecorderTask.IsCompleted);
 
                 ad.State = ReplayState.None;
                 ad.FileName = null;
@@ -1353,6 +1401,168 @@ namespace SS.Replay
                 ad.RecorderQueue = null;
 
                 ad.RecorderTask = null;
+
+                removeHold = ad.IsHoldingArena;
+                ad.IsHoldingArena = false;
+            }
+
+            // If the arena is being destroyed, it can continue now that the recording is complete.
+            if (removeHold)
+                _arenaManager.RemoveHold(arena);
+        }
+
+        /// <summary>
+        /// Stops any recordings in progress and waits for them to complete their replay files.
+        /// </summary>
+        /// <remarks>
+        /// This is for when the module is being unloaded.
+        /// The recorder queues are only changed on the mainloop thread (the producer), so the work is done on the mainloop thread.
+        /// If this isn't the mainloop thread, it's queued to the mainloop thread and this waits for it to complete.
+        /// </remarks>
+        private void EndAllRecordings()
+        {
+            if (!IsAnyArenaRecording())
+                return;
+
+            if (_mainloop.IsMainloop)
+            {
+                MainloopWorkItem_EndAllRecordings(null);
+                return;
+            }
+
+            using ManualResetEventSlim done = new(false);
+
+            if (!_mainloop.QueueMainWorkItem(MainloopWorkItem_EndAllRecordings, done))
+            {
+                _logManager.LogM(LogLevel.Error, nameof(ReplayModule), "Unable to queue the work to end recordings. Replay files being recorded may be incomplete.");
+                return;
+            }
+
+            // Each recording is waited on for at most RecordingEndTimeout, so this won't wait indefinitely.
+            done.Wait();
+
+            bool IsAnyArenaRecording()
+            {
+                _arenaManager.Lock();
+
+                try
+                {
+                    foreach (Arena arena in _arenaManager.Arenas)
+                    {
+                        if (!arena.TryGetExtraData(_adKey, out ArenaData? ad))
+                            continue;
+
+                        lock (ad.Lock)
+                        {
+                            if (ad.RecorderTask is not null)
+                                return true;
+                        }
+                    }
+                }
+                finally
+                {
+                    _arenaManager.Unlock();
+                }
+
+                return false;
+            }
+        }
+
+        private void MainloopWorkItem_EndAllRecordings(ManualResetEventSlim? done)
+        {
+            Debug.Assert(_mainloop.IsMainloop);
+
+            try
+            {
+                HashSet<Arena> arenas = _objectPoolManager.ArenaSetPool.Get();
+
+                try
+                {
+                    _arenaManager.Lock();
+
+                    try
+                    {
+                        foreach (Arena arena in _arenaManager.Arenas)
+                        {
+                            if (!arena.TryGetExtraData(_adKey, out ArenaData? ad))
+                                continue;
+
+                            lock (ad.Lock)
+                            {
+                                if (ad.RecorderTask is not null)
+                                    arenas.Add(arena);
+                            }
+                        }
+                    }
+                    finally
+                    {
+                        _arenaManager.Unlock();
+                    }
+
+                    foreach (Arena arena in arenas)
+                    {
+                        if (!arena.TryGetExtraData(_adKey, out ArenaData? ad))
+                            continue;
+
+                        // Tell the recorder task to finish: no more events will be queued.
+                        StopRecording(arena);
+
+                        Task? recorderTask;
+                        string? fileName;
+
+                        lock (ad.Lock)
+                        {
+                            recorderTask = ad.RecorderTask;
+                            fileName = ad.FileName;
+                        }
+
+                        if (recorderTask is null)
+                            continue;
+
+                        // Wait for the recorder task to write the remaining events and complete the replay file.
+                        bool isCompleted;
+
+                        try
+                        {
+                            isCompleted = recorderTask.Wait(RecordingEndTimeout);
+                        }
+                        catch (AggregateException)
+                        {
+                            // The task faulted, which means it's completed.
+                            isCompleted = true;
+                        }
+
+                        if (isCompleted)
+                        {
+                            // The recorder task queued a mainloop work item to do this, but it won't get to run before the module is unloaded.
+                            EndRecording(arena);
+                        }
+                        else
+                        {
+                            _logManager.LogA(LogLevel.Error, nameof(ReplayModule), arena, $"Timed out waiting for the recording to '{fileName}' to complete. The replay file may be incomplete.");
+
+                            // Don't leave the arena stuck if it's waiting to be destroyed.
+                            bool removeHold;
+
+                            lock (ad.Lock)
+                            {
+                                removeHold = ad.IsHoldingArena;
+                                ad.IsHoldingArena = false;
+                            }
+
+                            if (removeHold)
+                                _arenaManager.RemoveHold(arena);
+                        }
+                    }
+                }
+                finally
+                {
+                    _objectPoolManager.ArenaSetPool.Return(arenas);
+                }
+            }
+            finally
+            {
+                done?.Set();
             }
         }
 
@@ -2816,7 +3026,15 @@ namespace SS.Replay
             /// <summary>
             /// The task for recording.
             /// </summary>
+            /// <remarks>
+            /// This remains set after the task completes, until the recording is cleaned up by <see cref="EndRecording"/>.
+            /// </remarks>
             public Task? RecorderTask;
+
+            /// <summary>
+            /// Whether there is a hold on the arena (<see cref="IArenaManager.AddHold"/>), keeping it from being destroyed until the recording ends.
+            /// </summary>
+            public bool IsHoldingArena;
 
             /// <summary>
             /// The task for playback.
@@ -2877,6 +3095,7 @@ namespace SS.Replay
                     PlaybackPosition = 0;
                     IsPlaybackPaused = false;
                     RecorderTask = null;
+                    IsHoldingArena = false;
                     PlaybackTask = null;
                     PlayerIdMap.Clear();
 
